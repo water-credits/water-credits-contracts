@@ -6,6 +6,7 @@ members = [
     "contracts/retirement_registry",
     "contracts/project_registry",
     "contracts/governance",
+    "contracts/reward-engine",
     "tests",
 ]
 resolver = "2"
