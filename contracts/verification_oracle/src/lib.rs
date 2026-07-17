@@ -206,6 +206,10 @@ fn sha256_commitment(
     e.crypto().sha256(&data)
 }
 
+// `len % 2 == 0` is the stable equivalent of `len.is_multiple_of(2)`,
+// which is only stable from Rust 1.87. Suppress the clippy suggestion so
+// the crate compiles on the pinned CI toolchain (1.85).
+#[allow(clippy::manual_is_multiple_of)]
 fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
     let mut sorted: Vec<i64> = Vec::new(e);
     for i in 0..values.len() {
@@ -223,7 +227,7 @@ fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
         }
     }
     let len = sorted.len();
-    if len.is_multiple_of(2) {
+    if len % 2 == 0 {
         (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
     } else {
         sorted.get(len / 2).unwrap()
@@ -231,6 +235,7 @@ fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
 }
 
 #[allow(unused)]
+#[allow(clippy::manual_is_multiple_of)]
 fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
     let mut sorted: Vec<i128> = Vec::new(e);
     for i in 0..values.len() {
@@ -248,7 +253,7 @@ fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
         }
     }
     let len = sorted.len();
-    if len.is_multiple_of(2) {
+    if len % 2 == 0 {
         (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
     } else {
         sorted.get(len / 2).unwrap()
