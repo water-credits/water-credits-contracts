@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Batch transfer support in `credit_token`
 - Allowance expiration in `credit_token`
 - Transfer admin capability in `governance`
+- Transfer admin capability in `verification_oracle`, enabling governance to hold admin authority over the oracle for proposal-driven `update_config` calls
 - Historical verification results in `verification_oracle`
 - Oracle count getter and oracle list in `verification_oracle`
 - Oracle submission stats tracking in `verification_oracle`

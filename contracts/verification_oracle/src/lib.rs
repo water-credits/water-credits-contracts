@@ -291,6 +291,22 @@ impl VerificationOracle {
         e.storage().instance().set(&DataKey::Config, &config);
     }
 
+    /// Transfer admin rights to a new address. Admin only.
+    ///
+    /// This is the delegation mechanism that lets a `governance` contract take over
+    /// admin authority: transfer admin to the governance contract's own address, and
+    /// subsequent `execute()` dispatches from governance will auto-authorize the
+    /// `admin.require_auth()` check here (a contract always authorizes its own address
+    /// for calls it makes), with no separate signature required.
+    pub fn transfer_admin(e: Env, admin: Address, new_admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
     /// Add an oracle address to the whitelist. Only admin can call.
     /// If min_stake > 0, the oracle must have at least min_stake tokens staked.
     pub fn add_oracle(e: Env, admin: Address, oracle: Address) {
@@ -1720,6 +1736,34 @@ mod tests {
         assert_eq!(config.unstake_cooldown_secs, 86400);
         assert_eq!(config.commit_phase_secs, 300);
         assert_eq!(config.reveal_phase_secs, 300);
+    }
+
+    #[test]
+    fn test_transfer_admin_succeeds() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let new_admin = Address::generate(&e);
+        client.transfer_admin(&admin, &new_admin);
+
+        // New admin can now perform admin actions.
+        let oracle = Address::generate(&e);
+        client.add_oracle(&new_admin, &oracle);
+        assert!(client.is_oracle_active(&oracle));
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_transfer_admin_old_admin_rejected() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let new_admin = Address::generate(&e);
+        client.transfer_admin(&admin, &new_admin);
+
+        // Old admin can no longer act as admin.
+        let oracle = Address::generate(&e);
+        client.add_oracle(&admin, &oracle);
     }
 
     #[test]

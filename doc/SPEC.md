@@ -256,6 +256,44 @@ DAO for protocol parameter management. Members propose, vote, and execute
 changes after a timelock. Voting is majority-based with a configurable
 approval threshold.
 
+**Proposal execution.** Each `Proposal` carries a list of `GovernanceAction`
+entries (`target: Address`, `function: Symbol`, `args: Vec<Val>`). On
+`execute()`, once the timelock has elapsed, `governance` dispatches each
+action in order:
+
+- `function == "emergency_pause"` / `"emergency_unpause"` are handled as
+  built-in protocol actions (pause/unpause every token in `RegisteredTokens`);
+  `target` is ignored for these.
+- Any other `function` is invoked generically via `e.invoke_contract(target,
+  function, args)`.
+
+If any action panics, the whole `execute()` call reverts (standard Soroban
+transaction semantics) and the proposal remains `Approved` for retry. The
+proposal is only marked `Executed` after every action in the list succeeds —
+the status write happens after the dispatch loop, not before it.
+
+**Authorization: how governance acts as admin of other contracts.** A
+generic action such as `verification_oracle::update_config(admin, config)`
+requires `admin.require_auth()` to succeed for the target's stored admin
+address. `governance` does not have a special bypass for this — instead it
+relies on Soroban's invoker auto-authorization: when a contract calls
+`require_auth()` on an address equal to *its own* contract address during a
+call it initiated, that check passes without a separate signature. So the
+delegation pattern is:
+
+1. The target contract must expose a `transfer_admin(admin, new_admin)`
+   function (see `verification_oracle::transfer_admin`).
+2. The existing admin calls `transfer_admin(admin, <governance_contract_address>)`,
+   making the governance contract itself the target's admin.
+3. From then on, any `GovernanceAction` whose `args` include the governance
+   contract's own address as the `admin` parameter will auto-authorize when
+   dispatched from `execute()`.
+
+This is opt-in per contract — a target only comes under DAO control once its
+admin is explicitly transferred to the governance contract address. Contracts
+that never transfer admin to governance remain solely under their original
+admin's control.
+
 ---
 
 ## 3. Access Control Summary
