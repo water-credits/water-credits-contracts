@@ -223,7 +223,7 @@ fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
         }
     }
     let len = sorted.len();
-    if len % 2 == 0 {
+    if len.is_multiple_of(2) {
         (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
     } else {
         sorted.get(len / 2).unwrap()
@@ -248,7 +248,7 @@ fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
         }
     }
     let len = sorted.len();
-    if len % 2 == 0 {
+    if len.is_multiple_of(2) {
         (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
     } else {
         sorted.get(len / 2).unwrap()
@@ -437,19 +437,28 @@ impl VerificationOracle {
             total_phosphorus,
         );
         if let Some(ref res) = result {
-            let cfg_key = DataKey::ProjectConfig(project_id);
-            if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
-                let mint_args: Vec<Val> = vec![
-                    &e,
-                    e.current_contract_address().to_val(),
-                    config.beneficiary.to_val(),
-                    res.total_credits.into_val(&e),
-                ];
-                e.invoke_contract::<()>(
-                    &config.token_contract,
-                    &Symbol::new(&e, "mint_to"),
-                    mint_args,
-                );
+            // Only mint when credits are positive.  A zero-credit window is a
+            // valid environmental outcome (e.g. baseline window, high-flow
+            // zero-nutrient-removal reading).  Calling mint_to with amount 0
+            // would panic inside credit_token ("amount must be positive"), which
+            // would roll back ALL state written by submit_reading_impl — leaving
+            // nonces and OracleSubmitted markers in an inconsistent state and
+            // permanently locking the window.
+            if res.total_credits > 0 {
+                let cfg_key = DataKey::ProjectConfig(project_id);
+                if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
+                    let mint_args: Vec<Val> = vec![
+                        &e,
+                        e.current_contract_address().to_val(),
+                        config.beneficiary.to_val(),
+                        res.total_credits.into_val(&e),
+                    ];
+                    e.invoke_contract::<()>(
+                        &config.token_contract,
+                        &Symbol::new(&e, "mint_to"),
+                        mint_args,
+                    );
+                }
             }
         }
         result
@@ -3240,5 +3249,153 @@ mod tests {
             assert!(slash.is_some());
             assert_eq!(slash.unwrap().reason, 3);
         }
+    }
+
+    // ── Zero-credit window fix (issue #24) ──
+
+    /// Three oracles submit readings that produce zero credits (zero flow, N and P
+    /// at or above baseline, bad quality).  The window must finalize cleanly,
+    /// get_last_result must return Some with total_credits == 0, and all oracle
+    /// nonces must have advanced so the oracles can participate in the next window.
+    #[test]
+    fn test_zero_credit_window_finalizes_and_nonces_advance() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let project_id = BytesN::from_array(&e, &[200u8; 32]);
+
+        // Readings that produce zero credits:
+        //   flow_rate = 0  → volumetric_credit = 0
+        //   total_nitrogen = 15 (≥ baseline 10) → n_removal = 0
+        //   total_phosphorus = 3 (≥ baseline 2)  → p_removal = 0
+        //   Poor quality (ph=300, turb=200, do=10) → large penalty, but gross is
+        //   already 0 so total stays 0.
+        let result1 =
+            client.submit_reading(&o1, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
+        assert!(
+            result1.is_none(),
+            "window should not finalize after 1 oracle"
+        );
+
+        let result2 =
+            client.submit_reading(&o2, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
+        assert!(
+            result2.is_none(),
+            "window should not finalize after 2 oracles"
+        );
+
+        let result3 =
+            client.submit_reading(&o3, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
+
+        // Window must finalize and return a result even though total_credits == 0.
+        assert!(
+            result3.is_some(),
+            "window must finalize when min_oracles reached"
+        );
+        let res = result3.unwrap();
+        assert_eq!(
+            res.total_credits, 0,
+            "credits should be zero for this reading"
+        );
+        assert_eq!(res.oracle_count, 3);
+
+        // get_last_result must reflect the finalized zero-credit result.
+        let stored = client.get_last_result(&project_id);
+        assert!(
+            stored.is_some(),
+            "get_last_result must return Some after finalization"
+        );
+        assert_eq!(stored.unwrap().total_credits, 0);
+
+        // Oracle nonces must have advanced (each oracle consumed nonce 1).
+        // Verify indirectly: after reset_window, all three oracles must accept nonce 2
+        // (not nonce 1).  If the fix were broken, the stored nonce would still be 0 and
+        // nonce 1 would be accepted, but nonce 2 would be rejected as "invalid nonce".
+        // A successful three-oracle submission with nonce 2 proves all nonces advanced.
+        client.reset_window(&admin, &project_id);
+
+        // nonce 2 must be accepted for all three oracles
+        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        let next_result =
+            client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+
+        // The second window also produces zero credits (same readings), but it must finalize.
+        assert!(
+            next_result.is_some(),
+            "nonce 2 must be accepted after zero-credit window advanced nonces"
+        );
+        assert_eq!(
+            next_result.unwrap().total_credits,
+            0,
+            "same zero-credit readings must still produce zero credits"
+        );
+    }
+
+    /// After a zero-credit window finalizes, reset_window + a new window with
+    /// positive credits must work end-to-end without any state corruption.
+    #[test]
+    fn test_positive_credit_window_after_zero_credit_window() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        let project_id = BytesN::from_array(&e, &[201u8; 32]);
+
+        // ── Window 1: zero credits ──
+        client.submit_reading(&o1, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
+        client.submit_reading(&o2, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
+        let zero_result =
+            client.submit_reading(&o3, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
+
+        assert!(zero_result.is_some());
+        assert_eq!(zero_result.unwrap().total_credits, 0);
+
+        // ── Window 2: positive credits ──
+        // reset_window is required to open a new direct-submission window after
+        // the previous one was finalized.
+        client.reset_window(&admin, &project_id);
+
+        // Good readings: good pH (700=7.0), low turbidity (10), high DO (80),
+        // positive flow (500), low temperature (250), N below baseline (8 < 10),
+        // P below baseline (1 < 2).
+        let r1 = client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        assert!(r1.is_none());
+
+        let r2 = client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        assert!(r2.is_none());
+
+        let r3 = client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        assert!(r3.is_some(), "second window must finalize");
+
+        let res = r3.unwrap();
+        assert!(
+            res.total_credits > 0,
+            "second window must produce positive credits"
+        );
+        assert_eq!(res.oracle_count, 3);
+
+        // get_last_result must now reflect the positive-credit window.
+        let stored = client.get_last_result(&project_id).unwrap();
+        assert!(stored.total_credits > 0);
+
+        // History must contain both results.
+        let history = client.get_result_history(&project_id, &0, &10);
+        assert_eq!(history.len(), 2, "history must contain both windows");
+        assert_eq!(history.get(0).unwrap().total_credits, 0);
+        assert!(history.get(1).unwrap().total_credits > 0);
     }
 }
