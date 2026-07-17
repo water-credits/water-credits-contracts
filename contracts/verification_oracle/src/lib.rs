@@ -207,8 +207,10 @@ fn sha256_commitment(
 }
 
 // `len % 2 == 0` is the stable equivalent of `len.is_multiple_of(2)`,
-// which is only stable from Rust 1.87. Suppress the clippy suggestion so
-// the crate compiles on the pinned CI toolchain (1.85).
+// which is only stable from Rust 1.87. The clippy lint for this
+// (`manual_is_multiple_of`) was also added in 1.87, so suppress the
+// unknown-lint warning on older toolchains too.
+#[allow(unknown_lints)]
 #[allow(clippy::manual_is_multiple_of)]
 fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
     let mut sorted: Vec<i64> = Vec::new(e);
@@ -235,6 +237,7 @@ fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
 }
 
 #[allow(unused)]
+#[allow(unknown_lints)]
 #[allow(clippy::manual_is_multiple_of)]
 fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
     let mut sorted: Vec<i128> = Vec::new(e);
