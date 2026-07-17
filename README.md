@@ -593,8 +593,9 @@ pub struct Proposal {
     pub id: BytesN<32>,                // Unique proposal ID
     pub proposer: Address,             // Who created the proposal
     pub description: String,           // Text description
-    pub votes_for: i128,               // Total votes in favour
-    pub votes_against: i128,           // Total votes against
+    pub votes_for: u32,                // Count of "yes" votes (not a voter list)
+    pub votes_against: u32,            // Count of "no" votes
+    pub eligible_voters: u32,          // Member count snapshotted at creation
     pub executed: bool,                // Whether proposal was executed
     pub deadline: u64,                 // Unix timestamp when voting ends
     pub action: String,                // Action type identifier

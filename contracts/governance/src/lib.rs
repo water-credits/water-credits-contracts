@@ -33,6 +33,12 @@ pub struct GovernanceConfig {
     pub voting_period: u64,
     pub timelock_duration: u64,
     pub approval_threshold_bps: u32,
+    /// Minimum participation required to resolve a proposal, expressed as a
+    /// basis-point fraction of `Proposal.eligible_voters`. A proposal is only
+    /// evaluated for approval/rejection once the number of cast votes reaches
+    /// this quorum. This decouples resolution from 100% turnout and from
+    /// retroactive membership changes.
+    pub quorum_bps: u32,
     pub min_proposal_deposit: i128,
     pub max_active_proposals: u32,
 }
@@ -45,8 +51,17 @@ pub struct Proposal {
     pub title: String,
     pub description: String,
     pub actions: Vec<GovernanceAction>,
-    pub votes_for: Vec<Address>,
-    pub votes_against: Vec<Address>,
+    /// Number of "yes" votes. Stored as a count (not a voter list) for bounded
+    /// storage and O(1) updates. Per-voter dedup is enforced via
+    /// `DataKey::HasVoted`.
+    pub votes_for: u32,
+    /// Number of "no" votes. See `votes_for` for rationale.
+    pub votes_against: u32,
+    /// Number of eligible voters snapshotted at proposal creation time. Used as
+    /// the stable denominator for both quorum and approval math so that
+    /// members added/removed after creation cannot change the threshold
+    /// retroactively.
+    pub eligible_voters: u32,
     pub status: ProposalStatus,
     pub created_at: u64,
     pub voting_ends_at: u64,
@@ -149,6 +164,7 @@ impl Governance {
             voting_period: 604800,
             timelock_duration: 86400,
             approval_threshold_bps: 6000,
+            quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
         };
@@ -241,8 +257,9 @@ impl Governance {
             title,
             description,
             actions,
-            votes_for: Vec::new(&e),
-            votes_against: Vec::new(&e),
+            votes_for: 0,
+            votes_against: 0,
+            eligible_voters: member_count(&e),
             status: ProposalStatus::Pending,
             created_at: timestamp,
             voting_ends_at: timestamp + config.voting_period,
@@ -274,7 +291,14 @@ impl Governance {
     }
 
     /// Vote on a proposal. Members can vote once. Auto-activates pending proposals.
-    /// Auto-approves or rejects when all members have voted.
+    ///
+    /// A proposal is resolved (Approved/Rejected) once the number of cast votes
+    /// reaches the quorum derived from `Proposal.eligible_voters` (snapshotted at
+    /// creation), not when 100% turnout is achieved. Approval is measured as a
+    /// fraction of `eligible_voters`, so abstentions count as "no" rather than as
+    /// implicit "yes" votes. Because the denominator is frozen at creation time,
+    /// adding or removing members after a proposal exists cannot change its
+    /// threshold retroactively.
     pub fn vote(e: Env, voter: Address, proposal_id: u64, approve: bool) {
         voter.require_auth();
 
@@ -317,9 +341,9 @@ impl Governance {
         }
 
         if approve {
-            proposal.votes_for.push_back(voter.clone());
+            proposal.votes_for += 1;
         } else {
-            proposal.votes_against.push_back(voter.clone());
+            proposal.votes_against += 1;
         }
 
         e.storage().persistent().set(&voted_key, &true);
@@ -336,20 +360,30 @@ impl Governance {
         e.events()
             .publish((EVENT_VOTE_CAST,), (proposal_id, voter, approve));
 
-        // Check if threshold reached
-        let total_members = member_count(&e);
-        let total_votes = proposal.votes_for.len() + proposal.votes_against.len();
+        // Resolution math uses the creation-time snapshot (`eligible_voters`),
+        // never the live membership count. This guarantees membership changes
+        // after proposal creation never retroactively alter the threshold.
         let config: GovernanceConfig = read_config(&e);
+        let total_votes = proposal.votes_for + proposal.votes_against;
 
-        if total_votes >= total_members {
-            let yes_pct = if total_votes > 0 {
-                (proposal.votes_for.len() as u64 * 10000)
-                    .checked_div(total_votes as u64)
-                    .unwrap_or(0) as u32
+        // Quorum = ceil(quorum_bps/10000 * eligible_voters), computed against the
+        // snapshot. At least one vote is required to resolve.
+        let quorum = if proposal.eligible_voters == 0 {
+            0u64
+        } else {
+            (proposal.eligible_voters as u64 * config.quorum_bps as u64).div_ceil(10000)
+        };
+
+        if (total_votes as u64) >= quorum {
+            // Approval is measured against eligible voters: abstentions are
+            // counted as "no", so a silent majority cannot be overruled by a
+            // small number of active voters.
+            let yes_pct = if proposal.eligible_voters > 0 {
+                (proposal.votes_for as u64 * 10000) / proposal.eligible_voters as u64
             } else {
                 0
             };
-            if yes_pct >= config.approval_threshold_bps {
+            if yes_pct >= config.approval_threshold_bps as u64 {
                 proposal.status = ProposalStatus::Approved;
                 proposal.timelock_ends_at = timestamp + config.timelock_duration;
                 e.storage().persistent().set(&proposal_key, &proposal);
@@ -426,9 +460,9 @@ impl Governance {
         // `Approved` status and can be retried or superseded by a new proposal.
         for i in 0..proposal.actions.len() {
             let action = proposal.actions.get(i).unwrap();
-            if action.function == Symbol::new(&e, "emergency_pause") {
+            if action.function == soroban_sdk::Symbol::new(&e, "emergency_pause") {
                 Self::do_pause(&e);
-            } else if action.function == Symbol::new(&e, "emergency_unpause") {
+            } else if action.function == soroban_sdk::Symbol::new(&e, "emergency_unpause") {
                 Self::do_unpause(&e);
             } else {
                 e.invoke_contract::<()>(&action.target, &action.function, action.args.clone());
@@ -644,7 +678,7 @@ impl Governance {
         for i in 0..tokens.len() {
             let token = tokens.get(i).unwrap();
             let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
-            e.invoke_contract::<()>(&token, &Symbol::new(e, "pause"), args);
+            e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "pause"), args);
         }
 
         e.storage().instance().set(&DataKey::ProtocolPaused, &true);
@@ -662,7 +696,7 @@ impl Governance {
         for i in 0..tokens.len() {
             let token = tokens.get(i).unwrap();
             let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
-            e.invoke_contract::<()>(&token, &Symbol::new(e, "unpause"), args);
+            e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "unpause"), args);
         }
 
         e.storage().instance().set(&DataKey::ProtocolPaused, &false);
@@ -700,7 +734,7 @@ mod tests {
                 panic!("intentional failure");
             }
 
-            pub fn echo_arg(e: Env, symbol: Symbol) -> Symbol {
+            pub fn echo_arg(e: Env, symbol: soroban_sdk::Symbol) -> soroban_sdk::Symbol {
                 e.storage().instance().set(&DataKey::Value, &symbol);
                 symbol
             }
@@ -819,8 +853,112 @@ mod tests {
 
         client.vote(&member1, &id, &true);
         let proposal = client.get_proposal(&id).unwrap();
-        assert_eq!(proposal.votes_for.len(), 1);
-        assert_eq!(proposal.votes_against.len(), 0);
+        assert_eq!(proposal.votes_for, 1);
+        assert_eq!(proposal.votes_against, 0);
+    }
+
+    #[test]
+    fn test_member_added_after_proposal_keeps_threshold() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        // Start with 2 members.
+        let member2 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Add Member Test"),
+            &String::from_str(&e, "desc"),
+            &actions,
+        );
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.eligible_voters, 2);
+
+        // A third member is added AFTER the proposal was created.
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member3);
+        assert_eq!(client.member_count_fn(), 3);
+
+        // Only the original two members vote. With the old 100%-turnout logic
+        // this could never reach `total_votes >= total_members`, leaving the
+        // proposal stuck. The snapshot-based quorum must still resolve it.
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.eligible_voters, 2);
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+    }
+
+    #[test]
+    fn test_quorum_reached_before_full_turnout() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        // Three members at creation time.
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Quorum Test"),
+            &String::from_str(&e, "desc"),
+            &actions,
+        );
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.eligible_voters, 3);
+
+        // Quorum (50% of 3 -> 2 votes) is reached with two "yes" votes; the
+        // third member never votes, yet the proposal must resolve.
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.votes_for, 2);
+        assert_eq!(proposal.votes_against, 0);
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+    }
+
+    #[test]
+    fn test_member_removed_after_voting_preserves_counts() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        // Three members at creation time.
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Remove Member Test"),
+            &String::from_str(&e, "desc"),
+            &actions,
+        );
+
+        // Two members vote yes; the third is then removed.
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+        client.remove_member(&admin, &member3);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        // Eligible-voter snapshot must remain 3 (not drop to 2).
+        assert_eq!(proposal.eligible_voters, 3);
+        // Vote counts must reflect exactly the two recorded votes.
+        assert_eq!(proposal.votes_for, 2);
+        assert_eq!(proposal.votes_against, 0);
+        // Quorum (50% of 3 -> 2) is met, so the proposal resolves to Approved
+        // rather than being corrupted by the removed member.
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
     }
 
     #[test]
@@ -930,6 +1068,7 @@ mod tests {
             voting_period: 432000,
             timelock_duration: 43200,
             approval_threshold_bps: 5000,
+            quorum_bps: 5000,
             min_proposal_deposit: 500,
             max_active_proposals: 20,
         };
@@ -954,6 +1093,7 @@ mod tests {
             voting_period: 604800,
             timelock_duration: 86400,
             approval_threshold_bps: 6000,
+            quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
         };
@@ -961,17 +1101,18 @@ mod tests {
         assert_eq!(client.get_config().fee_bps, 200);
 
         // Old admin should be rejected
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let config2 = GovernanceConfig {
                 fee_bps: 300,
                 voting_period: 604800,
                 timelock_duration: 86400,
                 approval_threshold_bps: 6000,
+                quorum_bps: 5000,
                 min_proposal_deposit: 1000,
                 max_active_proposals: 10,
             };
             client.update_config(&admin, &config2);
-        });
+        }));
         assert!(result.is_err());
     }
 
@@ -1073,8 +1214,8 @@ mod tests {
 
         let action = GovernanceAction {
             target: mock_id.clone(),
-            function: Symbol::new(&e, "set_value"),
-            args: Vec::from_array(&e, [42i128.into_val(&e)]),
+            function: soroban_sdk::Symbol::new(&e, "set_value"),
+            args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&42i128, &e)]),
         };
         let actions = Vec::from_array(&e, [action]);
 
@@ -1116,18 +1257,18 @@ mod tests {
         let gov_client = GovernanceClient::new(&e, &gov_id);
         gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
 
-        let sym1 = Symbol::new(&e, "hello");
-        let sym2 = Symbol::new(&e, "world");
+        let sym1 = soroban_sdk::Symbol::new(&e, "hello");
+        let sym2 = soroban_sdk::Symbol::new(&e, "world");
 
         let action1 = GovernanceAction {
             target: mock_id.clone(),
-            function: Symbol::new(&e, "echo_arg"),
-            args: Vec::from_array(&e, [sym1.clone().into_val(&e)]),
+            function: soroban_sdk::Symbol::new(&e, "echo_arg"),
+            args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&sym1.clone(), &e)]),
         };
         let action2 = GovernanceAction {
             target: mock_id.clone(),
-            function: Symbol::new(&e, "echo_arg"),
-            args: Vec::from_array(&e, [sym2.clone().into_val(&e)]),
+            function: soroban_sdk::Symbol::new(&e, "echo_arg"),
+            args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&sym2.clone(), &e)]),
         };
         let actions = Vec::from_array(&e, [action1, action2]);
 
@@ -1174,7 +1315,7 @@ mod tests {
 
         let action = GovernanceAction {
             target: mock_id.clone(),
-            function: Symbol::new(&e, "always_fail"),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
             args: Vec::new(&e),
         };
         let actions = Vec::from_array(&e, [action]);
@@ -1193,9 +1334,9 @@ mod tests {
         info.timestamp = proposal.timelock_ends_at + 1;
         e.ledger().set(info);
 
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             gov_client.execute(&member, &proposal_id);
-        });
+        }));
         assert!(result.is_err(), "execute must revert when an action fails");
 
         let proposal = gov_client.get_proposal(&proposal_id).unwrap();
@@ -1224,8 +1365,8 @@ mod tests {
 
         let action = GovernanceAction {
             target: mock_id.clone(),
-            function: Symbol::new(&e, "set_value"),
-            args: Vec::from_array(&e, [999i128.into_val(&e)]),
+            function: soroban_sdk::Symbol::new(&e, "set_value"),
+            args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&999i128, &e)]),
         };
         let actions = Vec::from_array(&e, [action]);
 
@@ -1262,7 +1403,7 @@ mod tests {
 
         let pause_action = GovernanceAction {
             target: admin.clone(), // target is ignored for built-in actions
-            function: Symbol::new(&e, "emergency_pause"),
+            function: soroban_sdk::Symbol::new(&e, "emergency_pause"),
             args: Vec::new(&e),
         };
         let actions = Vec::from_array(&e, [pause_action]);

@@ -167,7 +167,7 @@ soroban contract invoke \
   --network mainnet
 ```
 
-The proposal is automatically marked **Approved** once `votes_for / total_members ≥ 60 %` (configurable via `approval_threshold_bps`).
+The proposal is resolved once the number of cast votes reaches the **quorum** (`quorum_bps`, default 50%, of the eligible-voter count snapshotted at proposal creation). Approval requires `votes_for / eligible_voters ≥ 60 %` (configurable via `approval_threshold_bps`), so abstentions count as "no" rather than as implicit "yes" votes. Because the denominator is frozen at creation time, adding or removing members after a proposal exists does not change its threshold.
 
 **Step 3 — Wait for the timelock, then execute**
 
