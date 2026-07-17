@@ -287,8 +287,7 @@ fn mint_credits_respecting_cap(
         return 0;
     }
 
-    let total_supply: i128 =
-        e.invoke_contract(token, &Symbol::new(e, "total_supply"), vec![e]);
+    let total_supply: i128 = e.invoke_contract(token, &Symbol::new(e, "total_supply"), vec![e]);
     let max_supply: i128 = e.invoke_contract(token, &Symbol::new(e, "max_supply"), vec![e]);
 
     let mintable = if max_supply > 0 {

@@ -7,10 +7,7 @@
 //! `credit_token` contract end-to-end (not a mock) to prove the cap is honored.
 
 use credit_token::{CreditToken, CreditTokenClient};
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, BytesN, Env, IntoVal, String, Vec,
-};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal, String, Vec};
 use verification_oracle::{VerificationOracle, VerificationOracleClient};
 
 /// Readings that produce exactly 50 total_credits:
@@ -87,10 +84,30 @@ fn setup() -> Fixture {
 
 fn submit_three(f: &Fixture) {
     let (ph, turb, do_, flow, temp, n, p) = READING;
-    f.oracle_client
-        .submit_reading(&f.oracles.get(0).unwrap(), &f.project_id, &1, &ph, &turb, &do_, &flow, &temp, &n, &p);
-    f.oracle_client
-        .submit_reading(&f.oracles.get(1).unwrap(), &f.project_id, &1, &ph, &turb, &do_, &flow, &temp, &n, &p);
+    f.oracle_client.submit_reading(
+        &f.oracles.get(0).unwrap(),
+        &f.project_id,
+        &1,
+        &ph,
+        &turb,
+        &do_,
+        &flow,
+        &temp,
+        &n,
+        &p,
+    );
+    f.oracle_client.submit_reading(
+        &f.oracles.get(1).unwrap(),
+        &f.project_id,
+        &1,
+        &ph,
+        &turb,
+        &do_,
+        &flow,
+        &temp,
+        &n,
+        &p,
+    );
     f.oracle_client.submit_reading(
         &f.oracles.get(2).unwrap(),
         &f.project_id,
