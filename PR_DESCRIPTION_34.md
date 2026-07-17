@@ -59,12 +59,17 @@ if total_votes >= total_members {
 ### `vote()` (`contracts/governance/src/lib.rs`)
 - Increments `votes_for`/`votes_against` counts instead of pushing addresses.
 - Resolves a proposal when the number of cast votes reaches the **quorum**:
-  `ceil(quorum_bps / 10000 * eligible_voters)`.
-- Approval is measured as a fraction of `eligible_voters`
-  (`votes_for * 10000 / eligible_voters`), so abstentions count as "no" rather
-  than as implicit "yes" votes.
+  `ceil(quorum_bps / 10000 * eligible_voters)`. This fixes the liveness bug —
+  a proposal no longer needs 100% turnout against the live membership count, so
+  adding a member after creation can no longer deadlock it.
+- Approval is measured as a fraction of **cast votes**
+  (`votes_for * 10000 / (votes_for + votes_against)`), gated by the quorum so a
+  proposal cannot resolve on a single vote from a tiny subset of the membership.
 - Resolution uses only the snapshot, never the live `member_count()`, so
   `add_member`/`remove_member` after creation cannot change the threshold.
+- A vote cast after the proposal is already `Approved`/`Rejected`/`Executed` is
+  now a harmless no-op (previously it panicked with "proposal not active"), so
+  voting past the quorum no longer aborts.
 
 ### `GovernanceConfig` (`contracts/governance/src/lib.rs`)
 - Added `quorum_bps: u32` (default `5000` = 50% of eligible voters). This is the
@@ -89,14 +94,20 @@ The fix adopts the following, now documented, semantics:
 1. **Quorum** — a proposal is only resolved once `votes_for + votes_against`
    reaches `quorum_bps` of `eligible_voters` (default 50%). Below quorum the
    proposal remains `Active` and resolves only when quorum is met (or it
-   expires at `voting_ends_at`).
-2. **Approval** — a proposal is `Approved` iff
-   `votes_for * 10000 / eligible_voters >= approval_threshold_bps`
-   (default 6000 = 60%). The denominator is `eligible_voters`, so abstentions
-   act as "no" and a quiet majority cannot be overridden by a few active voters.
+   expires at `voting_ends_at`). The quorum denominator is the
+   creation-time snapshot, so membership changes after creation cannot move the
+   goalposts.
+2. **Approval** — once quorum is reached, a proposal is `Approved` iff
+   `votes_for * 10000 / (votes_for + votes_against) >= approval_threshold_bps`
+   (default 6000 = 60%). Approval is measured over **cast votes**, gated by the
+   quorum so a proposal cannot resolve on a single vote from a tiny subset of
+   the membership.
 
-This is the "majority of eligible voters" interpretation: participation is
-gated by quorum, and the decision is measured against the full eligible set.
+This is the "majority of cast votes once quorum (of eligible voters) is reached"
+interpretation explicitly listed as a valid design choice in the issue's
+*Key Challenges* section. Abstentions therefore do not count as explicit "yes"
+votes beyond the quorum gate, and the prior liveness bug (proposals stuck in
+`Active` when membership changed) is fully resolved.
 
 ## Acceptance criteria
 

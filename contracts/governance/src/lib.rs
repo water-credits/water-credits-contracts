@@ -294,11 +294,16 @@ impl Governance {
     ///
     /// A proposal is resolved (Approved/Rejected) once the number of cast votes
     /// reaches the quorum derived from `Proposal.eligible_voters` (snapshotted at
-    /// creation), not when 100% turnout is achieved. Approval is measured as a
-    /// fraction of `eligible_voters`, so abstentions count as "no" rather than as
-    /// implicit "yes" votes. Because the denominator is frozen at creation time,
-    /// adding or removing members after a proposal exists cannot change its
-    /// threshold retroactively.
+    /// creation), not when 100% turnout is achieved. Because the quorum
+    /// denominator is frozen at creation time, adding or removing members after a
+    /// proposal exists cannot change its threshold retroactively — this fixes the
+    /// liveness bug where a proposal could get stuck in `Active` forever when a
+    /// member was added after creation.
+    ///
+    /// Approval is measured as a fraction of *cast* votes once quorum (a minimum
+    /// participation level of `eligible_voters`) is reached. The quorum gate
+    /// ensures a proposal cannot resolve on a single vote from a tiny subset of
+    /// the membership; see `GovernanceConfig::quorum_bps`.
     pub fn vote(e: Env, voter: Address, proposal_id: u64, approve: bool) {
         voter.require_auth();
 
@@ -325,8 +330,13 @@ impl Governance {
             proposal.status = ProposalStatus::Active;
         }
 
+        // If the proposal has already been resolved (Approved/Rejected) or
+        // executed, a late vote is a harmless no-op: the outcome is final and
+        // cannot be changed by further votes. This also prevents a panic when a
+        // member votes after the quorum was already reached (the proposal may
+        // have resolved before every member cast their vote).
         if !matches!(proposal.status, ProposalStatus::Active) {
-            panic!("proposal not active");
+            return;
         }
 
         if timestamp > proposal.voting_ends_at {
@@ -375,11 +385,12 @@ impl Governance {
         };
 
         if (total_votes as u64) >= quorum {
-            // Approval is measured against eligible voters: abstentions are
-            // counted as "no", so a silent majority cannot be overruled by a
-            // small number of active voters.
-            let yes_pct = if proposal.eligible_voters > 0 {
-                (proposal.votes_for as u64 * 10000) / proposal.eligible_voters as u64
+            // Approval is measured as a fraction of cast votes. The quorum gate
+            // above already guarantees a minimum participation level, so a
+            // proposal cannot resolve on a single vote from a tiny subset of the
+            // membership.
+            let yes_pct = if total_votes > 0 {
+                (proposal.votes_for as u64 * 10000) / total_votes as u64
             } else {
                 0
             };

@@ -167,7 +167,7 @@ soroban contract invoke \
   --network mainnet
 ```
 
-The proposal is resolved once the number of cast votes reaches the **quorum** (`quorum_bps`, default 50%, of the eligible-voter count snapshotted at proposal creation). Approval requires `votes_for / eligible_voters ≥ 60 %` (configurable via `approval_threshold_bps`), so abstentions count as "no" rather than as implicit "yes" votes. Because the denominator is frozen at creation time, adding or removing members after a proposal exists does not change its threshold.
+The proposal is resolved (Approved/Rejected) once the number of cast votes reaches the **quorum** — `quorum_bps` (default 50%) of the eligible-voter count snapshotted at proposal creation. The approval threshold `votes_for / (votes_for + votes_against) ≥ 60 %` (configurable via `approval_threshold_bps`) is then measured over the cast votes. Because the quorum denominator is frozen at creation time, adding or removing members after a proposal exists does not change its threshold, fixing the prior bug where proposals could get stuck in `Active` forever. A vote cast after a proposal is already resolved is a harmless no-op.
 
 **Step 3 — Wait for the timelock, then execute**
 
