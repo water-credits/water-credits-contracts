@@ -48,6 +48,12 @@ pub struct VerificationResult {
     pub quality_penalty: i64,
     pub volumetric_credit: i128,
     pub total_credits: i128,
+    /// Amount of `total_credits` that was actually minted to the beneficiary.
+    /// May be less than `total_credits` when the token's `max_supply` cap is
+    /// reached (partial mint), or `0` when the cap is already exhausted or no
+    /// project token is configured. Distinguishes "credits earned" from
+    /// "credits actually minted" (Issue #36).
+    pub credits_minted: i128,
     pub oracle_count: u32,
     pub finalized_at: u64,
 }
@@ -255,6 +261,61 @@ fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
     }
 }
 
+/// Read the token's `total_supply` and `max_supply` and mint at most
+/// `total_credits` to `beneficiary`, never exceeding the remaining supply
+/// allowance. Returns the amount actually minted.
+///
+/// This prevents the partial-rollback failure mode described in Issue #36:
+/// calling `mint_to` with `total_credits` when
+/// `total_supply + total_credits > max_supply` panics inside the token and
+/// rolls back the entire oracle finalization (leaving the window in a broken
+/// state). By clamping to `max_supply - total_supply` up front, the mint call
+/// can never breach the cap.
+///
+/// Semantics:
+/// - `total_credits <= 0` → no mint is attempted, returns `0`.
+/// - `max_supply == 0` → token is uncapped; the full `total_credits` is minted.
+/// - `total_supply >= max_supply` → nothing remains; returns `0`, no mint.
+/// - otherwise → mints `min(total_credits, max_supply - total_supply)`.
+fn mint_credits_respecting_cap(
+    e: &Env,
+    token: &Address,
+    beneficiary: &Address,
+    total_credits: i128,
+) -> i128 {
+    if total_credits <= 0 {
+        return 0;
+    }
+
+    let total_supply: i128 =
+        e.invoke_contract(token, &Symbol::new(e, "total_supply"), vec![e]);
+    let max_supply: i128 = e.invoke_contract(token, &Symbol::new(e, "max_supply"), vec![e]);
+
+    let mintable = if max_supply > 0 {
+        let remaining = max_supply - total_supply;
+        if remaining <= 0 {
+            0
+        } else {
+            remaining.min(total_credits)
+        }
+    } else {
+        total_credits
+    };
+
+    if mintable <= 0 {
+        return 0;
+    }
+
+    let mint_args: Vec<Val> = vec![
+        e,
+        e.current_contract_address().to_val(),
+        beneficiary.to_val(),
+        mintable.into_val(e),
+    ];
+    e.invoke_contract::<()>(token, &Symbol::new(e, "mint_to"), mint_args);
+    mintable
+}
+
 #[contract]
 pub struct VerificationOracle;
 
@@ -439,10 +500,10 @@ impl VerificationOracle {
         total_nitrogen: i64,
         total_phosphorus: i64,
     ) -> Option<VerificationResult> {
-        let result = Self::submit_reading_impl(
-            e.clone(),
+        Self::submit_reading_impl(
+            e,
             oracle,
-            project_id.clone(),
+            project_id,
             nonce,
             ph,
             turbidity,
@@ -451,33 +512,7 @@ impl VerificationOracle {
             temperature,
             total_nitrogen,
             total_phosphorus,
-        );
-        if let Some(ref res) = result {
-            // Only mint when credits are positive.  A zero-credit window is a
-            // valid environmental outcome (e.g. baseline window, high-flow
-            // zero-nutrient-removal reading).  Calling mint_to with amount 0
-            // would panic inside credit_token ("amount must be positive"), which
-            // would roll back ALL state written by submit_reading_impl — leaving
-            // nonces and OracleSubmitted markers in an inconsistent state and
-            // permanently locking the window.
-            if res.total_credits > 0 {
-                let cfg_key = DataKey::ProjectConfig(project_id);
-                if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
-                    let mint_args: Vec<Val> = vec![
-                        &e,
-                        e.current_contract_address().to_val(),
-                        config.beneficiary.to_val(),
-                        res.total_credits.into_val(&e),
-                    ];
-                    e.invoke_contract::<()>(
-                        &config.token_contract,
-                        &Symbol::new(&e, "mint_to"),
-                        mint_args,
-                    );
-                }
-            }
-        }
-        result
+        )
     }
 
     fn submit_reading_impl(
@@ -678,16 +713,33 @@ impl VerificationOracle {
             // Apply quality penalty
             let total: i128 = gross * (10000 - penalty as i128) / 10000;
 
-            let result = VerificationResult {
+            let mut result = VerificationResult {
                 project_id: project_id.clone(),
                 n_removal_kg: n_removed,
                 p_removal_kg: p_removed,
                 quality_penalty: penalty,
                 volumetric_credit,
                 total_credits: total,
+                credits_minted: 0,
                 oracle_count: window.submissions.len(),
                 finalized_at: e.ledger().timestamp(),
             };
+
+            // Mint credits to the beneficiary, clamped to the token's
+            // max_supply cap. This runs BEFORE the result is persisted so that
+            // `credits_minted` is recorded accurately and so a cap breach can
+            // never roll back finalization (Issue #36). If no project token is
+            // configured, or the cap is already exhausted, no mint occurs and
+            // the window still finalizes cleanly.
+            let cfg_key = DataKey::ProjectConfig(project_id.clone());
+            if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
+                result.credits_minted = mint_credits_respecting_cap(
+                    &e,
+                    &config.token_contract,
+                    &config.beneficiary,
+                    result.total_credits,
+                );
+            }
 
             // Persist last result
             let last_key = DataKey::LastResult(project_id.clone());
@@ -1614,16 +1666,30 @@ impl VerificationOracle {
         let gross = n_credit + p_credit + volumetric_credit;
         let total: i128 = gross * (10000 - penalty as i128) / 10000;
 
-        let result = VerificationResult {
+        let mut result = VerificationResult {
             project_id: project_id.clone(),
             n_removal_kg: n_removed,
             p_removal_kg: p_removed,
             quality_penalty: penalty,
             volumetric_credit,
             total_credits: total,
+            credits_minted: 0,
             oracle_count: window.submissions.len(),
             finalized_at: e.ledger().timestamp(),
         };
+
+        // Mint credits to the beneficiary, clamped to the token's max_supply cap
+        // (same handling as submit_reading_impl; see Issue #36). Runs before the
+        // result is persisted so `credits_minted` is recorded accurately.
+        let cfg_key = DataKey::ProjectConfig(project_id.clone());
+        if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
+            result.credits_minted = mint_credits_respecting_cap(
+                &e,
+                &config.token_contract,
+                &config.beneficiary,
+                result.total_credits,
+            );
+        }
 
         // Persist last result
         let last_key = DataKey::LastResult(project_id.clone());
