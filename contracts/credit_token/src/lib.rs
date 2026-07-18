@@ -574,10 +574,8 @@ impl CreditToken {
         e.events()
             .publish((EVENT_RETIRED,), (holder.clone(), amount, cert.clone()));
 
-        let registry_addr: Option<Address> = e
-            .storage()
-            .instance()
-            .get(&DataKey::RetirementRegistry);
+        let registry_addr: Option<Address> =
+            e.storage().instance().get(&DataKey::RetirementRegistry);
         if registry_addr.is_some() {
             let registry = registry_addr.unwrap();
             let record_args: Vec<Val> = vec![
