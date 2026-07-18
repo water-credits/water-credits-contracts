@@ -48,6 +48,7 @@ pub struct RetirementCertificate {
     pub purpose: String,
     pub timestamp: u64,
     pub metadata_uri: String,
+    pub registry_record_id: Option<u64>,
 }
 
 #[contracttype]
@@ -75,6 +76,8 @@ pub enum DataKey {
     /// An address that is allowed to call pause/unpause in addition to the admin.
     /// Used to grant the governance contract emergency pause rights.
     PauseGuardian,
+    /// When true, `retire()` panics if no retirement registry is configured.
+    RequireRegistry,
 }
 
 fn is_paused(e: &Env) -> bool {
@@ -242,6 +245,25 @@ impl CreditToken {
         e.storage()
             .instance()
             .set(&DataKey::RetirementRegistry, &registry);
+    }
+
+    /// When true, `retire()` panics if no retirement registry is configured.
+    pub fn set_require_registry(e: Env, admin: Address, require: bool) {
+        admin.require_auth();
+        if admin != read_admin(&e) {
+            panic!("unauthorized");
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::RequireRegistry, &require);
+    }
+
+    /// Return whether strict retirement registry mode is enabled.
+    pub fn require_registry(e: Env) -> bool {
+        e.storage()
+            .instance()
+            .get(&DataKey::RequireRegistry)
+            .unwrap_or(false)
     }
 
     /// Pause all token operations (mint, transfer, retire). Admin or pause guardian only.
@@ -552,11 +574,12 @@ impl CreditToken {
         e.events()
             .publish((EVENT_RETIRED,), (holder.clone(), amount, cert.clone()));
 
-        if let Some(registry) = e
+        let registry_addr: Option<Address> = e
             .storage()
             .instance()
-            .get::<_, Address>(&DataKey::RetirementRegistry)
-        {
+            .get(&DataKey::RetirementRegistry);
+        if registry_addr.is_some() {
+            let registry = registry_addr.unwrap();
             let record_args: Vec<Val> = vec![
                 &e,
                 e.current_contract_address().to_val(),
@@ -566,11 +589,21 @@ impl CreditToken {
                 purpose.to_val(),
                 metadata_uri.to_val(),
             ];
-            e.invoke_contract::<Val>(
+            let record_id: u64 = e.invoke_contract::<Val>(
                 &registry,
                 &Symbol::new(&e, "record_retirement"),
                 record_args,
             );
+            let mut updated_cert = cert;
+            updated_cert.registry_record_id = Some(record_id);
+            e.storage().persistent().set(&cert_key, &updated_cert);
+        } else if e
+            .storage()
+            .instance()
+            .get(&DataKey::RequireRegistry)
+            .unwrap_or(false)
+        {
+            panic!("retirement registry is required");
         }
 
         cert
