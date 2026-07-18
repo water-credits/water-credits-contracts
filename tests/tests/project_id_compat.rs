@@ -5,7 +5,7 @@
 //! `shared::generate_project_id` helper.
 
 use shared::generate_project_id;
-use soroban_sdk::{testutils::Address as _, BytesN, Env};
+use soroban_sdk::{BytesN, Env};
 
 /// The same (count, timestamp) pair must produce the same ID via the shared helper.
 #[test]

@@ -30,7 +30,6 @@ pub fn generate_project_id(e: &Env, count: u64, timestamp: u64) -> BytesN<32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
 
     #[test]
     fn test_deterministic() {

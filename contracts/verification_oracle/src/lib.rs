@@ -957,7 +957,7 @@ impl VerificationOracle {
     pub fn stake(e: Env, oracle: Address, amount: i128) {
         oracle.require_auth();
         if amount <= 0 {
-            panic!("stake amount must be positive");
+            soroban_sdk::panic_with_error!(&e, soroban_sdk::Error::from_contract_error(1));
         }
         let config: OracleConfig = read_config(&e);
 
@@ -1754,6 +1754,13 @@ impl VerificationOracle {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger as _;
+
+    fn set_ledger_timestamp(e: &Env, timestamp: u64) {
+        let mut info = e.ledger().get();
+        info.timestamp = timestamp;
+        e.ledger().set(info);
+    }
 
     // Minimal mock token that implements transfer_from and transfer.
     // In tests with mock_all_auths, auth checks are bypassed.
@@ -2359,7 +2366,7 @@ mod tests {
 
     #[test]
     fn test_stake_increases_balance() {
-        let (e, admin, client) = setup_with_client();
+        let (e, _admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
@@ -2371,7 +2378,7 @@ mod tests {
 
     #[test]
     fn test_stake_accumulates() {
-        let (e, admin, client) = setup_with_client();
+        let (e, _admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
@@ -2387,17 +2394,13 @@ mod tests {
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
-        let result = e.try_invoke_contract::<_, ()>(
-            &client.address,
-            &Symbol::new(&e, "stake"),
-            vec![&e, oracle.to_val(), 0i128.into_val(&e)],
-        );
+        let result = client.try_stake(&oracle, &0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_unstake_reduces_balance() {
-        let (e, admin, client) = setup_with_client();
+        let (e, _admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
@@ -2410,12 +2413,12 @@ mod tests {
 
     #[test]
     fn test_unstake_insufficient_balance_panics() {
-        let (e, admin, client) = setup_with_client();
+        let (e, _admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
         client.stake(&oracle, &1000);
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "unstake"),
             vec![&e, oracle.to_val(), 2000i128.into_val(&e)],
@@ -2433,7 +2436,7 @@ mod tests {
         client.add_oracle(&admin, &oracle);
 
         // min_stake is 1000, staking 1500, trying to unstake 600 would leave 900 < 1000
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "unstake"),
             vec![&e, oracle.to_val(), 600i128.into_val(&e)],
@@ -2458,7 +2461,7 @@ mod tests {
 
     #[test]
     fn test_stake_clears_unstake_request() {
-        let (e, admin, client) = setup_with_client();
+        let (e, _admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
@@ -2520,7 +2523,7 @@ mod tests {
         let oracle = Address::generate(&e);
 
         client.stake(&oracle, &1000);
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "slash"),
             vec![
@@ -2542,7 +2545,7 @@ mod tests {
         let rando = Address::generate(&e);
 
         client.stake(&oracle, &5000);
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "slash"),
             vec![
@@ -2563,7 +2566,7 @@ mod tests {
         let oracle = Address::generate(&e);
 
         // min_stake is 1000 by default, oracle has 0 stake
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "add_oracle"),
             vec![&e, admin.to_val(), oracle.to_val()],
@@ -2601,7 +2604,7 @@ mod tests {
         client.add_oracle(&admin, &o4);
 
         // Cannot remove while staked
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "remove_oracle"),
             vec![&e, admin.to_val(), o4.to_val()],
@@ -2654,7 +2657,7 @@ mod tests {
         client.update_config(&admin, &config);
 
         let project_id = BytesN::from_array(&e, &[1u8; 32]);
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "submit_reading"),
             vec![
@@ -2696,7 +2699,7 @@ mod tests {
         client.stake(&oracle, &5000);
         client.unstake(&oracle, &2000);
 
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "claim_unstake"),
             vec![&e, oracle.to_val()],
@@ -2706,7 +2709,7 @@ mod tests {
 
     #[test]
     fn test_getters_return_config_values() {
-        let (e, _admin, client) = setup_with_client();
+        let (_e, _admin, client) = setup_with_client();
 
         let cooldown = client.get_unstake_cooldown();
         assert_eq!(cooldown, 86400);
@@ -2776,7 +2779,7 @@ mod tests {
     }
 
     fn make_reveal_params(
-        e: &Env,
+        _e: &Env,
         nonce: u64,
         ph: i64,
         turbidity: i64,
@@ -2824,7 +2827,7 @@ mod tests {
         }
 
         // Advance time past commit phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
 
         client.begin_reveal_phase(&project_id);
         let phase = client.get_window_phase(&project_id);
@@ -2864,20 +2867,20 @@ mod tests {
         client.commit_reading(&oracles.get(0).unwrap(), &project_id, &nonce, &commitment);
 
         // Advance to reveal phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
         client.begin_reveal_phase(&project_id);
 
         // Try to reveal with wrong values (different salt)
         let wrong_salt = BytesN::from_array(&e, &[0xCCu8; 32]);
         let wrong_params = make_reveal_params(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &wrong_salt);
-        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
+        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "reveal_reading"),
             vec![
                 &e,
                 oracles.get(0).unwrap().to_val(),
                 project_id.to_val(),
-                wrong_params.to_val(),
+                wrong_params.into_val(&e),
             ],
         );
         assert!(result.is_err());
@@ -2899,18 +2902,18 @@ mod tests {
         client.commit_reading(&oracles.get(0).unwrap(), &project_id, &nonce, &commitment);
 
         // Advance past both commit and reveal phases
-        e.ledger().set_timestamp(e.ledger().timestamp() + 601);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 601);
 
         // Trying to reveal after reveal phase ended should panic
         let params = make_reveal_params(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
-        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
+        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "reveal_reading"),
             vec![
                 &e,
                 oracles.get(0).unwrap().to_val(),
                 project_id.to_val(),
-                params.to_val(),
+                params.into_val(&e),
             ],
         );
         assert!(result.is_err());
@@ -2937,7 +2940,7 @@ mod tests {
         }
 
         // Advance to reveal phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
         client.begin_reveal_phase(&project_id);
 
         // Only 3 out of 4 oracles reveal
@@ -2948,7 +2951,7 @@ mod tests {
         }
 
         // Advance past reveal phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
 
         // finalize_window penalizes the non-revealer
         let result = client.finalize_window(&project_id);
@@ -2974,7 +2977,7 @@ mod tests {
         let rando = Address::generate(&e);
         let project_id = BytesN::from_array(&e, &[104u8; 32]);
 
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "open_window"),
             vec![&e, rando.to_val(), project_id.to_val()],
@@ -2990,7 +2993,7 @@ mod tests {
         let project_id = BytesN::from_array(&e, &[105u8; 32]);
         client.open_window(&admin, &project_id);
 
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "open_window"),
             vec![&e, admin.to_val(), project_id.to_val()],
@@ -3008,7 +3011,7 @@ mod tests {
 
         let inactive = Address::generate(&e);
         let commitment = BytesN::from_array(&e, &[0xFFu8; 32]);
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "commit_reading"),
             vec![
@@ -3037,7 +3040,7 @@ mod tests {
         client.commit_reading(&oracles.get(0).unwrap(), &project_id, &nonce, &commitment);
 
         // Second commit from same oracle should fail
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "commit_reading"),
             vec![
@@ -3062,19 +3065,19 @@ mod tests {
         client.open_window(&admin, &project_id);
 
         // Skip commit phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
         client.begin_reveal_phase(&project_id);
 
         let salt = BytesN::from_array(&e, &[0x22u8; 32]);
         let params = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
-        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
+        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "reveal_reading"),
             vec![
                 &e,
                 oracles.get(0).unwrap().to_val(),
                 project_id.to_val(),
-                params.to_val(),
+                params.into_val(&e),
             ],
         );
         assert!(result.is_err());
@@ -3089,7 +3092,7 @@ mod tests {
         client.open_window(&admin, &project_id);
 
         // Try to transition before commit phase ends
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "begin_reveal_phase"),
             vec![&e, project_id.to_val()],
@@ -3116,7 +3119,7 @@ mod tests {
         }
 
         // Advance to reveal phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
         client.begin_reveal_phase(&project_id);
 
         // All oracles reveal
@@ -3127,7 +3130,7 @@ mod tests {
         }
 
         // Try to finalize_window before reveal phase ends should fail (already auto-finalized)
-        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
+        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "finalize_window"),
             vec![&e, project_id.to_val()],
@@ -3150,21 +3153,21 @@ mod tests {
         let commitment = sha256_commitment(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
         client.commit_reading(&oracles.get(0).unwrap(), &project_id, &nonce, &commitment);
 
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
         client.begin_reveal_phase(&project_id);
 
         let params = make_reveal_params(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
         client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params);
 
         // Second reveal should fail
-        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
+        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "reveal_reading"),
             vec![
                 &e,
                 oracles.get(0).unwrap().to_val(),
                 project_id.to_val(),
-                params.to_val(),
+                params.into_val(&e),
             ],
         );
         assert!(result.is_err());
@@ -3183,7 +3186,7 @@ mod tests {
         let commitment = BytesN::from_array(&e, &[0x55u8; 32]);
 
         // First oracle tries to commit with wrong nonce (should be 1)
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "commit_reading"),
             vec![
@@ -3237,7 +3240,7 @@ mod tests {
         }
 
         // Advance to reveal phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
         client.begin_reveal_phase(&project_id);
 
         // Only 2 reveal (below min_oracles=3)
@@ -3246,7 +3249,7 @@ mod tests {
         client.reveal_reading(&oracles.get(1).unwrap(), &project_id, &params);
 
         // Advance past reveal phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
 
         // finalize_window - but with only 2 reveals (below min), no result
         let result = client.finalize_window(&project_id);
@@ -3304,7 +3307,7 @@ mod tests {
         client.update_config(&admin, &config);
 
         let commitment = BytesN::from_array(&e, &[0x88u8; 32]);
-        let result = e.try_invoke_contract::<_, ()>(
+        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
             &client.address,
             &Symbol::new(&e, "commit_reading"),
             vec![
@@ -3339,7 +3342,7 @@ mod tests {
         }
 
         // Advance to reveal phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
         client.begin_reveal_phase(&project_id);
 
         // Only oracle 0 reveals
@@ -3347,7 +3350,7 @@ mod tests {
         client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params);
 
         // Advance past reveal phase
-        e.ledger().set_timestamp(e.ledger().timestamp() + 301);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
 
         let result = client.finalize_window(&project_id);
         assert!(result.is_none()); // Only 1 reveal, below min_oracles

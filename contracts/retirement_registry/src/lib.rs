@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(proj_a_records.len(), 2);
 
         let total_a: i128 = (0..proj_a_records.len())
-            .map(|i| proj_a_records.get(i as u32).unwrap().amount)
+            .map(|i| proj_a_records.get(i).unwrap().amount)
             .sum();
         assert_eq!(total_a, 500);
 

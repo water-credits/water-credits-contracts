@@ -669,6 +669,7 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Events;
+    use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::{Address, Env, String, TryFromVal};
 
     fn setup() -> (
@@ -894,7 +895,7 @@ mod tests {
 
         // Advance ledger far beyond any reasonable value — should still work
         let mut info = e.ledger().get();
-        info.sequence = 999_999;
+        info.sequence_number = 999_999;
         e.ledger().set(info);
 
         client.transfer_from(&spender, &owner, &recipient, &100);
@@ -913,7 +914,7 @@ mod tests {
 
         // Advance to expiration ledger
         let mut info = e.ledger().get();
-        info.sequence = 10;
+        info.sequence_number = 10;
         e.ledger().set(info);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -936,7 +937,7 @@ mod tests {
 
         // Advance to one ledger before expiration
         let mut info = e.ledger().get();
-        info.sequence = 9;
+        info.sequence_number = 9;
         e.ledger().set(info);
 
         client.transfer_from(&spender, &owner, &recipient, &100);

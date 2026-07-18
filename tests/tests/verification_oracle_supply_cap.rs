@@ -7,7 +7,7 @@
 //! `credit_token` contract end-to-end (not a mock) to prove the cap is honored.
 
 use credit_token::{CreditToken, CreditTokenClient};
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, IntoVal, String, Vec};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Vec};
 use verification_oracle::{VerificationOracle, VerificationOracleClient};
 
 /// Readings that produce exactly 50 total_credits:
@@ -20,7 +20,7 @@ use verification_oracle::{VerificationOracle, VerificationOracleClient};
 const READING: (i64, i64, i64, i64, i64, i64, i64) = (700, 10, 80, 500, 250, 10, 2);
 
 struct Fixture {
-    e: Env,
+    _e: Env,
     admin: Address,
     oracle_client: VerificationOracleClient<'static>,
     token_client: CreditTokenClient<'static>,
@@ -72,7 +72,7 @@ fn setup() -> Fixture {
     }
 
     Fixture {
-        e,
+        _e: e,
         admin,
         oracle_client,
         token_client,
