@@ -150,6 +150,8 @@ pub enum DataKey {
     OracleStake(Address),
     OracleSlashed(Address),
     OracleMissedReveals(Address),
+    /// Index of project IDs with open (non-finalized) windows
+    OpenProjects,
     // ── Temporary (window-scoped, can expire after finalization) ──
     WindowState(BytesN<32>),
     OracleSubmitted(BytesN<32>, Address),
@@ -261,6 +263,63 @@ fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
     } else {
         sorted.get(len / 2).unwrap()
     }
+}
+
+fn add_open_project(e: &Env, project_id: &BytesN<32>) {
+    let mut open: Vec<BytesN<32>> = e
+        .storage()
+        .instance()
+        .get(&DataKey::OpenProjects)
+        .unwrap_or(Vec::new(e));
+    for i in 0..open.len() {
+        if open.get(i).unwrap() == *project_id {
+            return;
+        }
+    }
+    open.push_back(project_id.clone());
+    e.storage().instance().set(&DataKey::OpenProjects, &open);
+}
+
+fn remove_open_project(e: &Env, project_id: &BytesN<32>) {
+    let open: Vec<BytesN<32>> = e
+        .storage()
+        .instance()
+        .get(&DataKey::OpenProjects)
+        .unwrap_or(Vec::new(e));
+    let mut filtered: Vec<BytesN<32>> = Vec::new(e);
+    for i in 0..open.len() {
+        let p = open.get(i).unwrap();
+        if p != *project_id {
+            filtered.push_back(p);
+        }
+    }
+    e.storage()
+        .instance()
+        .set(&DataKey::OpenProjects, &filtered);
+}
+
+fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
+    let open: Vec<BytesN<32>> = e
+        .storage()
+        .instance()
+        .get(&DataKey::OpenProjects)
+        .unwrap_or(Vec::new(e));
+    for i in 0..open.len() {
+        let pid = open.get(i).unwrap();
+        if e.storage()
+            .temporary()
+            .has(&DataKey::OracleSubmitted(pid.clone(), oracle.clone()))
+            || e.storage()
+                .temporary()
+                .has(&DataKey::OracleCommitted((pid.clone(), oracle.clone())))
+            || e.storage()
+                .temporary()
+                .has(&DataKey::OracleRevealed((pid.clone(), oracle.clone())))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read the token's `total_supply` and `max_supply` and mint at most
@@ -449,6 +508,9 @@ impl VerificationOracle {
         if count <= config.min_oracles {
             panic!("minimum oracles required");
         }
+        if oracle_has_open_submissions(&e, &oracle) {
+            panic!("oracle has open window submissions");
+        }
         e.storage()
             .persistent()
             .remove(&DataKey::OracleActive(oracle.clone()));
@@ -608,6 +670,8 @@ impl VerificationOracle {
             panic!("window already finalized");
         }
 
+        add_open_project(&e, &project_id);
+
         let timestamp = e.ledger().timestamp();
 
         let submission = ReadingSubmission {
@@ -765,6 +829,8 @@ impl VerificationOracle {
             window.finalized = true;
             e.storage().temporary().set(&window_key, &window);
             // no extend needed — finalized windows can expire
+
+            remove_open_project(&e, &project_id);
 
             e.events()
                 .publish((EVENT_READING_VERIFIED,), (project_id, result.clone()));
@@ -1200,6 +1266,8 @@ impl VerificationOracle {
         e.storage()
             .temporary()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
+
+        add_open_project(&e, &project_id);
 
         e.events().publish((EVENT_WINDOW_OPENED,), (project_id,));
     }
@@ -1716,6 +1784,8 @@ impl VerificationOracle {
         window.phase = WindowPhase::Finalized;
         // Write finalized state back; window will naturally expire via TTL
         e.storage().temporary().set(&window_key, &window);
+
+        remove_open_project(&e, &project_id);
 
         // Clean up commit/reveal markers for all oracles in this window
         let oracles: Vec<Address> = e
@@ -3511,5 +3581,164 @@ mod tests {
         assert_eq!(history.len(), 2, "history must contain both windows");
         assert_eq!(history.get(0).unwrap().total_credits, 0);
         assert!(history.get(1).unwrap().total_credits > 0);
+    }
+
+    // ── remove_oracle open-window guard tests ──
+
+    #[test]
+    fn test_remove_oracle_with_open_submissions_panics() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        let o4 = Address::generate(&e);
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        client.update_config(&admin, &config);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        client.add_oracle(&admin, &o4);
+
+        let project_id = BytesN::from_array(&e, &[210u8; 32]);
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "remove_oracle"),
+            vec![&e, admin.to_val(), o1.to_val()],
+        );
+        assert!(result.is_err());
+        assert!(client.is_oracle_active(&o1));
+    }
+
+    #[test]
+    fn test_remove_oracle_no_open_submissions_succeeds() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        let o4 = Address::generate(&e);
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        client.update_config(&admin, &config);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        client.add_oracle(&admin, &o4);
+
+        let project_id = BytesN::from_array(&e, &[211u8; 32]);
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        client.remove_oracle(&admin, &o4);
+        assert!(!client.is_oracle_active(&o4));
+    }
+
+    #[test]
+    fn test_remove_oracle_after_window_finalization_succeeds() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        let o4 = Address::generate(&e);
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        client.update_config(&admin, &config);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        client.add_oracle(&admin, &o4);
+
+        let project_id = BytesN::from_array(&e, &[212u8; 32]);
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        client.remove_oracle(&admin, &o4);
+        assert!(!client.is_oracle_active(&o4));
+
+        let result = client.get_last_result(&project_id);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().oracle_count, 3);
+    }
+
+    #[test]
+    fn test_window_finalizes_after_oracle_removed_between_windows() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        let o4 = Address::generate(&e);
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        client.update_config(&admin, &config);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        client.add_oracle(&admin, &o4);
+
+        let project_id = BytesN::from_array(&e, &[213u8; 32]);
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+
+        let first = client.get_last_result(&project_id);
+        assert!(first.is_some());
+        assert_eq!(first.unwrap().oracle_count, 3);
+
+        client.remove_oracle(&admin, &o4);
+        assert!(!client.is_oracle_active(&o4));
+
+        client.reset_window(&admin, &project_id);
+        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        let result =
+            client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().oracle_count, 3);
+    }
+
+    #[test]
+    fn test_remove_oracle_with_open_window_panics() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        let o4 = Address::generate(&e);
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        client.update_config(&admin, &config);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        client.add_oracle(&admin, &o4);
+
+        let project_id = BytesN::from_array(&e, &[214u8; 32]);
+        client.open_window(&admin, &project_id);
+
+        let salt = BytesN::from_array(&e, &[0xA1u8; 32]);
+        let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&o1, &project_id, &1, &commitment);
+
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "remove_oracle"),
+            vec![&e, admin.to_val(), o1.to_val()],
+        );
+        assert!(result.is_err());
+        assert!(client.is_oracle_active(&o1));
     }
 }
