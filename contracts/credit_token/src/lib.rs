@@ -541,6 +541,40 @@ impl CreditToken {
         if balance < amount {
             panic!("insufficient balance");
         }
+
+        let metadata: CreditMetadata = e.storage().instance().get(&DataKey::Metadata).unwrap();
+        let project_id = metadata.project_id.clone();
+
+        let registry_addr: Option<Address> =
+            e.storage().instance().get(&DataKey::RetirementRegistry);
+        let require_registry: bool = e
+            .storage()
+            .instance()
+            .get(&DataKey::RequireRegistry)
+            .unwrap_or(false);
+
+        let registry_record_id = if let Some(registry) = registry_addr {
+            let record_args: Vec<Val> = vec![
+                &e,
+                e.current_contract_address().to_val(),
+                holder.to_val(),
+                project_id.to_val(),
+                amount.into_val(&e),
+                purpose.to_val(),
+                metadata_uri.to_val(),
+            ];
+            let record_id: u64 = e.invoke_contract::<u64>(
+                &registry,
+                &Symbol::new(&e, "record_retirement"),
+                record_args,
+            );
+            Some(record_id)
+        } else if require_registry {
+            soroban_sdk::panic_with_error!(&e, soroban_sdk::Error::from_contract_error(1));
+        } else {
+            None
+        };
+
         save_balance(&e, &holder, balance - amount);
 
         let total = read_total_supply(&e);
@@ -549,8 +583,6 @@ impl CreditToken {
         let total_retired = read_total_retired(&e);
         save_total_retired(&e, total_retired + amount);
 
-        let metadata: CreditMetadata = e.storage().instance().get(&DataKey::Metadata).unwrap();
-        let project_id = metadata.project_id.clone();
         let cert_count: u64 = e.storage().instance().get(&DataKey::CertCount).unwrap();
         let timestamp = e.ledger().timestamp();
 
@@ -561,6 +593,7 @@ impl CreditToken {
             purpose: purpose.clone(),
             timestamp,
             metadata_uri: metadata_uri.clone(),
+            registry_record_id,
         };
         let cert_key = DataKey::Cert(cert_count);
         e.storage().persistent().set(&cert_key, &cert);
@@ -573,36 +606,6 @@ impl CreditToken {
 
         e.events()
             .publish((EVENT_RETIRED,), (holder.clone(), amount, cert.clone()));
-
-        let registry_addr: Option<Address> =
-            e.storage().instance().get(&DataKey::RetirementRegistry);
-        if registry_addr.is_some() {
-            let registry = registry_addr.unwrap();
-            let record_args: Vec<Val> = vec![
-                &e,
-                e.current_contract_address().to_val(),
-                holder.to_val(),
-                project_id.to_val(),
-                amount.into_val(&e),
-                purpose.to_val(),
-                metadata_uri.to_val(),
-            ];
-            let record_id: u64 = e.invoke_contract::<Val>(
-                &registry,
-                &Symbol::new(&e, "record_retirement"),
-                record_args,
-            );
-            let mut updated_cert = cert;
-            updated_cert.registry_record_id = Some(record_id);
-            e.storage().persistent().set(&cert_key, &updated_cert);
-        } else if e
-            .storage()
-            .instance()
-            .get(&DataKey::RequireRegistry)
-            .unwrap_or(false)
-        {
-            panic!("retirement registry is required");
-        }
 
         cert
     }
@@ -913,9 +916,9 @@ mod tests {
         info.sequence = 10;
         e.ledger().set(info);
 
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.transfer_from(&spender, &owner, &recipient, &100);
-        });
+        }));
         assert!(result.is_err());
 
         // Allowance should be reset to 0
@@ -1011,6 +1014,25 @@ mod tests {
     }
 
     #[test]
+    fn test_require_registry_blocks_dropout() {
+        let (e, admin, user, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.set_require_registry(&admin, &true);
+        client.mint_to(&admin, &user, &1000);
+
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmTest");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.retire(&user, &100, &purpose, &uri);
+        }));
+        assert!(
+            result.is_err(),
+            "retire must panic when registry is required but missing"
+        );
+    }
+
+    #[test]
     fn test_set_admin_transfers_ownership() {
         let (e, admin, _user1, _user2, _project_id, client) = setup();
         let new_admin = Address::generate(&e);
@@ -1056,9 +1078,9 @@ mod tests {
         assert_eq!(client.total_supply(), 1000);
 
         // Minting beyond cap should panic
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.mint_to(&admin, &user, &1);
-        });
+        }));
         assert!(result.is_err());
     }
 
@@ -1143,9 +1165,9 @@ mod tests {
         let recipients = Vec::from_array(&e, [user2.clone(), user3.clone()]);
         let amounts: Vec<i128> = Vec::from_array(&e, [60i128, 60i128]);
 
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.batch_transfer(&user1, &recipients, &amounts);
-        });
+        }));
         assert!(result.is_err());
     }
 
@@ -1157,9 +1179,9 @@ mod tests {
         client.pause(&admin);
         assert!(client.paused());
 
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.mint_to(&admin, &user, &100);
-        });
+        }));
         assert!(result.is_err());
     }
 
@@ -1171,9 +1193,9 @@ mod tests {
         client.mint_to(&admin, &user1, &1000);
         client.pause(&admin);
 
-        let result = std::panic::catch_unwind(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             client.transfer(&user1, &user2, &100);
-        });
+        }));
         assert!(result.is_err());
     }
 

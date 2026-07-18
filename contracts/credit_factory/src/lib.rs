@@ -238,7 +238,7 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Events;
-    use soroban_sdk::{Address, Env, TryFromVal};
+    use soroban_sdk::{Address, Bytes, Env, TryFromVal};
 
     fn setup_with_client() -> (
         Env,
