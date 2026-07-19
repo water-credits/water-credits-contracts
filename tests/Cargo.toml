@@ -24,6 +24,12 @@ governance = { path = "../contracts/governance", features = ["testutils"] }
 shared = { path = "../contracts/shared" }
 soroban-sdk = { version = "20.0.0", features = ["testutils"] }
 
+[build-dependencies]
+# Used by build.rs to normalize the credit_token WASM encoding for the
+# protocol-20 VM (library equivalent of the Makefile's `fix-wasm` target).
+wat = "=1.212.0"
+wasmprinter = "=0.212.0"
+
 [lib]
 doctest = false
 
