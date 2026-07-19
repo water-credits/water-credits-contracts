@@ -165,6 +165,9 @@ fn test_retire_cross_calls_registry() {
     assert_eq!(record.retiree, holder);
     assert_eq!(record.amount, 500);
 
+    // Verify certificate links back to registry record #1
+    assert_eq!(cert.registry_record_id, Some(1));
+
     // Verify token state
     assert_eq!(token_client.balance(&holder), 500);
     assert_eq!(token_client.total_supply(), 500);
@@ -270,6 +273,8 @@ fn test_supply_conservation_invariant_mint_transfer_retire_burn() {
 
     // Cross-contract: registry must agree on the retired total
     assert_eq!(registry_client.total_retired(), 800);
+    // Cross-contract: cert must reference registry record #1
+    assert_eq!(cert.registry_record_id, Some(1));
 
     // ── Step 4: admin burns 500 from farmer (no retirement record) ────────
     token_client.burn(&admin, &farmer, &500);
@@ -307,4 +312,54 @@ fn test_supply_conservation_invariant_mint_transfer_retire_burn() {
         token_client.total_supply(),
         "Σbalances must equal total_supply at rest"
     );
+}
+
+#[test]
+fn test_retire_certificate_defaults_record_id_to_none() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let user = Address::generate(&e);
+    let project_id = BytesN::from_array(&e, &[1u8; 32]);
+
+    let (_, token_client) = deploy_token(&e, &admin, &project_id);
+    token_client.mint_to(&admin, &user, &1000);
+
+    let purpose = String::from_str(&e, "voluntary");
+    let uri = String::from_str(&e, "ipfs://QmTest");
+    let cert = token_client.retire(&user, &100, &purpose, &uri);
+
+    assert_eq!(cert.registry_record_id, None);
+    assert_eq!(token_client.total_retired(), 100);
+}
+
+#[test]
+fn test_full_credit_lifecycle() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let farmer = Address::generate(&e);
+    let buyer = Address::generate(&e);
+    let project_id = BytesN::from_array(&e, &[1u8; 32]);
+
+    let (_, client) = deploy_token(&e, &admin, &project_id);
+
+    client.mint_to(&admin, &farmer, &5000);
+    assert_eq!(client.balance(&farmer), 5000);
+
+    client.transfer(&farmer, &buyer, &1000);
+    assert_eq!(client.balance(&farmer), 4000);
+    assert_eq!(client.balance(&buyer), 1000);
+
+    let purpose = String::from_str(&e, "voluntary");
+    let uri = String::from_str(&e, "ipfs://QmCert");
+    let cert = client.retire(&buyer, &500, &purpose, &uri);
+    assert_eq!(cert.amount, 500);
+    assert_eq!(cert.project_id, project_id);
+
+    assert_eq!(client.balance(&buyer), 500);
+    assert_eq!(client.total_retired(), 500);
+    assert_eq!(client.total_supply(), 4500);
 }

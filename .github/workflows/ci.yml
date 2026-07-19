@@ -42,6 +42,9 @@ jobs:
         uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: clippy
+          # tests/build.rs compiles credit_token to wasm for the
+          # full-lifecycle integration test.
+          targets: wasm32-unknown-unknown
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -73,6 +76,10 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          # tests/build.rs compiles credit_token to wasm for the
+          # full-lifecycle integration test.
+          targets: wasm32-unknown-unknown
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -86,9 +93,10 @@ jobs:
             ${{ runner.os }}-cargo-test-
 
       # Run tests via the test crate which depends on all contracts
-      # with the testutils feature enabled. The Soroban SDK test
-      # environment runs entirely in native (x86) code — no WASM
-      # execution or Soroban CLI required at test time.
+      # with the testutils feature enabled. Most tests run in native
+      # (x86) code; the full-lifecycle test additionally deploys the
+      # credit_token.wasm built by tests/build.rs (no Soroban CLI
+      # required).
       - name: cargo test
         run: cargo test -p tests --features testutils -- --nocapture
 
