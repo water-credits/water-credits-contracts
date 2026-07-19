@@ -1,7 +1,9 @@
 use credit_token::{CreditToken, CreditTokenClient};
 use retirement_registry::{RetirementRegistry, RetirementRegistryClient};
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
-use verification_oracle::{OracleConfig, VerificationOracle, VerificationOracleClient};
+use verification_oracle::{
+    sha256_commitment, OracleConfig, RevealParams, VerificationOracle, VerificationOracleClient,
+};
 
 fn deploy_oracle(e: &Env, admin: &Address) -> (Address, VerificationOracleClient<'static>) {
     let contract_id = e.register_contract(None, VerificationOracle);
@@ -10,7 +12,7 @@ fn deploy_oracle(e: &Env, admin: &Address) -> (Address, VerificationOracleClient
     let treasury = Address::generate(e);
     client.initialize(admin, &staking_token, &treasury);
     // Disable staking for integration tests — staking requires a live token contract.
-    // Keep min_oracles at 3 to match the test's 3-oracle submission flow.
+    // Keep min_oracles at 3 to match the test's 3-oracle commit-reveal flow.
     client.update_config(
         admin,
         &OracleConfig {
@@ -27,10 +29,58 @@ fn deploy_oracle(e: &Env, admin: &Address) -> (Address, VerificationOracleClient
             min_stake: 0,
             unstake_cooldown_secs: 86400,
             commit_phase_secs: 300,
-            reveal_phase_secs: 300,
+            min_reveal_ledgers: 0,
+            max_reveal_ledgers: 60,
         },
     );
     (contract_id, client)
+}
+
+/// Advance both the ledger timestamp and sequence number together, consistent
+/// with the ~5s/ledger assumption the oracle contract's reveal-window checks
+/// rely on.
+fn advance_ledgers(e: &Env, secs: u64) {
+    let bump = (secs / 5) as u32 + 1;
+    e.ledger().set_timestamp(e.ledger().timestamp() + secs);
+    e.ledger().set_sequence_number(e.ledger().sequence() + bump);
+}
+
+/// Run a full commit-reveal round for `oracles`, all submitting the same
+/// reading under `nonce`. Opens the window, waits out the commit phase,
+/// transitions to reveal, and reveals in order.
+#[allow(clippy::too_many_arguments)]
+fn commit_reveal_round(
+    e: &Env,
+    admin: &Address,
+    client: &VerificationOracleClient<'static>,
+    project_id: &BytesN<32>,
+    oracles: &[Address],
+    nonce: u64,
+    reading: (i64, i64, i64, i64, i64, i64, i64),
+    salt: &BytesN<32>,
+) {
+    let (ph, turb, do_, flow, temp, n, p) = reading;
+    client.open_window(admin, project_id);
+    let commitment = sha256_commitment(e, nonce, ph, turb, do_, flow, temp, n, p, salt);
+    for o in oracles {
+        client.commit_reading(o, project_id, &nonce, &commitment);
+    }
+    advance_ledgers(e, 301);
+    client.begin_reveal_phase(project_id);
+    let params = RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt: salt.clone(),
+    };
+    for o in oracles {
+        client.reveal_reading(o, project_id, &params);
+    }
 }
 
 fn deploy_token(
@@ -83,42 +133,17 @@ fn test_oracle_mints_credits_to_beneficiary() {
     oracle_client.add_oracle(&admin, &o2);
     oracle_client.add_oracle(&admin, &o3);
 
-    // Submit readings (one from each oracle)
-    oracle_client.submit_reading(
-        &o1,
+    // Commit-reveal a reading from each oracle
+    let salt = BytesN::from_array(&e, &[0xA1u8; 32]);
+    commit_reveal_round(
+        &e,
+        &admin,
+        &oracle_client,
         &project_id,
-        &1,
-        &700i64,
-        &10i64,
-        &80i64,
-        &500i64,
-        &250i64,
-        &8i64,
-        &1i64,
-    );
-    oracle_client.submit_reading(
-        &o2,
-        &project_id,
-        &1,
-        &700i64,
-        &10i64,
-        &80i64,
-        &500i64,
-        &250i64,
-        &8i64,
-        &1i64,
-    );
-    oracle_client.submit_reading(
-        &o3,
-        &project_id,
-        &1,
-        &700i64,
-        &10i64,
-        &80i64,
-        &500i64,
-        &250i64,
-        &8i64,
-        &1i64,
+        &[o1, o2, o3],
+        1,
+        (700, 10, 80, 500, 250, 8, 1),
+        &salt,
     );
 
     // Beneficiary should have received credits

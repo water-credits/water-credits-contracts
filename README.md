@@ -65,7 +65,7 @@ This repository contains the **on-chain component** of the Water Quality & Reple
 |---|---|---|
 | `credit_token` | **Asset** — represents a water quality credit for a specific project | `mint`, `burn`, `transfer`, `retire`, `balance` |
 | `credit_factory` | **Factory** — deploys new credit tokens for registered projects | `register_project`, `get_project`, `update_status` |
-| `verification_oracle` | **Verifier** — ingests sensor data, validates, computes credits | `submit_reading`, `add_oracle`, `get_config` |
+| `verification_oracle` | **Verifier** — ingests sensor data, validates, computes credits | `commit_reading`, `reveal_reading`, `add_oracle`, `get_config` |
 | `retirement_registry` | **Registry** — immutable record of all credit retirements | `record_retirement`, `get_record`, `total_retired` |
 | `project_registry` | **Directory** — on-chain metadata store for all projects | `register`, `get`, `update_status`, `list_all` |
 | `governance` | **DAO** — protocol parameters, oracle whitelist, multisig | `update_fee`, `propose`, `vote`, `execute` |
@@ -709,17 +709,17 @@ Given:
 
 ### Replay Protection
 
-Every `submit_reading` call includes a `nonce` parameter. The contract stores the last seen nonce for each `(project_id, oracle)` pair and rejects any submission with a nonce <= the stored value. Nonces are monotonically increasing and should be based on the oracle's internal counter.
+Every `commit_reading`/`reveal_reading` call includes a `nonce` parameter. The contract stores the last seen nonce for each `(project_id, oracle)` pair and rejects any submission with a nonce <= the stored value. Nonces are monotonically increasing and should be based on the oracle's internal counter.
 
 ### Frontrunning Protection
 
-Oracle submissions use a **commit-reveal scheme** (planned for v2):
+Oracle submissions use a **commit-reveal scheme** (see `doc/SPEC.md` §2.2 for the full lifecycle and byte-level commitment encoding):
 
-1. **Commit phase**: Oracle submits `hash(reading, nonce, secret)`.
-2. **Reveal phase**: After N blocks, oracle reveals `(reading, nonce, secret)`.
-3. **Verification**: Contract checks the hash matches, then processes the reading.
+1. **Commit phase**: Oracle calls `commit_reading(oracle, project_id, nonce, commitment)` where `commitment = sha256(reading || nonce || secret)`.
+2. **Reveal phase**: After `min_reveal_ledgers` have elapsed, the oracle calls `reveal_reading(oracle, project_id, params)` with the plaintext reading, nonce, and secret.
+3. **Verification**: The contract recomputes the hash and checks it matches the stored commitment before processing the reading. Reveals outside `[min_reveal_ledgers, max_reveal_ledgers]` of the reveal phase opening are rejected; a commitment left unrevealed past `max_reveal_ledgers` is forfeited and the oracle is penalized.
 
-This prevents MEV bots from frontrunning oracle submissions.
+This prevents MEV bots that monitor the mempool from frontrunning oracle submissions with manipulated data. There is no plaintext single-call submission path — `commit_reading` + `reveal_reading` is the only way to submit a reading.
 
 ### Emergency Controls
 

@@ -8,7 +8,9 @@
 
 use credit_token::{CreditToken, CreditTokenClient};
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Vec};
-use verification_oracle::{VerificationOracle, VerificationOracleClient};
+use verification_oracle::{
+    sha256_commitment, RevealParams, VerificationOracle, VerificationOracleClient,
+};
 
 /// Readings that produce exactly 50 total_credits:
 /// ph=700 turb=10 do=80 flow=500 temp=250 n=10 p=2
@@ -82,44 +84,47 @@ fn setup() -> Fixture {
     }
 }
 
+/// Advance both the ledger timestamp and sequence number together, consistent
+/// with the ~5s/ledger assumption the oracle contract's reveal-window checks
+/// rely on.
+fn advance_ledgers(e: &Env, secs: u64) {
+    let bump = (secs / 5) as u32 + 1;
+    e.ledger().set_timestamp(e.ledger().timestamp() + secs);
+    e.ledger().set_sequence_number(e.ledger().sequence() + bump);
+}
+
+/// Run a full commit-reveal round for all 3 fixture oracles against `READING`.
 fn submit_three(f: &Fixture) {
     let (ph, turb, do_, flow, temp, n, p) = READING;
-    f.oracle_client.submit_reading(
-        &f.oracles.get(0).unwrap(),
-        &f.project_id,
-        &1,
-        &ph,
-        &turb,
-        &do_,
-        &flow,
-        &temp,
-        &n,
-        &p,
-    );
-    f.oracle_client.submit_reading(
-        &f.oracles.get(1).unwrap(),
-        &f.project_id,
-        &1,
-        &ph,
-        &turb,
-        &do_,
-        &flow,
-        &temp,
-        &n,
-        &p,
-    );
-    f.oracle_client.submit_reading(
-        &f.oracles.get(2).unwrap(),
-        &f.project_id,
-        &1,
-        &ph,
-        &turb,
-        &do_,
-        &flow,
-        &temp,
-        &n,
-        &p,
-    );
+    let nonce = 1u64;
+    let salt = BytesN::from_array(&f._e, &[0xB1u8; 32]);
+
+    f.oracle_client.open_window(&f.admin, &f.project_id);
+    let commitment = sha256_commitment(&f._e, nonce, ph, turb, do_, flow, temp, n, p, &salt);
+    for i in 0..3u32 {
+        let o = f.oracles.get(i).unwrap();
+        f.oracle_client
+            .commit_reading(&o, &f.project_id, &nonce, &commitment);
+    }
+
+    advance_ledgers(&f._e, 301);
+    f.oracle_client.begin_reveal_phase(&f.project_id);
+
+    let params = RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt,
+    };
+    for i in 0..3u32 {
+        let o = f.oracles.get(i).unwrap();
+        f.oracle_client.reveal_reading(&o, &f.project_id, &params);
+    }
 }
 
 #[test]

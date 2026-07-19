@@ -33,8 +33,9 @@ the source code, so the numbers here can be checked against the contract line-by
 
 ## 1. Input Encoding
 
-All sensor readings are passed into `submit_reading` as **raw integers**. The caller
-(oracle node software) is responsible for encoding physical values before submission.
+All sensor readings are passed into `reveal_reading` (after a `commit_reading`
+commitment) as **raw integers**. The caller (oracle node software) is
+responsible for encoding physical values before submission.
 
 | Field | Rust param | Physical unit | Encoding | Example |
 |---|---|---|---|---|
@@ -495,9 +496,9 @@ in the test suite.
 | Formula | Source location |
 |---|---|
 | `median_i64` | `contracts/verification_oracle/src/lib.rs` — function `median_i64` |
-| Nitrogen removal | `submit_reading_impl`, lines under `// N removal: baseline 10 mg/L` |
-| Phosphorus removal | `submit_reading_impl`, lines under `// P removal: baseline 2 mg/L` |
-| Quality penalty | `submit_reading_impl`, lines under `// Quality penalty (basis points: 0-10000)` |
-| Volumetric credit | `submit_reading_impl`, lines under `// Volumetric credit based on flow` |
-| Total credits | `submit_reading_impl`, lines under `// Apply quality penalty` |
+| Nitrogen removal | `finalize_reveals`, lines under `// N removal: baseline 10 mg/L` |
+| Phosphorus removal | `finalize_reveals`, lines under `// P removal: baseline 2 mg/L` |
+| Quality penalty | `finalize_reveals`, lines under `// Quality penalty (basis points: 0-10000)` |
+| Volumetric credit | `finalize_reveals`, lines under `// Volumetric credit based on flow` |
+| Total credits | `finalize_reveals`, lines under `// Apply quality penalty` |
 | Default config | `VerificationOracle::initialize`, `OracleConfig { ... }` literal |

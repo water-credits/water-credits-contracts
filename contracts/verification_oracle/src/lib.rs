@@ -74,8 +74,19 @@ pub struct OracleConfig {
     pub treasury: Address,
     pub min_stake: i128,
     pub unstake_cooldown_secs: u64,
+    /// Seconds that must elapse after `open_window` before anyone can call
+    /// `begin_reveal_phase` to transition Commit → Reveal.
     pub commit_phase_secs: u64,
-    pub reveal_phase_secs: u64,
+    /// Minimum number of ledgers that must elapse after the reveal phase opens
+    /// before a reveal is accepted. Guards against a reveal landing in the same
+    /// ledger the phase transitioned, which would otherwise let a still-open
+    /// mempool observer react within the same block.
+    pub min_reveal_ledgers: u32,
+    /// Maximum number of ledgers after the reveal phase opens during which a
+    /// reveal is still accepted. A commitment not revealed within this window
+    /// is forfeited: `finalize_window` penalizes the oracle and the window
+    /// finalizes without its reading.
+    pub max_reveal_ledgers: u32,
 }
 
 #[contracttype]
@@ -91,6 +102,10 @@ pub enum WindowPhase {
 pub struct WindowState {
     pub phase: WindowPhase,
     pub opened_at: u64,
+    /// Ledger sequence number at which `begin_reveal_phase` transitioned this
+    /// window into `WindowPhase::Reveal`. `0` until that happens. Reveals are
+    /// only valid within `[reveal_opened_ledger + min_reveal_ledgers, reveal_opened_ledger + max_reveal_ledgers]`.
+    pub reveal_opened_ledger: u32,
     pub submissions: Vec<ReadingSubmission>,
     pub finalized: bool,
 }
@@ -155,8 +170,8 @@ pub enum DataKey {
     OpenProjects,
     // ── Temporary (window-scoped, can expire after finalization) ──
     WindowState(BytesN<32>),
-    OracleSubmitted(BytesN<32>, Address),
-    OracleCommitted((BytesN<32>, Address)),
+    /// SHA-256 commitment for an oracle's pending reading in the current window.
+    Commitment((BytesN<32>, Address)),
     OracleRevealed((BytesN<32>, Address)),
 }
 
@@ -188,8 +203,19 @@ fn read_config(e: &Env) -> OracleConfig {
 }
 
 /// Compute SHA-256(reading || salt) for commit-reveal scheme.
-/// Hashes: nonce(8B) || ph(8B) || turbidity(8B) || dissolved_oxygen(8B) || flow_rate(8B) || temperature(8B) || total_nitrogen(8B) || total_phosphorus(8B) || salt(32B)
-fn sha256_commitment(
+///
+/// Byte layout (all integers big-endian, fixed-width, no padding — see
+/// `doc/SPEC.md` §2.2 for the full commit-reveal writeup):
+///
+/// ```text
+/// nonce(8B) || ph(8B) || turbidity(8B) || dissolved_oxygen(8B) || flow_rate(8B)
+///   || temperature(8B) || total_nitrogen(8B) || total_phosphorus(8B) || salt(32B)
+/// ```
+///
+/// `pub` so off-chain oracle nodes and integration tests can compute the exact
+/// same commitment the contract will recompute on reveal, without
+/// reimplementing the byte layout themselves.
+pub fn sha256_commitment(
     e: &Env,
     nonce: u64,
     ph: i64,
@@ -309,10 +335,7 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
         let pid = open.get(i).unwrap();
         if e.storage()
             .temporary()
-            .has(&DataKey::OracleSubmitted(pid.clone(), oracle.clone()))
-            || e.storage()
-                .temporary()
-                .has(&DataKey::OracleCommitted((pid.clone(), oracle.clone())))
+            .has(&DataKey::Commitment((pid.clone(), oracle.clone())))
             || e.storage()
                 .temporary()
                 .has(&DataKey::OracleRevealed((pid.clone(), oracle.clone())))
@@ -408,7 +431,8 @@ impl VerificationOracle {
             min_stake: 1000,
             unstake_cooldown_secs: 86400,
             commit_phase_secs: 300,
-            reveal_phase_secs: 300,
+            min_reveal_ledgers: 0,
+            max_reveal_ledgers: 60,
         };
         e.storage().instance().set(&DataKey::Config, &config);
     }
@@ -545,301 +569,6 @@ impl VerificationOracle {
             .instance()
             .get(&DataKey::OracleList)
             .unwrap_or_else(|| Vec::new(&e))
-    }
-
-    /// Submit a sensor reading for a project. Uses nonce-based replay protection.
-    /// When min_oracles submissions are collected, computes median values, calculates
-    /// nutrient removal, quality penalty, and volumetric credits. If a ProjectConfig
-    /// is set, automatically mints credits to the configured beneficiary.
-    pub fn submit_reading(
-        e: Env,
-        oracle: Address,
-        project_id: BytesN<32>,
-        nonce: u64,
-        ph: i64,
-        turbidity: i64,
-        dissolved_oxygen: i64,
-        flow_rate: i64,
-        temperature: i64,
-        total_nitrogen: i64,
-        total_phosphorus: i64,
-    ) -> Option<VerificationResult> {
-        Self::submit_reading_impl(
-            e,
-            oracle,
-            project_id,
-            nonce,
-            ph,
-            turbidity,
-            dissolved_oxygen,
-            flow_rate,
-            temperature,
-            total_nitrogen,
-            total_phosphorus,
-        )
-    }
-
-    fn submit_reading_impl(
-        e: Env,
-        oracle: Address,
-        project_id: BytesN<32>,
-        nonce: u64,
-        ph: i64,
-        turbidity: i64,
-        dissolved_oxygen: i64,
-        flow_rate: i64,
-        temperature: i64,
-        total_nitrogen: i64,
-        total_phosphorus: i64,
-    ) -> Option<VerificationResult> {
-        oracle.require_auth();
-
-        if !e
-            .storage()
-            .persistent()
-            .get(&DataKey::OracleActive(oracle.clone()))
-            .unwrap_or(false)
-        {
-            panic!("oracle not active");
-        }
-
-        let config: OracleConfig = read_config(&e);
-        if config.min_stake > 0 {
-            let stake_info: StakeInfo = e
-                .storage()
-                .persistent()
-                .get(&DataKey::OracleStake(oracle.clone()))
-                .unwrap_or(StakeInfo {
-                    amount: 0,
-                    unstake_request: None,
-                });
-            if stake_info.amount < config.min_stake {
-                panic!("insufficient stake");
-            }
-        }
-
-        let nonce_key = DataKey::OracleNonce((project_id.clone(), oracle.clone()));
-        let expected_nonce: u64 = e.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
-        if nonce != expected_nonce {
-            panic!("invalid nonce");
-        }
-        e.storage().persistent().set(&nonce_key, &nonce);
-        e.storage()
-            .persistent()
-            .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
-
-        // Track per-oracle and global submission counts
-        let submit_count_key = DataKey::OracleSubmitCount(oracle.clone());
-        let oracle_count: u64 = e.storage().persistent().get(&submit_count_key).unwrap_or(0);
-        e.storage()
-            .persistent()
-            .set(&submit_count_key, &(oracle_count + 1));
-        e.storage().persistent().extend_ttl(
-            &submit_count_key,
-            ORACLE_TTL_THRESHOLD,
-            ORACLE_TTL_BUMP,
-        );
-
-        let total: u64 = e
-            .storage()
-            .instance()
-            .get(&DataKey::TotalSubmissions)
-            .unwrap_or(0);
-        e.storage()
-            .instance()
-            .set(&DataKey::TotalSubmissions, &(total + 1));
-
-        // Prevent duplicate oracle per window (temporary storage)
-        let submitted_key = DataKey::OracleSubmitted(project_id.clone(), oracle.clone());
-        if e.storage().temporary().has(&submitted_key) {
-            panic!("oracle already submitted for this window");
-        }
-
-        let window_key = DataKey::WindowState(project_id.clone());
-        let mut window: WindowState =
-            e.storage()
-                .temporary()
-                .get(&window_key)
-                .unwrap_or(WindowState {
-                    phase: WindowPhase::Reveal,
-                    opened_at: e.ledger().timestamp(),
-                    submissions: Vec::new(&e),
-                    finalized: false,
-                });
-
-        if window.finalized {
-            panic!("window already finalized");
-        }
-
-        add_open_project(&e, &project_id);
-
-        let timestamp = e.ledger().timestamp();
-
-        let submission = ReadingSubmission {
-            oracle: oracle.clone(),
-            nonce,
-            timestamp,
-            ph,
-            turbidity,
-            dissolved_oxygen,
-            flow_rate,
-            temperature,
-            total_nitrogen,
-            total_phosphorus,
-        };
-
-        window.submissions.push_back(submission);
-        e.storage().temporary().set(&window_key, &window);
-        e.storage()
-            .temporary()
-            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
-
-        e.storage().temporary().set(&submitted_key, &true);
-        e.storage()
-            .temporary()
-            .extend_ttl(&submitted_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
-
-        if window.submissions.len() >= config.min_oracles {
-            let subs = &window.submissions;
-            let n_subs = subs.len();
-
-            let mut ph_vals: Vec<i64> = Vec::new(&e);
-            let mut turb_vals: Vec<i64> = Vec::new(&e);
-            let mut do_vals: Vec<i64> = Vec::new(&e);
-            let mut temp_vals: Vec<i64> = Vec::new(&e);
-            let mut flow_vals: Vec<i64> = Vec::new(&e);
-            let mut n_vals: Vec<i64> = Vec::new(&e);
-            let mut p_vals: Vec<i64> = Vec::new(&e);
-            for k in 0..n_subs {
-                let s = subs.get(k).unwrap();
-                ph_vals.push_back(s.ph);
-                turb_vals.push_back(s.turbidity);
-                do_vals.push_back(s.dissolved_oxygen);
-                temp_vals.push_back(s.temperature);
-                flow_vals.push_back(s.flow_rate);
-                n_vals.push_back(s.total_nitrogen);
-                p_vals.push_back(s.total_phosphorus);
-            }
-
-            let med_ph = median_i64(&e, &ph_vals);
-            let med_turb = median_i64(&e, &turb_vals);
-            let med_do = median_i64(&e, &do_vals);
-            let med_temp = median_i64(&e, &temp_vals);
-            let med_flow = median_i64(&e, &flow_vals);
-            let med_n = median_i64(&e, &n_vals);
-            let med_p = median_i64(&e, &p_vals);
-
-            // N removal: baseline 10 mg/L
-            let baseline_n: i128 = 10;
-            let n_removed: i128 = if (med_n as i128) < baseline_n {
-                (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 1000000
-            } else {
-                0
-            };
-
-            // P removal: baseline 2 mg/L
-            let baseline_p: i128 = 2;
-            let p_removed: i128 = if (med_p as i128) < baseline_p {
-                (baseline_p - med_p as i128) * med_flow as i128 * 3600 / 1000000
-            } else {
-                0
-            };
-
-            // Quality penalty (basis points: 0-10000)
-            let mut penalty: i64 = 0;
-            if med_ph < config.quality_threshold_ph || med_ph > (config.quality_threshold_ph + 100)
-            {
-                penalty += 2000;
-            }
-            if med_turb > config.quality_threshold_turbidity {
-                penalty += 2000;
-            }
-            if med_do < config.quality_threshold_do {
-                penalty += 2000;
-            }
-            if med_temp > config.quality_threshold_temp {
-                penalty += 1000;
-            }
-            if penalty > 8000 {
-                penalty = 8000;
-            }
-
-            // Volumetric credit based on flow
-            let volumetric_credit: i128 = if med_flow > 0 {
-                med_flow as i128 * 100 / 1000
-            } else {
-                0
-            };
-
-            // Gross credit
-            let n_credit: i128 = n_removed * config.credit_per_kg_n;
-            let p_credit: i128 = p_removed * config.credit_per_kg_p;
-            let gross = n_credit + p_credit + volumetric_credit;
-
-            // Apply quality penalty
-            let total: i128 = gross * (10000 - penalty as i128) / 10000;
-
-            let mut result = VerificationResult {
-                project_id: project_id.clone(),
-                n_removal_kg: n_removed,
-                p_removal_kg: p_removed,
-                quality_penalty: penalty,
-                volumetric_credit,
-                total_credits: total,
-                credits_minted: 0,
-                oracle_count: window.submissions.len(),
-                finalized_at: e.ledger().timestamp(),
-            };
-
-            // Mint credits to the beneficiary, clamped to the token's
-            // max_supply cap. This runs BEFORE the result is persisted so that
-            // `credits_minted` is recorded accurately and so a cap breach can
-            // never roll back finalization (Issue #36). If no project token is
-            // configured, or the cap is already exhausted, no mint occurs and
-            // the window still finalizes cleanly.
-            let cfg_key = DataKey::ProjectConfig(project_id.clone());
-            if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
-                result.credits_minted = mint_credits_respecting_cap(
-                    &e,
-                    &config.token_contract,
-                    &config.beneficiary,
-                    result.total_credits,
-                );
-            }
-
-            // Persist last result
-            let last_key = DataKey::LastResult(project_id.clone());
-            e.storage().persistent().set(&last_key, &result);
-            e.storage()
-                .persistent()
-                .extend_ttl(&last_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
-
-            // Append to paginated history
-            let count_key = DataKey::ResultCount(project_id.clone());
-            let hist_pos: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
-            let hist_key = DataKey::ResultAt(project_id.clone(), hist_pos);
-            e.storage().persistent().set(&hist_key, &result);
-            e.storage()
-                .persistent()
-                .extend_ttl(&hist_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
-            e.storage().persistent().set(&count_key, &(hist_pos + 1));
-            e.storage()
-                .persistent()
-                .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
-
-            window.finalized = true;
-            e.storage().temporary().set(&window_key, &window);
-            // no extend needed — finalized windows can expire
-
-            remove_open_project(&e, &project_id);
-
-            e.events()
-                .publish((EVENT_READING_VERIFIED,), (project_id, result.clone()));
-
-            Some(result)
-        } else {
-            None
-        }
     }
 
     /// Configure the credit token contract and beneficiary for a project.
@@ -982,19 +711,32 @@ impl VerificationOracle {
             _ => {}
         }
 
-        // Remove the OracleSubmitted markers for all oracles in this window
-        let window = window.unwrap();
-        for i in 0..window.submissions.len() {
-            let sub = window.submissions.get(i).unwrap();
+        // Clear any pending commitment/reveal markers for every whitelisted
+        // oracle. A commit-reveal round may be reset after some oracles have
+        // committed but before they revealed, so this must scan the full
+        // oracle list rather than `window.submissions` (which only contains
+        // oracles that already revealed).
+        let oracles: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleList)
+            .unwrap_or_else(|| Vec::new(&e));
+        for i in 0..oracles.len() {
+            let oracle = oracles.get(i).unwrap();
             e.storage()
                 .temporary()
-                .remove(&DataKey::OracleSubmitted(project_id.clone(), sub.oracle));
+                .remove(&DataKey::Commitment((project_id.clone(), oracle.clone())));
+            e.storage()
+                .temporary()
+                .remove(&DataKey::OracleRevealed((project_id.clone(), oracle)));
         }
 
-        // Replace with a fresh empty window in Reveal phase (for direct submissions)
+        // Replace with a fresh empty window, back in the Commit phase. The
+        // project stays in OpenProjects (reset doesn't finalize the window).
         let fresh = WindowState {
-            phase: WindowPhase::Reveal,
+            phase: WindowPhase::Commit,
             opened_at: e.ledger().timestamp(),
+            reveal_opened_ledger: 0,
             submissions: Vec::new(&e),
             finalized: false,
         };
@@ -1260,6 +1002,7 @@ impl VerificationOracle {
         let window = WindowState {
             phase: WindowPhase::Commit,
             opened_at: e.ledger().timestamp(),
+            reveal_opened_ledger: 0,
             submissions: Vec::new(&e),
             finalized: false,
         };
@@ -1337,7 +1080,7 @@ impl VerificationOracle {
             panic!("not in commit phase");
         }
 
-        let commit_key = DataKey::OracleCommitted((project_id.clone(), oracle.clone()));
+        let commit_key = DataKey::Commitment((project_id.clone(), oracle.clone()));
         if e.storage().temporary().has(&commit_key) {
             panic!("oracle already committed");
         }
@@ -1387,6 +1130,7 @@ impl VerificationOracle {
 
         let mut window = window;
         window.phase = WindowPhase::Reveal;
+        window.reveal_opened_ledger = e.ledger().sequence();
         e.storage().temporary().set(&window_key, &window);
         e.storage()
             .temporary()
@@ -1441,7 +1185,15 @@ impl VerificationOracle {
             panic!("not in reveal phase");
         }
 
-        let commit_key = DataKey::OracleCommitted((project_id.clone(), oracle.clone()));
+        let current_ledger = e.ledger().sequence();
+        if current_ledger < window.reveal_opened_ledger + config.min_reveal_ledgers {
+            panic!("reveal submitted before the reveal window opened");
+        }
+        if current_ledger > window.reveal_opened_ledger + config.max_reveal_ledgers {
+            panic!("reveal window has closed");
+        }
+
+        let commit_key = DataKey::Commitment((project_id.clone(), oracle.clone()));
         let commit_info: CommitInfo = e
             .storage()
             .temporary()
@@ -1548,9 +1300,8 @@ impl VerificationOracle {
         }
 
         let config: OracleConfig = read_config(&e);
-        let now = e.ledger().timestamp();
-        let reveal_end = window.opened_at + config.commit_phase_secs + config.reveal_phase_secs;
-        if now < reveal_end {
+        let current_ledger = e.ledger().sequence();
+        if current_ledger <= window.reveal_opened_ledger + config.max_reveal_ledgers {
             panic!("reveal phase not ended");
         }
 
@@ -1570,7 +1321,7 @@ impl VerificationOracle {
 
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
-            let commit_key = DataKey::OracleCommitted((project_id.clone(), oracle.clone()));
+            let commit_key = DataKey::Commitment((project_id.clone(), oracle.clone()));
             let reveal_key = DataKey::OracleRevealed((project_id.clone(), oracle.clone()));
 
             let committed = e.storage().temporary().has(&commit_key);
@@ -1749,8 +1500,8 @@ impl VerificationOracle {
         };
 
         // Mint credits to the beneficiary, clamped to the token's max_supply cap
-        // (same handling as submit_reading_impl; see Issue #36). Runs before the
-        // result is persisted so `credits_minted` is recorded accurately.
+        // (see Issue #36). Runs before the result is persisted so
+        // `credits_minted` is recorded accurately.
         let cfg_key = DataKey::ProjectConfig(project_id.clone());
         if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
             result.credits_minted = mint_credits_respecting_cap(
@@ -1796,7 +1547,7 @@ impl VerificationOracle {
             .unwrap_or_else(|| Vec::new(&e));
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
-            e.storage().temporary().remove(&DataKey::OracleCommitted((
+            e.storage().temporary().remove(&DataKey::Commitment((
                 project_id.clone(),
                 oracle.clone(),
             )));
@@ -1869,6 +1620,133 @@ mod tests {
         (e, admin, client)
     }
 
+    // ── Commit-Reveal Test Helpers ──
+    //
+    // All submissions now go through commit_reading + reveal_reading (the old
+    // single-call submit_reading was removed as part of Issue #33 — it was the
+    // plaintext bypass that made commit-reveal pointless). These helpers keep the
+    // many aggregation/math/staking tests below readable.
+
+    fn setup_oracles_with_stakes(
+        e: &Env,
+        admin: &Address,
+        client: &VerificationOracleClient<'static>,
+        count: u32,
+        stake: i128,
+    ) -> Vec<Address> {
+        let mut oracles = Vec::new(e);
+        for _ in 0..count {
+            let o = Address::generate(e);
+            client.stake(&o, &stake);
+            client.add_oracle(admin, &o);
+            oracles.push_back(o);
+        }
+        oracles
+    }
+
+    fn make_reveal_params(
+        e: &Env,
+        nonce: u64,
+        ph: i64,
+        turbidity: i64,
+        dissolved_oxygen: i64,
+        flow_rate: i64,
+        temperature: i64,
+        total_nitrogen: i64,
+        total_phosphorus: i64,
+        salt: &BytesN<32>,
+    ) -> RevealParams {
+        RevealParams {
+            nonce,
+            ph,
+            turbidity,
+            dissolved_oxygen,
+            flow_rate,
+            temperature,
+            total_nitrogen,
+            total_phosphorus,
+            salt: salt.clone(),
+        }
+    }
+
+    /// Commit+reveal one round for `oracles.len()` oracles on an already-open
+    /// Commit-phase window, each submitting the reading at the matching index in
+    /// `readings`. Waits out the default commit phase, transitions to reveal, and
+    /// reveals in order. Returns the last reveal's result (`Some` only if it
+    /// crossed `min_oracles`).
+    fn commit_reveal_round_no_open(
+        e: &Env,
+        client: &VerificationOracleClient<'static>,
+        project_id: &BytesN<32>,
+        oracles: &Vec<Address>,
+        nonce: u64,
+        readings: &[(i64, i64, i64, i64, i64, i64, i64)],
+        salt: &BytesN<32>,
+    ) -> Option<VerificationResult> {
+        for i in 0..oracles.len() {
+            let o = oracles.get(i).unwrap();
+            let r = readings[i as usize];
+            let commitment = sha256_commitment(e, nonce, r.0, r.1, r.2, r.3, r.4, r.5, r.6, salt);
+            client.commit_reading(&o, project_id, &nonce, &commitment);
+        }
+        set_ledger_timestamp(e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(project_id);
+        let mut last = None;
+        for i in 0..oracles.len() {
+            let o = oracles.get(i).unwrap();
+            let r = readings[i as usize];
+            let params = make_reveal_params(e, nonce, r.0, r.1, r.2, r.3, r.4, r.5, r.6, salt);
+            last = client.reveal_reading(&o, project_id, &params);
+        }
+        last
+    }
+
+    /// Opens a fresh window, then runs `commit_reveal_round_no_open`.
+    fn commit_reveal_round(
+        e: &Env,
+        admin: &Address,
+        client: &VerificationOracleClient<'static>,
+        project_id: &BytesN<32>,
+        oracles: &Vec<Address>,
+        nonce: u64,
+        readings: &[(i64, i64, i64, i64, i64, i64, i64)],
+        salt: &BytesN<32>,
+    ) -> Option<VerificationResult> {
+        client.open_window(admin, project_id);
+        commit_reveal_round_no_open(e, client, project_id, oracles, nonce, readings, salt)
+    }
+
+    /// Same-reading convenience wrapper around `commit_reveal_round`.
+    fn commit_reveal_round_same(
+        e: &Env,
+        admin: &Address,
+        client: &VerificationOracleClient<'static>,
+        project_id: &BytesN<32>,
+        oracles: &Vec<Address>,
+        nonce: u64,
+        reading: (i64, i64, i64, i64, i64, i64, i64),
+        salt: &BytesN<32>,
+    ) -> Option<VerificationResult> {
+        let readings = std::vec![reading; oracles.len() as usize];
+        commit_reveal_round(e, admin, client, project_id, oracles, nonce, &readings, salt)
+    }
+
+    /// Same-reading convenience wrapper around `commit_reveal_round_no_open`, for
+    /// use after `reset_window` (which already reopens the window in the Commit
+    /// phase, so calling `open_window` again would panic).
+    fn commit_reveal_round_same_no_open(
+        e: &Env,
+        client: &VerificationOracleClient<'static>,
+        project_id: &BytesN<32>,
+        oracles: &Vec<Address>,
+        nonce: u64,
+        reading: (i64, i64, i64, i64, i64, i64, i64),
+        salt: &BytesN<32>,
+    ) -> Option<VerificationResult> {
+        let readings = std::vec![reading; oracles.len() as usize];
+        commit_reveal_round_no_open(e, client, project_id, oracles, nonce, &readings, salt)
+    }
+
     #[test]
     fn test_initialize_sets_default_config() {
         let (_e, _admin, client) = setup_with_client();
@@ -1880,7 +1758,8 @@ mod tests {
         assert_eq!(config.min_stake, 1000);
         assert_eq!(config.unstake_cooldown_secs, 86400);
         assert_eq!(config.commit_phase_secs, 300);
-        assert_eq!(config.reveal_phase_secs, 300);
+        assert_eq!(config.min_reveal_ledgers, 0);
+        assert_eq!(config.max_reveal_ledgers, 60);
     }
 
     #[test]
@@ -1977,11 +1856,21 @@ mod tests {
     fn test_oracle_submission_works() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
-        let oracle = Address::generate(&e);
-        client.add_oracle(&admin, &oracle);
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 1, 1500);
 
         let project_id = BytesN::from_array(&e, &[1u8; 32]);
-        client.submit_reading(&oracle, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let salt = BytesN::from_array(&e, &[0x01u8; 32]);
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
+        assert!(result.is_none()); // only 1 of min_oracles=3 revealed
     }
 
     #[test]
@@ -1989,19 +1878,17 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[2u8; 32]);
+        let salt = BytesN::from_array(&e, &[0x02u8; 32]);
 
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &710, &12, &75, &480, &260, &9, &1);
+        let readings = [
+            (700i64, 10i64, 80i64, 500i64, 250i64, 8i64, 1i64),
+            (710, 12, 75, 480, 260, 9, 1),
+            (690, 11, 78, 510, 245, 7, 1),
+        ];
         let result =
-            client.submit_reading(&o3, &project_id, &1, &690, &11, &78, &510, &245, &7, &1);
+            commit_reveal_round(&e, &admin, &client, &project_id, &oracles, 1, &readings, &salt);
 
         assert!(result.is_some());
         let res = result.unwrap();
@@ -2014,17 +1901,19 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[3u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let salt = BytesN::from_array(&e, &[0x03u8; 32]);
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         let result = client.get_last_result(&project_id);
         assert!(result.is_some());
@@ -2036,17 +1925,19 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[4u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let salt = BytesN::from_array(&e, &[0x04u8; 32]);
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         let result = client.get_last_result(&project_id);
         assert!(result.is_some());
@@ -2068,26 +1959,34 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[50u8; 32]);
+        let salt = BytesN::from_array(&e, &[0x50u8; 32]);
 
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         let history = client.get_result_history(&project_id, &0, &10);
         assert_eq!(history.len(), 1);
 
         client.reset_window(&admin, &project_id);
-        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        commit_reveal_round_same_no_open(
+            &e,
+            &client,
+            &project_id,
+            &oracles,
+            2,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         let history = client.get_result_history(&project_id, &0, &10);
         assert_eq!(history.len(), 2);
@@ -2115,7 +2014,8 @@ mod tests {
             min_stake: 2000,
             unstake_cooldown_secs: 172800,
             commit_phase_secs: 600,
-            reveal_phase_secs: 600,
+            min_reveal_ledgers: 0,
+            max_reveal_ledgers: 120,
         };
         client.update_config(&admin, &new_config);
 
@@ -2130,18 +2030,19 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[6u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &15, &5);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &15, &5);
-        let result =
-            client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &15, &5);
+        let salt = BytesN::from_array(&e, &[0x06u8; 32]);
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 15, 5),
+            &salt,
+        );
 
         assert!(result.is_some());
         let res = result.unwrap();
@@ -2154,18 +2055,19 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[7u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &300, &200, &10, &500, &350, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &300, &200, &10, &500, &350, &8, &1);
-        let result =
-            client.submit_reading(&o3, &project_id, &1, &300, &200, &10, &500, &350, &8, &1);
+        let salt = BytesN::from_array(&e, &[0x07u8; 32]);
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (300, 200, 10, 500, 350, 8, 1),
+            &salt,
+        );
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().quality_penalty, 7000);
@@ -2176,24 +2078,45 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let o1 = oracles.get(0).unwrap();
+        let o2 = oracles.get(1).unwrap();
+        let o3 = oracles.get(2).unwrap();
+        let salt = BytesN::from_array(&e, &[0x10u8; 32]);
 
         assert_eq!(client.oracle_submit_count(&o1), 0);
         assert_eq!(client.total_submissions(), 0);
 
         let project_id = BytesN::from_array(&e, &[10u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let mut single = Vec::new(&e);
+        single.push_back(o1.clone());
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &single,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
         assert_eq!(client.oracle_submit_count(&o1), 1);
         assert_eq!(client.total_submissions(), 1);
 
         let project_id2 = BytesN::from_array(&e, &[11u8; 32]);
-        client.submit_reading(&o2, &project_id2, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o3, &project_id2, &1, &700, &10, &80, &500, &250, &8, &1);
+        let mut pair = Vec::new(&e);
+        pair.push_back(o2.clone());
+        pair.push_back(o3.clone());
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id2,
+            &pair,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
         assert_eq!(client.oracle_submit_count(&o2), 1);
         assert_eq!(client.oracle_submit_count(&o3), 1);
         assert_eq!(client.total_submissions(), 3);
@@ -2204,19 +2127,71 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
+        // A single oracle finalizing per round requires min_oracles=1 so each
+        // round completes and a fresh window can be opened for the next nonce.
+        let mut config = client.get_config();
+        config.min_oracles = 1;
+        client.update_config(&admin, &config);
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 1, 1500);
+        let salt = BytesN::from_array(&e, &[0x60u8; 32]);
 
         let p1 = BytesN::from_array(&e, &[50u8; 32]);
         let p2 = BytesN::from_array(&e, &[51u8; 32]);
         let p3 = BytesN::from_array(&e, &[52u8; 32]);
 
-        client.submit_reading(&o1, &p1, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o1, &p2, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o1, &p3, &1, &700, &10, &80, &500, &250, &8, &1);
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &p1,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &p2,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &p3,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
-        client.submit_reading(&o1, &p1, &2, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o1, &p2, &2, &700, &10, &80, &500, &250, &8, &1);
+        // nonce 2 must be accepted for p1 and p2 (new windows after finalization).
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &p1,
+            &oracles,
+            2,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &p2,
+            &oracles,
+            2,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
     }
 
     #[test]
@@ -2274,16 +2249,23 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[30u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let salt = BytesN::from_array(&e, &[0x30u8; 32]);
+
+        client.open_window(&admin, &project_id);
+        let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        for i in 0..3u32 {
+            let o = oracles.get(i).unwrap();
+            client.commit_reading(&o, &project_id, &1, &commitment);
+        }
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(&project_id);
+
+        // Only 2 of 3 committed oracles reveal.
+        let params = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params);
+        client.reveal_reading(&oracles.get(1).unwrap(), &project_id, &params);
         assert_eq!(client.window_submission_count(&project_id), 2);
 
         client.reset_window(&admin, &project_id);
@@ -2295,23 +2277,35 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[31u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let salt = BytesN::from_array(&e, &[0x31u8; 32]);
+
+        // Round 1: o1 and o2 commit+reveal with nonce 1; o3 sits out.
+        client.open_window(&admin, &project_id);
+        let commitment1 = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracles.get(0).unwrap(), &project_id, &1, &commitment1);
+        client.commit_reading(&oracles.get(1).unwrap(), &project_id, &1, &commitment1);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(&project_id);
+        let params1 = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params1);
+        client.reveal_reading(&oracles.get(1).unwrap(), &project_id, &params1);
 
         client.reset_window(&admin, &project_id);
 
-        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        let result =
-            client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        // Round 2: o1 and o2 resubmit with nonce 2; o3 submits for the first time
+        // with nonce 1 (its nonce is independent of o1/o2's).
+        let commitment2 = sha256_commitment(&e, 2, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracles.get(0).unwrap(), &project_id, &2, &commitment2);
+        client.commit_reading(&oracles.get(1).unwrap(), &project_id, &2, &commitment2);
+        client.commit_reading(&oracles.get(2).unwrap(), &project_id, &1, &commitment1);
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(&project_id);
+        let params2 = make_reveal_params(&e, 2, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params2);
+        client.reveal_reading(&oracles.get(1).unwrap(), &project_id, &params2);
+        let result = client.reveal_reading(&oracles.get(2).unwrap(), &project_id, &params1);
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
@@ -2322,17 +2316,19 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[40u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &0, &250, &2, &0);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &0, &250, &2, &0);
-        let result = client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &0, &250, &2, &0);
+        let salt = BytesN::from_array(&e, &[0x40u8; 32]);
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 0, 250, 2, 0),
+            &salt,
+        );
 
         assert!(result.is_some());
         let res = result.unwrap();
@@ -2347,16 +2343,22 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[41u8; 32]);
-        let result =
-            client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let salt = BytesN::from_array(&e, &[0x41u8; 32]);
+
+        let mut single = Vec::new(&e);
+        single.push_back(oracles.get(0).unwrap());
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &single,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         assert!(result.is_none());
         assert!(client.get_last_result(&project_id).is_none());
@@ -2367,17 +2369,23 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[42u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        let result =
-            client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let salt = BytesN::from_array(&e, &[0x42u8; 32]);
+
+        let mut pair = Vec::new(&e);
+        pair.push_back(oracles.get(0).unwrap());
+        pair.push_back(oracles.get(1).unwrap());
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &pair,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         assert!(result.is_none());
         assert!(client.get_last_result(&project_id).is_none());
@@ -2388,18 +2396,19 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[43u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &300, &200, &10, &0, &350, &20, &5);
-        client.submit_reading(&o2, &project_id, &1, &300, &200, &10, &0, &350, &20, &5);
-        let result =
-            client.submit_reading(&o3, &project_id, &1, &300, &200, &10, &0, &350, &20, &5);
+        let salt = BytesN::from_array(&e, &[0x43u8; 32]);
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (300, 200, 10, 0, 350, 20, 5),
+            &salt,
+        );
 
         assert!(result.is_some());
         let res = result.unwrap();
@@ -2418,15 +2427,15 @@ mod tests {
         config.min_oracles = 2;
         client.update_config(&admin, &config);
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 2, 1500);
         let project_id = BytesN::from_array(&e, &[44u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &400, &250, &8, &1);
+        let salt = BytesN::from_array(&e, &[0x44u8; 32]);
+        let readings = [
+            (700i64, 10i64, 80i64, 400i64, 250i64, 8i64, 1i64),
+            (700, 10, 80, 600, 250, 8, 1),
+        ];
         let result =
-            client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &600, &250, &8, &1);
+            commit_reveal_round(&e, &admin, &client, &project_id, &oracles, 1, &readings, &salt);
 
         assert!(result.is_some());
         let res = result.unwrap();
@@ -2437,7 +2446,7 @@ mod tests {
 
     #[test]
     fn test_stake_increases_balance() {
-        let (e, _admin, client) = setup_with_client();
+        let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
@@ -2449,7 +2458,7 @@ mod tests {
 
     #[test]
     fn test_stake_accumulates() {
-        let (e, _admin, client) = setup_with_client();
+        let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
@@ -2465,13 +2474,17 @@ mod tests {
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
-        let result = client.try_stake(&oracle, &0);
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "stake"),
+            vec![&e, oracle.to_val(), 0i128.into_val(&e)],
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_unstake_reduces_balance() {
-        let (e, _admin, client) = setup_with_client();
+        let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
@@ -2484,12 +2497,12 @@ mod tests {
 
     #[test]
     fn test_unstake_insufficient_balance_panics() {
-        let (e, _admin, client) = setup_with_client();
+        let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
         client.stake(&oracle, &1000);
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "unstake"),
             vec![&e, oracle.to_val(), 2000i128.into_val(&e)],
@@ -2507,7 +2520,7 @@ mod tests {
         client.add_oracle(&admin, &oracle);
 
         // min_stake is 1000, staking 1500, trying to unstake 600 would leave 900 < 1000
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "unstake"),
             vec![&e, oracle.to_val(), 600i128.into_val(&e)],
@@ -2532,7 +2545,7 @@ mod tests {
 
     #[test]
     fn test_stake_clears_unstake_request() {
-        let (e, _admin, client) = setup_with_client();
+        let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
@@ -2594,7 +2607,7 @@ mod tests {
         let oracle = Address::generate(&e);
 
         client.stake(&oracle, &1000);
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "slash"),
             vec![
@@ -2616,7 +2629,7 @@ mod tests {
         let rando = Address::generate(&e);
 
         client.stake(&oracle, &5000);
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "slash"),
             vec![
@@ -2637,7 +2650,7 @@ mod tests {
         let oracle = Address::generate(&e);
 
         // min_stake is 1000 by default, oracle has 0 stake
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "add_oracle"),
             vec![&e, admin.to_val(), oracle.to_val()],
@@ -2675,7 +2688,7 @@ mod tests {
         client.add_oracle(&admin, &o4);
 
         // Cannot remove while staked
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "remove_oracle"),
             vec![&e, admin.to_val(), o4.to_val()],
@@ -2711,45 +2724,13 @@ mod tests {
         assert!(!client.is_oracle_active(&o4));
     }
 
-    #[test]
-    fn test_submit_reading_requires_min_stake() {
-        let (e, admin, client) = setup_with_client();
-        e.mock_all_auths();
-        let oracle = Address::generate(&e);
-
-        // Force-add oracle bypassing the stake check by using update_config
-        let mut config = client.get_config();
-        config.min_stake = 0;
-        client.update_config(&admin, &config);
-        client.add_oracle(&admin, &oracle);
-
-        // Now re-enable min_stake
-        config.min_stake = 5000;
-        client.update_config(&admin, &config);
-
-        let project_id = BytesN::from_array(&e, &[1u8; 32]);
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
-            &client.address,
-            &Symbol::new(&e, "submit_reading"),
-            vec![
-                &e,
-                oracle.to_val(),
-                project_id.to_val(),
-                1u64.into_val(&e),
-                700i64.into_val(&e),
-                10i64.into_val(&e),
-                80i64.into_val(&e),
-                500i64.into_val(&e),
-                250i64.into_val(&e),
-                8i64.into_val(&e),
-                1i64.into_val(&e),
-            ],
-        );
-        assert!(result.is_err());
-    }
+    // Note: the "insufficient stake blocks participation" case is covered by
+    // `test_commit_requires_min_stake` below, against `commit_reading` (the
+    // only entry point into a submission round now that `submit_reading` is
+    // gone).
 
     #[test]
-    fn test_submit_reading_with_sufficient_stake() {
+    fn test_commit_reading_with_sufficient_stake() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
         let oracle = Address::generate(&e);
@@ -2758,7 +2739,10 @@ mod tests {
         client.add_oracle(&admin, &oracle);
 
         let project_id = BytesN::from_array(&e, &[1u8; 32]);
-        client.submit_reading(&oracle, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.open_window(&admin, &project_id);
+        let salt = BytesN::from_array(&e, &[0x09u8; 32]);
+        let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracle, &project_id, &1, &commitment);
     }
 
     #[test]
@@ -2770,7 +2754,7 @@ mod tests {
         client.stake(&oracle, &5000);
         client.unstake(&oracle, &2000);
 
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "claim_unstake"),
             vec![&e, oracle.to_val()],
@@ -2780,7 +2764,7 @@ mod tests {
 
     #[test]
     fn test_getters_return_config_values() {
-        let (_e, _admin, client) = setup_with_client();
+        let (e, _admin, client) = setup_with_client();
 
         let cooldown = client.get_unstake_cooldown();
         assert_eq!(cooldown, 86400);
@@ -2831,48 +2815,6 @@ mod tests {
     }
 
     // ── Commit-Reveal Scheme Tests ──
-
-    fn setup_oracles_with_stakes(
-        e: &Env,
-        admin: &Address,
-        client: &VerificationOracleClient<'static>,
-        count: u32,
-        stake: i128,
-    ) -> Vec<Address> {
-        let mut oracles = Vec::new(e);
-        for _ in 0..count {
-            let o = Address::generate(e);
-            client.stake(&o, &stake);
-            client.add_oracle(admin, &o);
-            oracles.push_back(o);
-        }
-        oracles
-    }
-
-    fn make_reveal_params(
-        _e: &Env,
-        nonce: u64,
-        ph: i64,
-        turbidity: i64,
-        dissolved_oxygen: i64,
-        flow_rate: i64,
-        temperature: i64,
-        total_nitrogen: i64,
-        total_phosphorus: i64,
-        salt: &BytesN<32>,
-    ) -> RevealParams {
-        RevealParams {
-            nonce,
-            ph,
-            turbidity,
-            dissolved_oxygen,
-            flow_rate,
-            temperature,
-            total_nitrogen,
-            total_phosphorus,
-            salt: salt.clone(),
-        }
-    }
 
     #[test]
     fn test_commit_reveal_happy_path() {
@@ -2944,14 +2886,14 @@ mod tests {
         // Try to reveal with wrong values (different salt)
         let wrong_salt = BytesN::from_array(&e, &[0xCCu8; 32]);
         let wrong_params = make_reveal_params(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &wrong_salt);
-        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
             &client.address,
             &Symbol::new(&e, "reveal_reading"),
             vec![
                 &e,
                 oracles.get(0).unwrap().to_val(),
                 project_id.to_val(),
-                wrong_params.into_val(&e),
+                wrong_params.to_val(),
             ],
         );
         assert!(result.is_err());
@@ -2977,17 +2919,102 @@ mod tests {
 
         // Trying to reveal after reveal phase ended should panic
         let params = make_reveal_params(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
-        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
             &client.address,
             &Symbol::new(&e, "reveal_reading"),
             vec![
                 &e,
                 oracles.get(0).unwrap().to_val(),
                 project_id.to_val(),
-                params.into_val(&e),
+                params.to_val(),
             ],
         );
         assert!(result.is_err());
+    }
+
+    /// Unlike `test_late_reveal_after_phase_ends_panics` (which never leaves the
+    /// Commit phase), this test actually enters the Reveal phase and then lets
+    /// `max_reveal_ledgers` elapse *without* anyone calling `finalize_window`.
+    /// `reveal_reading` itself must reject the reveal — the ledger-window check
+    /// cannot depend on `finalize_window` having already run.
+    #[test]
+    fn test_reveal_rejected_after_max_reveal_ledgers() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let project_id = BytesN::from_array(&e, &[103u8; 32]);
+        client.open_window(&admin, &project_id);
+
+        let salt = BytesN::from_array(&e, &[0xDEu8; 32]);
+        let nonce: u64 = 1;
+        let commitment = sha256_commitment(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracles.get(0).unwrap(), &project_id, &nonce, &commitment);
+
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(&project_id);
+
+        // Advance well past max_reveal_ledgers (default 60) without revealing.
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 400);
+
+        let params = make_reveal_params(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
+        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
+            &client.address,
+            &Symbol::new(&e, "reveal_reading"),
+            vec![
+                &e,
+                oracles.get(0).unwrap().to_val(),
+                project_id.to_val(),
+                params.to_val(),
+            ],
+        );
+        assert!(
+            result.is_err(),
+            "reveal past max_reveal_ledgers must be rejected even before finalize_window runs"
+        );
+    }
+
+    /// `min_reveal_ledgers` guards against a reveal landing in the very same
+    /// ledger the phase transitioned to Reveal.
+    #[test]
+    fn test_reveal_rejected_before_min_reveal_ledgers() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.min_reveal_ledgers = 5;
+        client.update_config(&admin, &config);
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let project_id = BytesN::from_array(&e, &[104u8; 32]);
+        client.open_window(&admin, &project_id);
+
+        let salt = BytesN::from_array(&e, &[0xDFu8; 32]);
+        let nonce: u64 = 1;
+        let commitment = sha256_commitment(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracles.get(0).unwrap(), &project_id, &nonce, &commitment);
+
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(&project_id);
+
+        // Reveal immediately: no ledgers have elapsed since the reveal phase
+        // opened, so this must be rejected as too early.
+        let params = make_reveal_params(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
+        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
+            &client.address,
+            &Symbol::new(&e, "reveal_reading"),
+            vec![
+                &e,
+                oracles.get(0).unwrap().to_val(),
+                project_id.to_val(),
+                params.to_val(),
+            ],
+        );
+        assert!(result.is_err());
+
+        // Once enough ledgers elapse, the identical reveal succeeds.
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 30);
+        client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params);
     }
 
     #[test]
@@ -3048,7 +3075,7 @@ mod tests {
         let rando = Address::generate(&e);
         let project_id = BytesN::from_array(&e, &[104u8; 32]);
 
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "open_window"),
             vec![&e, rando.to_val(), project_id.to_val()],
@@ -3064,7 +3091,7 @@ mod tests {
         let project_id = BytesN::from_array(&e, &[105u8; 32]);
         client.open_window(&admin, &project_id);
 
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "open_window"),
             vec![&e, admin.to_val(), project_id.to_val()],
@@ -3082,7 +3109,7 @@ mod tests {
 
         let inactive = Address::generate(&e);
         let commitment = BytesN::from_array(&e, &[0xFFu8; 32]);
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "commit_reading"),
             vec![
@@ -3111,7 +3138,7 @@ mod tests {
         client.commit_reading(&oracles.get(0).unwrap(), &project_id, &nonce, &commitment);
 
         // Second commit from same oracle should fail
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "commit_reading"),
             vec![
@@ -3141,14 +3168,14 @@ mod tests {
 
         let salt = BytesN::from_array(&e, &[0x22u8; 32]);
         let params = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
-        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
             &client.address,
             &Symbol::new(&e, "reveal_reading"),
             vec![
                 &e,
                 oracles.get(0).unwrap().to_val(),
                 project_id.to_val(),
-                params.into_val(&e),
+                params.to_val(),
             ],
         );
         assert!(result.is_err());
@@ -3163,7 +3190,7 @@ mod tests {
         client.open_window(&admin, &project_id);
 
         // Try to transition before commit phase ends
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "begin_reveal_phase"),
             vec![&e, project_id.to_val()],
@@ -3201,7 +3228,7 @@ mod tests {
         }
 
         // Try to finalize_window before reveal phase ends should fail (already auto-finalized)
-        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
             &client.address,
             &Symbol::new(&e, "finalize_window"),
             vec![&e, project_id.to_val()],
@@ -3231,14 +3258,14 @@ mod tests {
         client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params);
 
         // Second reveal should fail
-        let result = e.try_invoke_contract::<Option<VerificationResult>, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, Option<VerificationResult>>(
             &client.address,
             &Symbol::new(&e, "reveal_reading"),
             vec![
                 &e,
                 oracles.get(0).unwrap().to_val(),
                 project_id.to_val(),
-                params.into_val(&e),
+                params.to_val(),
             ],
         );
         assert!(result.is_err());
@@ -3257,7 +3284,7 @@ mod tests {
         let commitment = BytesN::from_array(&e, &[0x55u8; 32]);
 
         // First oracle tries to commit with wrong nonce (should be 1)
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "commit_reading"),
             vec![
@@ -3348,11 +3375,14 @@ mod tests {
         let commitment = sha256_commitment(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
         client.commit_reading(&oracles.get(0).unwrap(), &project_id, &nonce, &commitment);
 
-        // Reset should work on commit-phase window
+        // Reset should work on a commit-phase window and clear the pending
+        // commitment, even though the oracle never revealed.
         client.reset_window(&admin, &project_id);
 
-        // Window should be back to Reveal phase (reset creates Reveal windows for direct submissions)
-        // And oracle should be able to re-commit with a new nonce
+        // Window is back in the Commit phase, and the oracle can re-commit with
+        // a fresh nonce (the old commitment was cleared, not left dangling).
+        let phase = client.get_window_phase(&project_id);
+        assert_eq!(phase.unwrap(), WindowPhase::Commit);
         let commitment2 = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
         client.commit_reading(&oracles.get(0).unwrap(), &project_id, &1, &commitment2);
     }
@@ -3378,7 +3408,7 @@ mod tests {
         client.update_config(&admin, &config);
 
         let commitment = BytesN::from_array(&e, &[0x88u8; 32]);
-        let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
+        let result = e.try_invoke_contract::<_, ()>(
             &client.address,
             &Symbol::new(&e, "commit_reading"),
             vec![
@@ -3447,14 +3477,9 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[200u8; 32]);
+        let salt = BytesN::from_array(&e, &[0xC8u8; 32]);
 
         // Readings that produce zero credits:
         //   flow_rate = 0  → volumetric_credit = 0
@@ -3462,22 +3487,29 @@ mod tests {
         //   total_phosphorus = 3 (≥ baseline 2)  → p_removal = 0
         //   Poor quality (ph=300, turb=200, do=10) → large penalty, but gross is
         //   already 0 so total stays 0.
-        let result1 =
-            client.submit_reading(&o1, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
+        client.open_window(&admin, &project_id);
+        let commitment = sha256_commitment(&e, 1, 300, 200, 10, 0, 350, 15, 3, &salt);
+        for i in 0..3u32 {
+            let o = oracles.get(i).unwrap();
+            client.commit_reading(&o, &project_id, &1, &commitment);
+        }
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(&project_id);
+        let params = make_reveal_params(&e, 1, 300, 200, 10, 0, 350, 15, 3, &salt);
+
+        let result1 = client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params);
         assert!(
             result1.is_none(),
             "window should not finalize after 1 oracle"
         );
 
-        let result2 =
-            client.submit_reading(&o2, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
+        let result2 = client.reveal_reading(&oracles.get(1).unwrap(), &project_id, &params);
         assert!(
             result2.is_none(),
             "window should not finalize after 2 oracles"
         );
 
-        let result3 =
-            client.submit_reading(&o3, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
+        let result3 = client.reveal_reading(&oracles.get(2).unwrap(), &project_id, &params);
 
         // Window must finalize and return a result even though total_credits == 0.
         assert!(
@@ -3503,14 +3535,18 @@ mod tests {
         // Verify indirectly: after reset_window, all three oracles must accept nonce 2
         // (not nonce 1).  If the fix were broken, the stored nonce would still be 0 and
         // nonce 1 would be accepted, but nonce 2 would be rejected as "invalid nonce".
-        // A successful three-oracle submission with nonce 2 proves all nonces advanced.
+        // A successful three-oracle round with nonce 2 proves all nonces advanced.
         client.reset_window(&admin, &project_id);
 
-        // nonce 2 must be accepted for all three oracles
-        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        let next_result =
-            client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        let next_result = commit_reveal_round_same_no_open(
+            &e,
+            &client,
+            &project_id,
+            &oracles,
+            2,
+            (300, 200, 10, 0, 350, 15, 3),
+            &salt,
+        );
 
         // The second window also produces zero credits (same readings), but it must finalize.
         assert!(
@@ -3531,42 +3567,44 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let o1 = Address::generate(&e);
-        let o2 = Address::generate(&e);
-        let o3 = Address::generate(&e);
-        client.add_oracle(&admin, &o1);
-        client.add_oracle(&admin, &o2);
-        client.add_oracle(&admin, &o3);
-
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[201u8; 32]);
+        let salt = BytesN::from_array(&e, &[0xC9u8; 32]);
 
         // ── Window 1: zero credits ──
-        client.submit_reading(&o1, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
-        client.submit_reading(&o2, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
-        let zero_result =
-            client.submit_reading(&o3, &project_id, &1, &300, &200, &10, &0, &350, &15, &3);
-
+        let zero_result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (300, 200, 10, 0, 350, 15, 3),
+            &salt,
+        );
         assert!(zero_result.is_some());
         assert_eq!(zero_result.unwrap().total_credits, 0);
 
         // ── Window 2: positive credits ──
-        // reset_window is required to open a new direct-submission window after
-        // the previous one was finalized.
+        // reset_window is required to open a new round after the previous one
+        // was finalized.
         client.reset_window(&admin, &project_id);
 
         // Good readings: good pH (700=7.0), low turbidity (10), high DO (80),
         // positive flow (500), low temperature (250), N below baseline (8 < 10),
         // P below baseline (1 < 2).
-        let r1 = client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        assert!(r1.is_none());
+        let positive_result = commit_reveal_round_same_no_open(
+            &e,
+            &client,
+            &project_id,
+            &oracles,
+            2,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
+        assert!(positive_result.is_some(), "second window must finalize");
 
-        let r2 = client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        assert!(r2.is_none());
-
-        let r3 = client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        assert!(r3.is_some(), "second window must finalize");
-
-        let res = r3.unwrap();
+        let res = positive_result.unwrap();
         assert!(
             res.total_credits > 0,
             "second window must produce positive credits"
@@ -3604,7 +3642,19 @@ mod tests {
         client.add_oracle(&admin, &o4);
 
         let project_id = BytesN::from_array(&e, &[210u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let mut only_o1 = Vec::new(&e);
+        only_o1.push_back(o1.clone());
+        let salt = BytesN::from_array(&e, &[0xD0u8; 32]);
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &only_o1,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         let result = e.try_invoke_contract::<_, ()>(
             &client.address,
@@ -3633,9 +3683,21 @@ mod tests {
         client.add_oracle(&admin, &o4);
 
         let project_id = BytesN::from_array(&e, &[211u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let mut oracles = Vec::new(&e);
+        oracles.push_back(o1.clone());
+        oracles.push_back(o2.clone());
+        oracles.push_back(o3.clone());
+        let salt = BytesN::from_array(&e, &[0xD1u8; 32]);
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         client.remove_oracle(&admin, &o4);
         assert!(!client.is_oracle_active(&o4));
@@ -3659,9 +3721,21 @@ mod tests {
         client.add_oracle(&admin, &o4);
 
         let project_id = BytesN::from_array(&e, &[212u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let mut oracles = Vec::new(&e);
+        oracles.push_back(o1.clone());
+        oracles.push_back(o2.clone());
+        oracles.push_back(o3.clone());
+        let salt = BytesN::from_array(&e, &[0xD2u8; 32]);
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         client.remove_oracle(&admin, &o4);
         assert!(!client.is_oracle_active(&o4));
@@ -3689,9 +3763,21 @@ mod tests {
         client.add_oracle(&admin, &o4);
 
         let project_id = BytesN::from_array(&e, &[213u8; 32]);
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let mut oracles = Vec::new(&e);
+        oracles.push_back(o1.clone());
+        oracles.push_back(o2.clone());
+        oracles.push_back(o3.clone());
+        let salt = BytesN::from_array(&e, &[0xD3u8; 32]);
+        commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         let first = client.get_last_result(&project_id);
         assert!(first.is_some());
@@ -3701,10 +3787,15 @@ mod tests {
         assert!(!client.is_oracle_active(&o4));
 
         client.reset_window(&admin, &project_id);
-        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        let result =
-            client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        let result = commit_reveal_round_same_no_open(
+            &e,
+            &client,
+            &project_id,
+            &oracles,
+            2,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);

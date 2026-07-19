@@ -74,56 +74,143 @@ The oracle contract collects sensor readings from whitelisted oracle nodes,
 aggregates them using median statistics, computes credit-equivalent impact,
 and optionally triggers an auto-mint to the project beneficiary.
 
-#### Oracle window lifecycle
+#### Oracle window lifecycle: commit-reveal
 
-A **window** is a single aggregation round for one project. The lifecycle:
+Readings are submitted through a **commit-reveal scheme**. This is the only
+submission path — there is no plaintext single-call entry point. A well
+capitalized actor watching the mempool who could see plaintext readings before
+they land could observe two honest submissions and frontrun the third with an
+outlier value chosen to shift the median, manufacturing credits that don't
+correspond to real sensor data. Commit-reveal removes that window: every
+committed value is opaque (a hash) until the reveal phase, by which point the
+committing oracle can no longer react to what others submitted.
+
+A **window** is a single aggregation round for one project and moves through
+three phases:
 
 ```
-  OPEN                       FINALIZED
-┌──────────────────────┐    ┌───────────────────────────┐
-│  WindowState          │    │  WindowState               │
-│  submissions: []      │ →  │  submissions: [s1,s2,s3]  │
-│  finalized: false     │    │  finalized: true           │
-└──────────────────────┘    └───────────────────────────┘
-       ↑                              ↑
-  oracle submits              len(submissions) >= min_oracles
-  (dedup enforced)            → compute median → emit event
-                              → store LastResult
-                              → optional auto-mint
+  COMMIT                      REVEAL                        FINALIZED
+┌──────────────────────┐    ┌───────────────────────────┐  ┌───────────────────────────┐
+│  WindowState          │    │  WindowState                │  │  WindowState                │
+│  phase: Commit        │ →  │  phase: Reveal              │→ │  phase: Finalized           │
+│  submissions: []      │    │  submissions: [s1,s2,...]  │  │  submissions: [s1,s2,s3]  │
+│  finalized: false     │    │  finalized: false           │  │  finalized: true           │
+└──────────────────────┘    └───────────────────────────┘  └───────────────────────────┘
+       ↑                              ↑                               ↑
+  admin: open_window            oracle: commit_reading         len(submissions) >= min_oracles
+                                 (stores SHA-256 hash only)     → compute median → emit event
+                                                                 → store LastResult
+                                                                 → optional auto-mint
 ```
 
 State transitions:
 
-1. **No window** — `get_last_result` returns `None`, `window_submission_count` returns 0.
-2. **Open window** — An oracle calls `submit_reading`. A `WindowState` entry is
-   created/updated. `OracleSubmitted(project_id, oracle)` is set to prevent the
-   same oracle from submitting twice to the same window.
-3. **Finalized window** — Once `submissions.len() >= config.min_oracles`, the
-   contract computes median sensor values, evaluates the credit formula, stores
-   a `VerificationResult` under `LastResult(project_id)`, marks `finalized = true`,
-   and emits a `("rdng_vrfy",)` event. Subsequent `submit_reading` calls for the
-   same project panic with `"window already finalized"`.
-4. **Reset** — Admin calls `reset_window(admin, project_id)`. The
-   `OracleSubmitted` markers for all oracles that submitted to that window are
-   removed, and a fresh empty `WindowState` replaces the old one. Oracle nonces
-   are **not** reset. A new open window begins.
+1. **No window** — `get_last_result` returns `None`, `window_submission_count`
+   returns 0, `get_window_phase` returns `None`.
+2. **Open (Commit phase)** — Admin calls `open_window(admin, project_id)`.
+   Fails if a non-finalized window is already active for that project.
+3. **Commit** — Each whitelisted oracle calls
+   `commit_reading(oracle, project_id, nonce, commitment)`, storing the
+   32-byte SHA-256 commitment under `DataKey::Commitment(project_id, oracle)`
+   (see "Commitment encoding" below). Requires `min_stake` (if configured),
+   an unused nonce for `(project_id, oracle)`, the window to be in the Commit
+   phase, and the oracle to not have already committed this window.
+4. **Begin reveal** — Once `commit_phase_secs` have elapsed since the window
+   opened, anyone can call `begin_reveal_phase(project_id)`. This transitions
+   `phase` to `Reveal` and records the current ledger sequence number as
+   `reveal_opened_ledger` — the anchor for the ledger-denominated reveal
+   window below.
+5. **Reveal** — Each committed oracle calls
+   `reveal_reading(oracle, project_id, params)` with the plaintext reading,
+   nonce, and secret. The contract recomputes the commitment and panics with
+   `"hash mismatch: revealed values do not match commitment"` if it doesn't
+   match the one stored at commit time. The reveal is only accepted while
+   `reveal_opened_ledger + min_reveal_ledgers <= current_ledger <=
+   reveal_opened_ledger + max_reveal_ledgers`; outside that window the call
+   panics (`"reveal submitted before the reveal window opened"` or
+   `"reveal window has closed"`) — this check runs inside `reveal_reading`
+   itself, so a late reveal is rejected immediately, not just once someone
+   later calls `finalize_window`. Each accepted reveal increments
+   `OracleSubmitCount`/`TotalSubmissions` and is appended to
+   `window.submissions`.
+6. **Finalized window** — As soon as `submissions.len() >= config.min_oracles`
+   (checked automatically at the end of each `reveal_reading`, and also by an
+   explicit `finalize_window(project_id)` call once
+   `max_reveal_ledgers` has elapsed), the contract computes median sensor
+   values, evaluates the credit formula, stores a `VerificationResult` under
+   `LastResult(project_id)`, marks `finalized = true` and `phase = Finalized`,
+   emits a `("rdng_vrfy",)` event, and clears the `Commitment`/`OracleRevealed`
+   markers for every whitelisted oracle. `finalize_window` additionally
+   penalizes (see "Missed reveals" below) any oracle that committed but never
+   revealed. Further calls against a finalized window panic with
+   `"window already finalized"`.
+7. **Reset** — Admin calls `reset_window(admin, project_id)`. Any pending
+   `Commitment`/`OracleRevealed` entries for every whitelisted oracle are
+   cleared (an oracle may have committed without revealing when the reset
+   happens), and a fresh empty `WindowState` replaces the old one, back in the
+   `Commit` phase. Oracle nonces are **not** reset. `reset_window` works on a
+   window in any non-finalized phase (Commit or Reveal).
+
+#### Commitment encoding
+
+`commitment = SHA-256(nonce || ph || turbidity || dissolved_oxygen ||
+flow_rate || temperature || total_nitrogen || total_phosphorus || secret)`,
+computed by the exported `sha256_commitment(...)` function (also usable
+directly by off-chain oracle node software and tests, so nobody has to
+reimplement the byte layout). Byte layout:
+
+| Field | Width | Encoding |
+|---|---|---|
+| `nonce` | 8 bytes | `u64`, big-endian |
+| `ph` | 8 bytes | `i64`, big-endian |
+| `turbidity` | 8 bytes | `i64`, big-endian |
+| `dissolved_oxygen` | 8 bytes | `i64`, big-endian |
+| `flow_rate` | 8 bytes | `i64`, big-endian |
+| `temperature` | 8 bytes | `i64`, big-endian |
+| `total_nitrogen` | 8 bytes | `i64`, big-endian |
+| `total_phosphorus` | 8 bytes | `i64`, big-endian |
+| `secret` | 32 bytes | raw `BytesN<32>` (called `salt` in the contract's `RevealParams`/`CommitInfo` types — same concept as "secret" in the commit-reveal literature) |
+
+Fields are concatenated with no separators or padding — each is a
+fixed-width, big-endian integer (via `to_be_bytes()`), so the encoding is
+unambiguous and collision-resistant: no two distinct `(nonce, ph, ...,
+secret)` tuples produce the same byte string. Sensor values use the same
+fixed-point scale factors as everywhere else in the contract (see MATH.md).
+The oracle picks `secret` itself (32 random bytes) and must remember it until
+the reveal — losing it means the commitment can never be revealed and the
+oracle's stake is slashed for a missed reveal once `max_reveal_ledgers`
+passes.
+
+#### Missed reveals
+
+If `finalize_window` runs and an oracle's `Commitment` entry exists but its
+`OracleRevealed` entry does not, the oracle is charged a missed reveal:
+`OracleMissedReveals(oracle)` is incremented, up to `min_stake` is slashed
+from its stake to the treasury, a `SlashReason { reason: 3, .. }` record is
+stored, an `("orc_mr",)` event is emitted, and the stale commitment is
+removed from storage. There is no separate grace period — a commitment not
+revealed within `max_reveal_ledgers` is simply forfeited the next time
+`finalize_window` runs (whether or not `min_oracles` reveals were reached).
 
 #### Nonce replay protection
 
 Each (project, oracle) pair has a monotonically-increasing nonce stored under
-`OracleNonce(project_id, oracle)`. On each `submit_reading` call the contract
-checks `nonce == stored + 1`. If the check fails the call panics with
-`"invalid nonce"`. This prevents replay of old readings. Nonces are independent
-across projects — an oracle can use the same nonce for different projects.
+`OracleNonce(project_id, oracle)`. On each `commit_reading` call the contract
+checks `nonce == stored + 1` and records it immediately (not deferred to
+reveal). `reveal_reading` cross-checks that its `params.nonce` matches the
+nonce recorded at commit time, panicking with `"nonce mismatch with
+commitment"` otherwise. This prevents replay of old readings. Nonces are
+independent across projects — an oracle can use the same nonce for different
+projects.
 
 #### Submission statistics
 
 The contract records:
-- `OracleSubmitCount(oracle)` — total accepted submissions by this oracle.
+- `OracleSubmitCount(oracle)` — total accepted reveals by this oracle.
 - `TotalSubmissions` — global total across all oracles.
 
-These are incremented after nonce validation, regardless of whether the window
-finalizes.
+These are incremented on each accepted `reveal_reading` call, regardless of
+whether the window finalizes.
 
 #### Credit calculation (summary)
 
@@ -173,17 +260,25 @@ oracle submits fraudulent readings.
 
 - `add_oracle` requires `stake >= min_stake` when `min_stake > 0`.
 - `remove_oracle` requires `stake == 0` (oracle must unstake first).
-- `submit_reading` requires `stake >= min_stake` when `min_stake > 0`.
+- `commit_reading` requires `stake >= min_stake` when `min_stake > 0`.
+- `reveal_reading` requires `stake >= min_stake` when `min_stake > 0`.
 
 #### Public interface additions (this version)
 
 | Function | Auth | Description |
 |---|---|---|
 | `initialize(admin, staking_token, treasury)` | None (once) | Set up oracle contract with staking token and treasury |
-| `reset_window(admin, project_id)` | admin | Clear pending window so oracles can resubmit |
-| `window_submission_count(project_id)` | — | Current pending submission count |
-| `oracle_submit_count(oracle)` | — | Lifetime submission count for an oracle |
-| `total_submissions()` | — | Global lifetime submission count |
+| `open_window(admin, project_id)` | admin | Open a new commit-reveal window (Commit phase) |
+| `commit_reading(oracle, project_id, nonce, commitment)` | oracle | Store a SHA-256 commitment during the Commit phase |
+| `begin_reveal_phase(project_id)` | anyone | Transition Commit → Reveal once `commit_phase_secs` has elapsed |
+| `reveal_reading(oracle, project_id, params)` | oracle | Reveal the plaintext reading; verified against the stored commitment |
+| `finalize_window(project_id)` | anyone | Finalize after `max_reveal_ledgers`, penalizing non-revealers |
+| `get_window_phase(project_id)` | — | Current phase (`Commit`/`Reveal`/`Finalized`) of a project's window |
+| `reset_window(admin, project_id)` | admin | Clear pending commitments/reveals so oracles can restart the round |
+| `window_submission_count(project_id)` | — | Current accepted-reveal count in the open window |
+| `oracle_submit_count(oracle)` | — | Lifetime accepted-reveal count for an oracle |
+| `total_submissions()` | — | Global lifetime accepted-reveal count |
+| `oracle_missed_reveals(oracle)` | — | Lifetime missed-reveal count for an oracle |
 | `stake(oracle, amount)` | oracle | Lock tokens as collateral |
 | `unstake(oracle, amount)` | oracle | Begin cooldown withdrawal |
 | `claim_unstake(oracle)` | oracle | Withdraw tokens after cooldown |

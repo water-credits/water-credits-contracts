@@ -2,7 +2,7 @@
 //! lifecycle (issue #40):
 //!
 //! ```text
-//! register_project → add_oracle ×3 → submit_reading ×3 → mint_to (auto)
+//! register_project → add_oracle ×3 → commit_reading/reveal_reading ×3 → mint_to (auto)
 //!     → transfer → retire → record_retirement → verify all invariants
 //! ```
 //!
@@ -51,7 +51,8 @@ use soroban_sdk::{
     vec, Address, Bytes, BytesN, Env, String, Symbol, TryFromVal, Val,
 };
 use verification_oracle::{
-    OracleConfig, VerificationOracle, VerificationOracleClient, VerificationResult,
+    sha256_commitment, OracleConfig, RevealParams, VerificationOracle, VerificationOracleClient,
+    VerificationResult,
 };
 
 /// Fixed ledger timestamp so certificate/record timestamps are non-zero and
@@ -152,7 +153,8 @@ fn test_full_six_contract_lifecycle() {
             min_stake: 0,
             unstake_cooldown_secs: 86400,
             commit_phase_secs: 300,
-            reveal_phase_secs: 300,
+            min_reveal_ledgers: 0,
+            max_reveal_ledgers: 60,
         },
     );
 
@@ -297,31 +299,47 @@ fn test_full_six_contract_lifecycle() {
     //   penalty    = 0 (all quality thresholds met)
     //   total      = 100 credits
     const EXPECTED_CREDITS: i128 = 100;
-    let submit = |oracle_addr: &Address| {
-        oracle.submit_reading(
-            oracle_addr,
-            &project_id,
-            &1, // first submission for this (project, oracle) pair
-            &700i64,
-            &10i64,
-            &80i64,
-            &500i64,
-            &250i64,
-            &8i64,
-            &1i64,
-        )
+    let salt = BytesN::from_array(&e, &[0xF1u8; 32]);
+    let nonce = 1u64; // first submission for this (project, oracle) pair
+    let (ph, turb, do_, flow, temp, n, p) = (700i64, 10i64, 80i64, 500i64, 250i64, 8i64, 1i64);
+    let commitment = sha256_commitment(&e, nonce, ph, turb, do_, flow, temp, n, p, &salt);
+    let reveal_params = RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt: salt.clone(),
     };
 
+    oracle.open_window(&admin, &project_id);
+    oracle.commit_reading(&o1, &project_id, &nonce, &commitment);
+    oracle.commit_reading(&o2, &project_id, &nonce, &commitment);
+    oracle.commit_reading(&o3, &project_id, &nonce, &commitment);
+
+    // Advance past the commit phase (both timestamp and ledger sequence,
+    // consistent with the ~5s/ledger assumption the oracle's reveal-window
+    // checks rely on) and transition to the reveal phase.
+    e.ledger().with_mut(|l| {
+        l.timestamp += 301;
+        l.sequence_number += 61;
+    });
+    oracle.begin_reveal_phase(&project_id);
+
     // Window does not finalize below min_oracles = 3.
-    assert_eq!(submit(&o1), None);
+    assert_eq!(oracle.reveal_reading(&o1, &project_id, &reveal_params), None);
     assert_eq!(token.total_supply(), 0, "no mint before window finalizes");
-    assert_eq!(submit(&o2), None);
+    assert_eq!(oracle.reveal_reading(&o2, &project_id, &reveal_params), None);
     assert_eq!(token.total_supply(), 0, "no mint before window finalizes");
 
-    // Third submission finalizes the window and auto-mints. Check the
-    // emitted events first, before any further client calls touch the
-    // event buffer.
-    let result = submit(&o3).expect("third submission must finalize the window");
+    // Third reveal finalizes the window and auto-mints. Check the emitted
+    // events first, before any further client calls touch the event buffer.
+    let result = oracle
+        .reveal_reading(&o3, &project_id, &reveal_params)
+        .expect("third reveal must finalize the window");
 
     // Event: rdng_vrfy(project_id, result) from the oracle.
     let vrfy_data = last_event_data(&e, &oracle_id, symbol_short!("rdng_vrfy"));
@@ -331,7 +349,7 @@ fn test_full_six_contract_lifecycle() {
     assert_eq!(evt_result, result);
 
     // Event: minted(beneficiary, amount) from the (WASM) token contract,
-    // emitted inside the same submit_reading invocation.
+    // emitted inside the same reveal_reading invocation.
     let minted_data = last_event_data(&e, &token_id, symbol_short!("minted"));
     let (evt_to, evt_amount) = <(Address, i128)>::try_from_val(&e, &minted_data).unwrap();
     assert_eq!(evt_to, project_owner);
