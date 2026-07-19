@@ -40,6 +40,24 @@ pub struct ProjectConfig {
     pub beneficiary: Address,
 }
 
+/// Per-project water-quality baselines used in credit computation.
+///
+/// All values use the same ×100 fixed-point scale as sensor readings
+/// (e.g. `baseline_n = 1000` means 10.00 mg/L, `baseline_p = 200` means 2.00 mg/L,
+/// `baseline_temp = 2500` means 25.00 °C).
+///
+/// Stored separately from `ProjectConfig` under `DataKey::ProjectBaseline` so
+/// that existing on-chain `ProjectConfig` entries are not invalidated by this
+/// schema change — old entries simply fall back to the global `OracleConfig`
+/// defaults.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectBaseline {
+    pub baseline_n: i64,
+    pub baseline_p: i64,
+    pub baseline_temp: i64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VerificationResult {
@@ -76,6 +94,13 @@ pub struct OracleConfig {
     pub unstake_cooldown_secs: u64,
     pub commit_phase_secs: u64,
     pub reveal_phase_secs: u64,
+    /// Global fallback baseline for total nitrogen (×100 scale, e.g. 1000 = 10.00 mg/L).
+    /// Used when a project has no `ProjectBaseline` configured.
+    pub default_baseline_n: i64,
+    /// Global fallback baseline for total phosphorus (×100 scale, e.g. 200 = 2.00 mg/L).
+    pub default_baseline_p: i64,
+    /// Global fallback baseline temperature (×100 scale, e.g. 2500 = 25.00 °C).
+    pub default_baseline_temp: i64,
 }
 
 #[contracttype]
@@ -147,6 +172,9 @@ pub enum DataKey {
     /// Per-project result count, used for paginated history
     ResultCount(BytesN<32>),
     ProjectConfig(BytesN<32>),
+    /// Per-project credit baselines (stored separately to preserve backward
+    /// compatibility with existing on-chain ProjectConfig entries).
+    ProjectBaseline(BytesN<32>),
     OracleSubmitCount(Address),
     OracleStake(Address),
     OracleSlashed(Address),
@@ -409,6 +437,10 @@ impl VerificationOracle {
             unstake_cooldown_secs: 86400,
             commit_phase_secs: 300,
             reveal_phase_secs: 300,
+            // Default baselines (×100 scale): N = 10.00 mg/L, P = 2.00 mg/L, temp = 25.00 °C
+            default_baseline_n: 1000,
+            default_baseline_p: 200,
+            default_baseline_temp: 2500,
         };
         e.storage().instance().set(&DataKey::Config, &config);
     }
@@ -729,18 +761,33 @@ impl VerificationOracle {
             let med_n = median_i64(&e, &n_vals);
             let med_p = median_i64(&e, &p_vals);
 
-            // N removal: baseline 10 mg/L
-            let baseline_n: i128 = 10;
+            // Resolve per-project baselines (×100 scale), falling back to
+            // OracleConfig global defaults when no ProjectBaseline is stored.
+            // The ×100 scale matches sensor readings so comparisons are
+            // consistent (e.g. baseline_n = 1000 means 10.00 mg/L).
+            let baseline_key = DataKey::ProjectBaseline(project_id.clone());
+            let project_baseline: Option<ProjectBaseline> =
+                e.storage().persistent().get(&baseline_key);
+            let baseline_n: i128 = project_baseline
+                .as_ref()
+                .map(|b| b.baseline_n as i128)
+                .unwrap_or(config.default_baseline_n as i128);
+            let baseline_p: i128 = project_baseline
+                .as_ref()
+                .map(|b| b.baseline_p as i128)
+                .unwrap_or(config.default_baseline_p as i128);
+
+            // N removal: kg = (baseline - measured) [×100 mg/L] × flow [L/s] × 3600 [s/hr]
+            //            ÷ 100 [scale] ÷ 1_000_000 [mg→kg]
             let n_removed: i128 = if (med_n as i128) < baseline_n {
-                (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 1000000
+                (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 100_000_000
             } else {
                 0
             };
 
-            // P removal: baseline 2 mg/L
-            let baseline_p: i128 = 2;
+            // P removal (same formula)
             let p_removed: i128 = if (med_p as i128) < baseline_p {
-                (baseline_p - med_p as i128) * med_flow as i128 * 3600 / 1000000
+                (baseline_p - med_p as i128) * med_flow as i128 * 3600 / 100_000_000
             } else {
                 0
             };
@@ -865,6 +912,60 @@ impl VerificationOracle {
         e.storage()
             .persistent()
             .extend_ttl(&key, PROJ_CFG_TTL_THRESHOLD, PROJ_CFG_TTL_BUMP);
+    }
+
+    /// Set per-project credit baselines for nitrogen, phosphorus, and temperature.
+    ///
+    /// All values use the same ×100 fixed-point scale as sensor readings:
+    /// - `baseline_n`: total-nitrogen baseline in ×100 mg/L (e.g. `1000` = 10.00 mg/L)
+    /// - `baseline_p`: total-phosphorus baseline in ×100 mg/L (e.g. `200` = 2.00 mg/L)
+    /// - `baseline_temp`: temperature baseline in ×100 °C (e.g. `2500` = 25.00 °C)
+    ///
+    /// Stored under a separate `ProjectBaseline` key so that existing on-chain
+    /// `ProjectConfig` entries are not invalidated (backward-compatible schema change).
+    /// If not set, the finalization logic falls back to `OracleConfig.default_baseline_*`.
+    pub fn set_project_baseline(
+        e: Env,
+        admin: Address,
+        project_id: BytesN<32>,
+        baseline_n: i64,
+        baseline_p: i64,
+        baseline_temp: i64,
+    ) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        if baseline_n < 0 || baseline_p < 0 || baseline_temp < 0 {
+            panic!("baselines must be non-negative");
+        }
+        let baseline = ProjectBaseline {
+            baseline_n,
+            baseline_p,
+            baseline_temp,
+        };
+        let key = DataKey::ProjectBaseline(project_id);
+        e.storage().persistent().set(&key, &baseline);
+        e.storage()
+            .persistent()
+            .extend_ttl(&key, PROJ_CFG_TTL_THRESHOLD, PROJ_CFG_TTL_BUMP);
+    }
+
+    /// Get the per-project baselines. Returns `None` if not configured
+    /// (in which case `OracleConfig.default_baseline_*` values are used).
+    pub fn get_project_baseline(
+        e: Env,
+        project_id: BytesN<32>,
+    ) -> Option<ProjectBaseline> {
+        let key = DataKey::ProjectBaseline(project_id);
+        let result: Option<ProjectBaseline> = e.storage().persistent().get(&key);
+        if result.is_some() {
+            e.storage()
+                .persistent()
+                .extend_ttl(&key, PROJ_CFG_TTL_THRESHOLD, PROJ_CFG_TTL_BUMP);
+        }
+        result
     }
 
     /// Get the project config (token contract and beneficiary) for a project.
@@ -1716,16 +1817,31 @@ impl VerificationOracle {
         let med_n = median_i64(&e, &n_vals);
         let med_p = median_i64(&e, &p_vals);
 
-        let baseline_n: i128 = 10;
+        // Resolve per-project baselines (×100 scale), falling back to
+        // OracleConfig global defaults when no ProjectBaseline is stored.
+        let baseline_key = DataKey::ProjectBaseline(project_id.clone());
+        let project_baseline: Option<ProjectBaseline> =
+            e.storage().persistent().get(&baseline_key);
+        let baseline_n: i128 = project_baseline
+            .as_ref()
+            .map(|b| b.baseline_n as i128)
+            .unwrap_or(config.default_baseline_n as i128);
+        let baseline_p: i128 = project_baseline
+            .as_ref()
+            .map(|b| b.baseline_p as i128)
+            .unwrap_or(config.default_baseline_p as i128);
+
+        // N removal: kg = (baseline - measured) [×100 mg/L] × flow [L/s] × 3600 [s/hr]
+        //            ÷ 100 [scale] ÷ 1_000_000 [mg→kg]
         let n_removed: i128 = if (med_n as i128) < baseline_n {
-            (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 1000000
+            (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 100_000_000
         } else {
             0
         };
 
-        let baseline_p: i128 = 2;
+        // P removal (same formula)
         let p_removed: i128 = if (med_p as i128) < baseline_p {
-            (baseline_p - med_p as i128) * med_flow as i128 * 3600 / 1000000
+            (baseline_p - med_p as i128) * med_flow as i128 * 3600 / 100_000_000
         } else {
             0
         };
@@ -2138,6 +2254,9 @@ mod tests {
             unstake_cooldown_secs: 172800,
             commit_phase_secs: 600,
             reveal_phase_secs: 600,
+            default_baseline_n: 1000,
+            default_baseline_p: 200,
+            default_baseline_temp: 2500,
         };
         client.update_config(&admin, &new_config);
 
@@ -3842,5 +3961,87 @@ mod tests {
             client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
+    }
+    /// Two projects with different per-project baselines must produce different
+    /// credit totals for identical sensor readings.
+    ///
+    /// Project A: high-pollution zone — baseline_n = 2500 (25.00 mg/L),
+    ///            baseline_p = 500 (5.00 mg/L).
+    /// Project B: pristine catchment — baseline_n = 800 (8.00 mg/L),
+    ///            baseline_p = 100 (1.00 mg/L).
+    /// Both projects receive the identical reading: N = 600 (6.00 mg/L),
+    /// P = 50 (0.50 mg/L), flow = 500 L/s.
+    ///
+    /// Project A removes more nutrient (larger gap above baseline) and therefore
+    /// earns more credits. Project B's readings already exceed its low baseline
+    /// and earn nothing (or much less) from the N/P component.
+    #[test]
+    fn test_per_project_baselines_produce_different_credits() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        // Disable min_stake so we can add oracles without token setup
+        let mut cfg = client.get_config();
+        cfg.min_stake = 0;
+        client.update_config(&admin, &cfg);
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+
+        // ── Project A: high-pollution agricultural runoff zone ──
+        let project_a = BytesN::from_array(&e, &[0xAAu8; 32]);
+        // baseline_n = 2500 (25.00 mg/L), baseline_p = 500 (5.00 mg/L)
+        client.set_project_baseline(&admin, &project_a, &2500, &500, &2500);
+
+        // ── Project B: pristine low-nutrient catchment ──
+        let project_b = BytesN::from_array(&e, &[0xBBu8; 32]);
+        // baseline_n = 800 (8.00 mg/L), baseline_p = 100 (1.00 mg/L)
+        client.set_project_baseline(&admin, &project_b, &800, &100, &2500);
+
+        // Identical readings: N = 600 (6.00 mg/L), P = 50 (0.50 mg/L), flow = 500 L/s
+        // Project A: N below baseline (25.00 > 6.00) → removes N → earns credits
+        // Project B: N below baseline (8.00 > 6.00) → removes N → earns fewer credits
+        let result_a = client.submit_reading(
+            &o1, &project_a, &1, &700, &10, &80, &500, &250, &600, &50,
+        );
+        client.submit_reading(&o2, &project_a, &1, &700, &10, &80, &500, &250, &600, &50);
+        let final_a = client
+            .submit_reading(&o3, &project_a, &1, &700, &10, &80, &500, &250, &600, &50)
+            .unwrap();
+
+        let result_b = client.submit_reading(
+            &o1, &project_b, &1, &700, &10, &80, &500, &250, &600, &50,
+        );
+        client.submit_reading(&o2, &project_b, &1, &700, &10, &80, &500, &250, &600, &50);
+        let final_b = client
+            .submit_reading(&o3, &project_b, &1, &700, &10, &80, &500, &250, &600, &50)
+            .unwrap();
+
+        // Suppress unused-variable warnings for intermediate results
+        let _ = result_a;
+        let _ = result_b;
+
+        // Project A has a larger nutrient gap above baseline → more removal → more credits
+        assert!(
+            final_a.total_credits > final_b.total_credits,
+            "Project A (high-pollution baseline) should earn more credits than Project B \
+             (low baseline) for identical readings; got A={} B={}",
+            final_a.total_credits,
+            final_b.total_credits
+        );
+
+        // Both projects must earn at least some credits (readings below both baselines)
+        assert!(final_a.total_credits > 0, "Project A must earn positive credits");
+        assert!(final_b.total_credits > 0, "Project B must earn positive credits");
+
+        // Sanity: N removal amounts should differ proportionally to the baseline gap
+        assert!(
+            final_a.n_removal_kg > final_b.n_removal_kg,
+            "Project A should remove more nitrogen than Project B"
+        );
     }
 }
