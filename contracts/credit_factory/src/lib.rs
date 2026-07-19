@@ -108,8 +108,23 @@ impl CreditFactory {
 
         let count: u64 = e.storage().instance().get(&DataKey::ProjectCount).unwrap();
         let timestamp = e.ledger().timestamp();
+        let project_id: BytesN<32> = generate_project_id(
+            &e,
+            count,
+            timestamp,
+            &name,
+            &methodology,
+            latitude,
+            longitude,
+            area_hectares,
+        );
 
-        let project_id: BytesN<32> = generate_project_id(&e, count, timestamp);
+        if e.storage()
+            .persistent()
+            .has(&DataKey::Project(project_id.clone()))
+        {
+            panic!("project id collision");
+        }
 
         // Deploy new credit_token contract
         let salt = project_id.clone();
@@ -505,5 +520,86 @@ mod tests {
         client.update_project_owner(&owner, &project_id, &new_owner);
         let project = client.get_project(&project_id).unwrap();
         assert_eq!(project.owner, new_owner);
+    }
+
+    #[test]
+    #[should_panic(expected = "project id collision")]
+    fn test_register_project_collision_panic() {
+        let (e, admin, owner, wasm_hash, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let name = String::from_str(&e, "Test Project");
+        let methodology = String::from_str(&e, "Test_v1");
+
+        let project_id = generate_project_id(
+            &e,
+            0,
+            e.ledger().timestamp(),
+            &name,
+            &methodology,
+            38897700,
+            -77036500,
+            500,
+        );
+
+        let dummy_project = ProjectInfo {
+            id: project_id.clone(),
+            name: name.clone(),
+            latitude: 38897700,
+            longitude: -77036500,
+            methodology: methodology.clone(),
+            owner: owner.clone(),
+            status: String::from_str(&e, "registered"),
+            credit_token: admin.clone(),
+            registration_date: e.ledger().timestamp(),
+            area_hectares: 500,
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::Project(project_id), &dummy_project);
+
+        client.register_project(
+            &admin,
+            &name,
+            &38897700,
+            &(-77036500),
+            &methodology,
+            &owner,
+            &500,
+            &wasm_hash,
+        );
+    }
+
+    #[test]
+    fn test_register_project_different_names_produce_different_ids() {
+        let (e, admin, owner, wasm_hash, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let name1 = String::from_str(&e, "Project A");
+        let name2 = String::from_str(&e, "Project B");
+        let methodology = String::from_str(&e, "Test_v1");
+
+        let id1 = client.register_project(
+            &admin,
+            &name1,
+            &38897700,
+            &(-77036500),
+            &methodology,
+            &owner,
+            &500,
+            &wasm_hash,
+        );
+        let id2 = client.register_project(
+            &admin,
+            &name2,
+            &38897700,
+            &(-77036500),
+            &methodology,
+            &owner,
+            &500,
+            &wasm_hash,
+        );
+
+        assert_ne!(id1, id2);
     }
 }

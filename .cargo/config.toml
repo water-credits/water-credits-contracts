@@ -2,4 +2,5 @@
 rustflags = ["-C", "target-cpu=mvp"]
 
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-cpu=mvp"]
+rustflags = ["-C", "target-cpu=mvp", "-C", "target-feature=-reference-types"]
+

@@ -1,22 +1,21 @@
 //! Cross-contract project ID compatibility tests (issue #6).
 //!
 //! Verifies that `credit_factory` and `project_registry` produce identical
-//! project IDs for the same (count, timestamp) inputs, using the canonical
+//! project IDs for the same inputs, using the canonical
 //! `shared::generate_project_id` helper.
 
 use shared::generate_project_id;
-use soroban_sdk::{testutils::Address as _, BytesN, Env};
+use soroban_sdk::{BytesN, Env, String};
 
-/// The same (count, timestamp) pair must produce the same ID via the shared helper.
+/// The same inputs must produce the same ID via the shared helper.
 #[test]
 fn test_shared_helper_deterministic_across_envs() {
-    // BytesN values are bound to the Env that created them — comparing values
-    // from two different Env instances panics.  Use a single Env and call the
-    // helper twice; determinism is still proven by comparing the two results.
     let e = Env::default();
+    let name = String::from_str(&e, "Project Alpha");
+    let meth = String::from_str(&e, "Methodology 1");
 
-    let id1 = generate_project_id(&e, 0, 1_700_000_000);
-    let id2 = generate_project_id(&e, 0, 1_700_000_000);
+    let id1 = generate_project_id(&e, 0, 1_700_000_000, &name, &meth, 100, 200, 50);
+    let id2 = generate_project_id(&e, 0, 1_700_000_000, &name, &meth, 100, 200, 50);
 
     assert_eq!(
         id1, id2,
@@ -29,10 +28,12 @@ fn test_shared_helper_deterministic_across_envs() {
 #[test]
 fn test_first_five_project_ids_match() {
     let e = Env::default();
+    let name = String::from_str(&e, "Project Alpha");
+    let meth = String::from_str(&e, "Methodology 1");
 
     for count in 0u64..5 {
         let timestamp = 1_700_000_000 + count * 3600;
-        let id = generate_project_id(&e, count, timestamp);
+        let id = generate_project_id(&e, count, timestamp, &name, &meth, 100, 200, 50);
 
         // Verify the ID is a valid 32-byte hash (not raw byte-packing with trailing zeros)
         assert_eq!(id.len(), 32);
@@ -52,10 +53,12 @@ fn test_first_five_project_ids_match() {
 fn test_uniqueness_same_timestamp() {
     let e = Env::default();
     let timestamp = 1_700_000_000;
+    let name = String::from_str(&e, "Project Alpha");
+    let meth = String::from_str(&e, "Methodology 1");
 
     let mut seen = soroban_sdk::Vec::<BytesN<32>>::new(&e);
     for count in 0u64..10 {
-        let id = generate_project_id(&e, count, timestamp);
+        let id = generate_project_id(&e, count, timestamp, &name, &meth, 100, 200, 50);
         // Ensure no duplicates
         for i in 0..seen.len() {
             assert_ne!(seen.get(i).unwrap(), id, "duplicate ID at count={}", count);
@@ -73,9 +76,11 @@ fn test_documents_breaking_change() {
 
     let count: u64 = 0;
     let timestamp: u64 = 1_700_000_000;
+    let name = String::from_str(&e, "Project Alpha");
+    let meth = String::from_str(&e, "Methodology 1");
 
     // New canonical ID (SHA-256 based)
-    let new_id = generate_project_id(&e, count, timestamp);
+    let new_id = generate_project_id(&e, count, timestamp, &name, &meth, 100, 200, 50);
 
     // Old byte-packing scheme (what project_registry used to do)
     let count_bytes = count.to_be_bytes();

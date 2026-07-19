@@ -96,7 +96,16 @@ impl ProjectRegistry {
         let count: u64 = e.storage().instance().get(&DataKey::ProjectCount).unwrap();
         let timestamp = e.ledger().timestamp();
 
-        let project_id = generate_project_id(&e, count, timestamp);
+        let project_id = generate_project_id(
+            &e,
+            count,
+            timestamp,
+            &name,
+            &methodology,
+            latitude,
+            longitude,
+            area_hectares,
+        );
 
         let project = ProjectEntry {
             id: project_id.clone(),
