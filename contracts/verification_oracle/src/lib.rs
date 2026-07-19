@@ -982,13 +982,35 @@ impl VerificationOracle {
             _ => {}
         }
 
-        // Remove the OracleSubmitted markers for all oracles in this window
         let window = window.unwrap();
+
+        // Remove OracleSubmitted markers for all submissions in this window
         for i in 0..window.submissions.len() {
             let sub = window.submissions.get(i).unwrap();
             e.storage()
                 .temporary()
                 .remove(&DataKey::OracleSubmitted(project_id.clone(), sub.oracle));
+        }
+
+        // Remove OracleCommitted and OracleRevealed markers for all active oracles.
+        // Oracles that committed but haven't revealed yet have no entry in
+        // window.submissions, so iterating only over submissions would leave
+        // stale committed markers that block oracle removal (issue #38).
+        let oracles: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleList)
+            .unwrap_or_else(|| Vec::new(&e));
+        for i in 0..oracles.len() {
+            let oracle = oracles.get(i).unwrap();
+            e.storage().temporary().remove(&DataKey::OracleCommitted((
+                project_id.clone(),
+                oracle.clone(),
+            )));
+            e.storage().temporary().remove(&DataKey::OracleRevealed((
+                project_id.clone(),
+                oracle.clone(),
+            )));
         }
 
         // Replace with a fresh empty window in Reveal phase (for direct submissions)
@@ -3351,10 +3373,10 @@ mod tests {
         // Reset should work on commit-phase window
         client.reset_window(&admin, &project_id);
 
-        // Window should be back to Reveal phase (reset creates Reveal windows for direct submissions)
-        // And oracle should be able to re-commit with a new nonce
-        let commitment2 = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
-        client.commit_reading(&oracles.get(0).unwrap(), &project_id, &1, &commitment2);
+        // Oracle should be able to re-commit with the next nonce
+        let nonce2: u64 = 2;
+        let commitment2 = sha256_commitment(&e, nonce2, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracles.get(0).unwrap(), &project_id, &nonce2, &commitment2);
     }
 
     #[test]
@@ -3741,5 +3763,84 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(client.is_oracle_active(&o1));
+    }
+
+    #[test]
+    fn test_reset_window_cleans_committed_markers_enabling_removal() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        let o4 = Address::generate(&e);
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        client.update_config(&admin, &config);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        client.add_oracle(&admin, &o4);
+
+        let project_id = BytesN::from_array(&e, &[215u8; 32]);
+        client.open_window(&admin, &project_id);
+
+        let salt = BytesN::from_array(&e, &[0xB1u8; 32]);
+        let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&o1, &project_id, &1, &commitment);
+
+        // Cannot remove o1 while it has an open committed marker
+        let result = e.try_invoke_contract::<_, ()>(
+            &client.address,
+            &Symbol::new(&e, "remove_oracle"),
+            vec![&e, admin.to_val(), o1.to_val()],
+        );
+        assert!(result.is_err());
+
+        // Reset clears committed markers — o1 can now be removed
+        client.reset_window(&admin, &project_id);
+        client.remove_oracle(&admin, &o1);
+        assert!(!client.is_oracle_active(&o1));
+    }
+
+    #[test]
+    fn test_window_finalizes_with_min_oracles_after_one_removed() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        let o4 = Address::generate(&e);
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        client.update_config(&admin, &config);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        client.add_oracle(&admin, &o4);
+
+        let project_id = BytesN::from_array(&e, &[216u8; 32]);
+
+        // First window: 3 oracles submit, finalize
+        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        let result =
+            client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().oracle_count, 3);
+
+        // Remove o4 (never submitted to this window)
+        client.remove_oracle(&admin, &o4);
+        assert!(!client.is_oracle_active(&o4));
+
+        // Reset and resubmit — 3 remaining oracles finalize the window
+        client.reset_window(&admin, &project_id);
+        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        let result =
+            client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().oracle_count, 3);
     }
 }
