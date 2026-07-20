@@ -744,8 +744,19 @@ impl VerificationOracle {
             let med_p = median_i64(&e, &p_vals);
 
             // Per-project baselines (doc/MATH.md §1: N/P raw mg/L, temp ×10 °C).
-            // Fall back to the global OracleConfig defaults when a project has
-            // not set its own baselines (ProjectConfig.baseline_* == 0).
+            //
+            // Scale note (Issue #26): `total_nitrogen` and `total_phosphorus` are
+            // raw integers in mg/L (no ×100 scaling — see doc/MATH.md §1 table).
+            // `temperature` is ×10 °C. The previous hardcoded `baseline_n = 10`
+            // and `baseline_p = 2` were already in the same raw mg/L encoding,
+            // so there is no scale mismatch. `baseline_temp = 300` matches the
+            // ×10 °C encoding (30.0 °C).
+            //
+            // Fall back to the global defaults when a project has not set its
+            // own baselines (ProjectConfig.baseline_* == 0). This preserves
+            // backward compatibility: existing projects with old ProjectConfig
+            // structs that predate these fields will deserialise with all-zero
+            // baselines and behave identically to the old hardcoded constants.
             let proj_cfg = Self::get_project_config(e.clone(), project_id.clone());
             let default_baseline_n: i128 = 10;
             let default_baseline_p: i128 = 2;
@@ -763,7 +774,8 @@ impl VerificationOracle {
                 _ => default_baseline_temp,
             };
 
-            // N removal
+            // N removal (checked arithmetic: baseline - med_n is non-negative
+            // because we only enter this branch when med_n < baseline).
             let n_removed: i128 = if (med_n as i128) < baseline_n {
                 (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 1000000
             } else {

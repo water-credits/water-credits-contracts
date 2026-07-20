@@ -198,3 +198,87 @@ fn test_per_project_temp_baseline_drives_penalty() {
         res_b.quality_penalty
     );
 }
+
+/// Edge case: very high baselines produce large removal credits without overflow.
+/// Verifies the arithmetic path (baseline - med) * flow * 3600 / 1_000_000
+/// does not panic when baseline is much larger than med_n.
+#[test]
+fn test_high_baseline_no_overflow() {
+    let f = setup();
+
+    // baseline_n = 1000 mg/L, med_n = 8 → diff = 992, flow = 500
+    // n_removed = 992 * 500 * 3600 / 1_000_000 = 1785 (well within i128)
+    let proj = configure_project(&f, 1000, 100, 300);
+    submit_three(&f, &proj);
+
+    let res = f.oracle_client.get_last_result(&proj).unwrap();
+    assert_eq!(
+        res.n_removal_kg,
+        (1000 - 8) as i128 * 500 * 3600 / 1_000_000
+    );
+    assert_eq!(
+        res.p_removal_kg,
+        (100 - 1) as i128 * 500 * 3600 / 1_000_000
+    );
+}
+
+/// Edge case: med_n exactly equals baseline_n → zero removal (boundary test).
+#[test]
+fn test_reading_equals_baseline_zero_removal() {
+    let f = setup();
+
+    // med_n = 10 = baseline_n → n_removed = 0
+    // med_p = 2 = baseline_p → p_removed = 0
+    // Use a custom reading where n=10, p=2.
+    let proj = configure_project(&f, 10, 2, 300);
+
+    let (ph, turb, do_, flow, temp, _, _) = READING;
+    for i in 0..3u32 {
+        f.oracle_client.submit_reading(
+            &f.oracles.get(i).unwrap(),
+            &proj,
+            &1,
+            &ph,
+            &turb,
+            &do_,
+            &flow,
+            &temp,
+            &10, // n = baseline_n exactly
+            &2,  // p = baseline_p exactly
+        );
+    }
+
+    let res = f.oracle_client.get_last_result(&proj).unwrap();
+    assert_eq!(res.n_removal_kg, 0, "n_removed should be 0 when med_n == baseline_n");
+    assert_eq!(res.p_removal_kg, 0, "p_removed should be 0 when med_p == baseline_p");
+}
+
+/// Edge case: reading above baseline → zero removal (no negative credits).
+#[test]
+fn test_reading_above_baseline_zero_removal() {
+    let f = setup();
+
+    // baseline_n = 5, but med_n = 8 > 5 → n_removed = 0
+    // baseline_p = 1, but med_p = 1 == 1 → p_removed = 0
+    let proj = configure_project(&f, 5, 1, 300);
+
+    let (ph, turb, do_, flow, temp, _, _) = READING;
+    for i in 0..3u32 {
+        f.oracle_client.submit_reading(
+            &f.oracles.get(i).unwrap(),
+            &proj,
+            &1,
+            &ph,
+            &turb,
+            &do_,
+            &flow,
+            &temp,
+            &8, // n > baseline_n
+            &1, // p == baseline_p
+        );
+    }
+
+    let res = f.oracle_client.get_last_result(&proj).unwrap();
+    assert_eq!(res.n_removal_kg, 0);
+    assert_eq!(res.p_removal_kg, 0);
+}
