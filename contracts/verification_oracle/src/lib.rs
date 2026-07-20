@@ -38,6 +38,20 @@ pub struct ReadingSubmission {
 pub struct ProjectConfig {
     pub token_contract: Address,
     pub beneficiary: Address,
+    /// Per-project nitrogen baseline (mg/L, raw integer — same encoding as
+    /// `total_nitrogen`; see doc/MATH.md §1). Falls back to the global
+    /// `OracleConfig` default when unset (0).
+    pub baseline_n: i64,
+    /// Per-project phosphorus baseline (mg/L, raw integer — same encoding as
+    /// `total_phosphorus`; see doc/MATH.md §1). Falls back to the global
+    /// `OracleConfig` default when unset (0).
+    pub baseline_p: i64,
+    /// Per-project temperature baseline (×10 °C — same encoding as
+    /// `temperature`; see doc/MATH.md §1). Used as the implicit baseline for the
+    /// temperature quality penalty (compared against the project baseline rather
+    /// than the global `quality_threshold_temp` max threshold). Falls back to the
+    /// global `OracleConfig` default when unset (0).
+    pub baseline_temp: i64,
 }
 
 #[contracttype]
@@ -729,16 +743,34 @@ impl VerificationOracle {
             let med_n = median_i64(&e, &n_vals);
             let med_p = median_i64(&e, &p_vals);
 
-            // N removal: baseline 10 mg/L
-            let baseline_n: i128 = 10;
+            // Per-project baselines (doc/MATH.md §1: N/P raw mg/L, temp ×10 °C).
+            // Fall back to the global OracleConfig defaults when a project has
+            // not set its own baselines (ProjectConfig.baseline_* == 0).
+            let proj_cfg = Self::get_project_config(e.clone(), project_id.clone());
+            let default_baseline_n: i128 = 10;
+            let default_baseline_p: i128 = 2;
+            let default_baseline_temp: i128 = 300;
+            let baseline_n: i128 = match proj_cfg {
+                Some(ref pc) if pc.baseline_n != 0 => pc.baseline_n as i128,
+                _ => default_baseline_n,
+            };
+            let baseline_p: i128 = match proj_cfg {
+                Some(ref pc) if pc.baseline_p != 0 => pc.baseline_p as i128,
+                _ => default_baseline_p,
+            };
+            let baseline_temp: i128 = match proj_cfg {
+                Some(ref pc) if pc.baseline_temp != 0 => pc.baseline_temp as i128,
+                _ => default_baseline_temp,
+            };
+
+            // N removal
             let n_removed: i128 = if (med_n as i128) < baseline_n {
                 (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 1000000
             } else {
                 0
             };
 
-            // P removal: baseline 2 mg/L
-            let baseline_p: i128 = 2;
+            // P removal
             let p_removed: i128 = if (med_p as i128) < baseline_p {
                 (baseline_p - med_p as i128) * med_flow as i128 * 3600 / 1000000
             } else {
@@ -757,7 +789,7 @@ impl VerificationOracle {
             if med_do < config.quality_threshold_do {
                 penalty += 2000;
             }
-            if med_temp > config.quality_threshold_temp {
+            if (med_temp as i128) > baseline_temp {
                 penalty += 1000;
             }
             if penalty > 8000 {
@@ -844,12 +876,21 @@ impl VerificationOracle {
 
     /// Configure the credit token contract and beneficiary for a project.
     /// When enabled, the oracle will auto-mint credits to the beneficiary upon verification finalization.
+    ///
+    /// `baseline_n` / `baseline_p` are per-project nutrient baselines in mg/L
+    /// (raw integer, same encoding as `total_nitrogen` / `total_phosphorus`;
+    /// see doc/MATH.md §1). `baseline_temp` is the per-project temperature
+    /// baseline in ×10 °C (same encoding as `temperature`). Pass the protocol
+    /// defaults (e.g. `10`, `2`, `300`) to preserve the previous behavior.
     pub fn set_project_config(
         e: Env,
         admin: Address,
         project_id: BytesN<32>,
         token_contract: Address,
         beneficiary: Address,
+        baseline_n: i64,
+        baseline_p: i64,
+        baseline_temp: i64,
     ) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -859,6 +900,9 @@ impl VerificationOracle {
         let config = ProjectConfig {
             token_contract,
             beneficiary,
+            baseline_n,
+            baseline_p,
+            baseline_temp,
         };
         let key = DataKey::ProjectConfig(project_id);
         e.storage().persistent().set(&key, &config);

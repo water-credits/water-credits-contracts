@@ -57,7 +57,7 @@ fn setup() -> Fixture {
     token_client.set_minter(&admin, &oracle_id);
 
     // Wire the project to the token + beneficiary.
-    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary);
+    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &10, &2, &300);
 
     // Disable the min-stake requirement so oracles can be added without funding.
     let mut config = oracle_client.get_config();
