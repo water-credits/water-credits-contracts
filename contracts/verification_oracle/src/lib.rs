@@ -229,54 +229,36 @@ fn sha256_commitment(
     e.crypto().sha256(&data)
 }
 
-fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
-    let mut sorted: Vec<i64> = Vec::new(e);
-    for i in 0..values.len() {
-        let val = values.get(i).unwrap();
-        let mut inserted = false;
-        for j in 0..sorted.len() {
-            if val < sorted.get(j).unwrap() {
-                sorted.insert(j, val);
-                inserted = true;
-                break;
-            }
-        }
-        if !inserted {
-            sorted.push_back(val);
-        }
+/// Compute the median of a `Vec<i64>`. Copies values into a local fixed-size
+/// array (max 10 elements, matching `max_oracles`) and uses an insertion sort
+/// on the stack — zero Soroban host allocations. For the hard config bound of
+/// `max_oracles = 10` this runs at most 45 local comparisons, a dramatic
+/// improvement over the previous O(n²) host-call-based insertion sort.
+///
+/// Even-length median: `(sorted[n/2-1] + sorted[n/2]) / 2` (Rust integer
+/// division truncates toward zero, matching the historical behaviour).
+fn median_i64(values: &Vec<i64>) -> i64 {
+    let n = values.len();
+    // `max_oracles = 10` is a hard config bound enforced at `add_oracle`,
+    // so `n` is always in [1, 10].
+    let mut arr = [0i64; 10];
+    for i in 0..n {
+        arr[i] = values.get(i).unwrap();
     }
-    let len = sorted.len();
-    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
-    if len % 2 == 0 {
-        (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
+    // Insertion sort on the local stack array — zero host calls.
+    for i in 1..n {
+        let key = arr[i];
+        let mut j = i;
+        while j > 0 && arr[j - 1] > key {
+            arr[j] = arr[j - 1];
+            j -= 1;
+        }
+        arr[j] = key;
+    }
+    if n % 2 == 0 {
+        (arr[n / 2 - 1] + arr[n / 2]) / 2
     } else {
-        sorted.get(len / 2).unwrap()
-    }
-}
-
-#[allow(unused)]
-fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
-    let mut sorted: Vec<i128> = Vec::new(e);
-    for i in 0..values.len() {
-        let val = values.get(i).unwrap();
-        let mut inserted = false;
-        for j in 0..sorted.len() {
-            if val < sorted.get(j).unwrap() {
-                sorted.insert(j, val);
-                inserted = true;
-                break;
-            }
-        }
-        if !inserted {
-            sorted.push_back(val);
-        }
-    }
-    let len = sorted.len();
-    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
-    if len % 2 == 0 {
-        (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
-    } else {
-        sorted.get(len / 2).unwrap()
+        arr[n / 2]
     }
 }
 
@@ -735,13 +717,13 @@ impl VerificationOracle {
                 p_vals.push_back(s.total_phosphorus);
             }
 
-            let med_ph = median_i64(&e, &ph_vals);
-            let med_turb = median_i64(&e, &turb_vals);
-            let med_do = median_i64(&e, &do_vals);
-            let med_temp = median_i64(&e, &temp_vals);
-            let med_flow = median_i64(&e, &flow_vals);
-            let med_n = median_i64(&e, &n_vals);
-            let med_p = median_i64(&e, &p_vals);
+            let med_ph = median_i64(&ph_vals);
+            let med_turb = median_i64(&turb_vals);
+            let med_do = median_i64(&do_vals);
+            let med_temp = median_i64(&temp_vals);
+            let med_flow = median_i64(&flow_vals);
+            let med_n = median_i64(&n_vals);
+            let med_p = median_i64(&p_vals);
 
             // Per-project baselines (doc/MATH.md §1: N/P raw mg/L, temp ×10 °C).
             //
@@ -1764,13 +1746,13 @@ impl VerificationOracle {
             p_vals.push_back(s.total_phosphorus);
         }
 
-        let med_ph = median_i64(&e, &ph_vals);
-        let med_turb = median_i64(&e, &turb_vals);
-        let med_do = median_i64(&e, &do_vals);
-        let med_temp = median_i64(&e, &temp_vals);
-        let med_flow = median_i64(&e, &flow_vals);
-        let med_n = median_i64(&e, &n_vals);
-        let med_p = median_i64(&e, &p_vals);
+        let med_ph = median_i64(&ph_vals);
+        let med_turb = median_i64(&turb_vals);
+        let med_do = median_i64(&do_vals);
+        let med_temp = median_i64(&temp_vals);
+        let med_flow = median_i64(&flow_vals);
+        let med_n = median_i64(&n_vals);
+        let med_p = median_i64(&p_vals);
 
         let baseline_n: i128 = 10;
         let n_removed: i128 = if (med_n as i128) < baseline_n {
@@ -3898,5 +3880,101 @@ mod tests {
             client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
+    }
+
+    // ── median_i64 unit tests ──
+
+    /// Build a `Vec<i64>` of length `n` from a Rust slice. Requires `Env`
+    /// for Soroban `Vec` construction and `#[cfg(test)]` (`extern crate std`).
+    fn make_i64_vec(e: &Env, values: &[i64]) -> Vec<i64> {
+        let mut v = Vec::new(e);
+        for val in values {
+            v.push_back(*val);
+        }
+        v
+    }
+
+    #[test]
+    fn test_median_odd_count() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[30, 10, 20]);
+        assert_eq!(median_i64(&v), 20);
+    }
+
+    #[test]
+    fn test_median_odd_count_five() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[50, 10, 30, 40, 20]);
+        assert_eq!(median_i64(&v), 30);
+    }
+
+    #[test]
+    fn test_median_even_count_averages_two_middles() {
+        let e = Env::default();
+        // [10, 20, 30, 40] → middles are 20 and 30 → (20+30)/2 = 25
+        let v = make_i64_vec(&e, &[40, 10, 30, 20]);
+        assert_eq!(median_i64(&v), 25);
+    }
+
+    #[test]
+    fn test_median_even_count_truncates_toward_zero() {
+        let e = Env::default();
+        // [11, 20] → (11+20)/2 = 15 (truncates toward zero)
+        let v = make_i64_vec(&e, &[11, 20]);
+        assert_eq!(median_i64(&v), 15);
+    }
+
+    #[test]
+    fn test_median_with_negative_values_odd() {
+        let e = Env::default();
+        // [-50, -10, -30] → sorted: [-50, -30, -10] → median = -30
+        let v = make_i64_vec(&e, &[-10, -50, -30]);
+        assert_eq!(median_i64(&v), -30);
+    }
+
+    #[test]
+    fn test_median_with_negative_values_even() {
+        let e = Env::default();
+        // [-2, -1] → (-2 + -1)/2 = -3/2 = -1 (truncates toward zero)
+        let v = make_i64_vec(&e, &[-2, -1]);
+        assert_eq!(median_i64(&v), -1);
+    }
+
+    #[test]
+    fn test_median_mixed_signs_even() {
+        let e = Env::default();
+        // [-5, 5] → (5 + -5)/2 = 0/2 = 0
+        let v = make_i64_vec(&e, &[-5, 5]);
+        assert_eq!(median_i64(&v), 0);
+    }
+
+    #[test]
+    fn test_median_single_element() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[42]);
+        assert_eq!(median_i64(&v), 42);
+    }
+
+    #[test]
+    fn test_median_ten_elements_max_oracles() {
+        let e = Env::default();
+        // 10 elements — max_oracles boundary. Sorted: [0,1,2,3,4,5,6,7,8,9]
+        // even → (4 + 5)/2 = 4
+        let v = make_i64_vec(&e, &[5, 3, 8, 1, 9, 7, 2, 6, 0, 4]);
+        assert_eq!(median_i64(&v), 4);
+    }
+
+    #[test]
+    fn test_median_all_same_values() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[7, 7, 7, 7, 7]);
+        assert_eq!(median_i64(&v), 7);
+    }
+
+    #[test]
+    fn test_median_extreme_i64_values() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[i64::MAX, i64::MIN, 0]);
+        assert_eq!(median_i64(&v), 0);
     }
 }

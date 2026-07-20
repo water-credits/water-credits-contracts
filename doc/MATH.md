@@ -60,10 +60,13 @@ all submissions.
 
 ### Median algorithm (from `median_i64`)
 
-1. Insertion-sort the values into `sorted`.
-2. If the count is **even**: `median = (sorted[n/2 - 1] + sorted[n/2]) / 2`  
-   (integer division — rounds toward zero).
-3. If the count is **odd**: `median = sorted[n/2]`
+1. Copy the `n` values from the Soroban `Vec<i64>` into a local `[i64; 10]`
+   stack array (bounded by `max_oracles = 10`).
+2. Insertion-sort the local array in-place (zero Soroban host calls; at most
+   45 local comparisons for `n = 10`).
+3. If the count is **even**: `median = (arr[n/2 - 1] + arr[n/2]) / 2`  
+   (Rust `i64` integer division — truncates toward zero).
+4. If the count is **odd**: `median = arr[n/2]`
 
 All subsequent calculations use only the per-field median values:
 
