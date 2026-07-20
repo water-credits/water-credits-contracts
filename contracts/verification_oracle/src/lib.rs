@@ -238,12 +238,12 @@ fn sha256_commitment(
 /// Even-length median: `(sorted[n/2-1] + sorted[n/2]) / 2` (Rust integer
 /// division truncates toward zero, matching the historical behaviour).
 fn median_i64(values: &Vec<i64>) -> i64 {
-    let n = values.len();
+    let n = values.len() as usize;
     // `max_oracles = 10` is a hard config bound enforced at `add_oracle`,
     // so `n` is always in [1, 10].
     let mut arr = [0i64; 10];
     for i in 0..n {
-        arr[i] = values.get(i).unwrap();
+        arr[i] = values.get(i as u32).unwrap();
     }
     // Insertion sort on the local stack array — zero host calls.
     for i in 1..n {
@@ -2163,7 +2163,7 @@ mod tests {
 
         let new_config = OracleConfig {
             min_oracles: 5,
-            max_oracles: 15,
+            max_oracles: 10,
             quality_threshold_ph: 550,
             quality_threshold_turbidity: 40,
             quality_threshold_do: 60,
