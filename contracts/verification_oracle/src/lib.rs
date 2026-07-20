@@ -242,8 +242,8 @@ fn median_i64(values: &Vec<i64>) -> i64 {
     // `max_oracles = 10` is a hard config bound enforced at `add_oracle`,
     // so `n` is always in [1, 10].
     let mut arr = [0i64; 10];
-    for i in 0..n {
-        arr[i] = values.get(i as u32).unwrap();
+    for (i, val) in values.iter().enumerate() {
+        arr[i] = val;
     }
     // Insertion sort on the local stack array — zero host calls.
     for i in 1..n {

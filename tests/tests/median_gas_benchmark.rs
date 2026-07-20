@@ -11,13 +11,17 @@
 //! allocations inside `median_i64`), the cost is dominated by the existing
 //! host calls for window state reads/writes, not by the median computation.
 
-use soroban_sdk::{
-    testutils::Address as _,
-    Address, BytesN, Env, Vec,
-};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
 use verification_oracle::{OracleConfig, VerificationOracle, VerificationOracleClient};
 
-fn setup_10_oracles(e: &Env) -> (Address, VerificationOracleClient<'static>, BytesN<32>, Vec<Address>) {
+fn setup_10_oracles(
+    e: &Env,
+) -> (
+    Address,
+    VerificationOracleClient<'static>,
+    BytesN<32>,
+    Vec<Address>,
+) {
     let admin = Address::generate(e);
     let project_id = BytesN::from_array(e, &[1u8; 32]);
 
@@ -64,7 +68,7 @@ fn test_median_gas_with_ten_oracles_within_budget() {
     e.mock_all_auths();
 
     // Use the default test budget (not unlimited) so we can observe actual usage.
-    let (admin, client, project_id, oracles) = setup_10_oracles(&e);
+    let (_admin, client, project_id, oracles) = setup_10_oracles(&e);
 
     // All 10 oracles submit the same "healthy system" readings from
     // doc/MATH.md Example A so the credit formula path is exercised.
@@ -166,7 +170,7 @@ fn test_median_gas_scales_linearly_from_three_to_ten() {
     }
 
     // ── 10-oracle setup ──
-    let (admin10, client10, project_id10, oracles10) = setup_10_oracles(&e10);
+    let (_admin10, client10, project_id10, oracles10) = setup_10_oracles(&e10);
 
     let reading: (i64, i64, i64, i64, i64, i64, i64) = (700, 10, 80, 500, 250, 8, 1);
 
