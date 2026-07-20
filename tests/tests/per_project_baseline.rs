@@ -216,10 +216,7 @@ fn test_high_baseline_no_overflow() {
         res.n_removal_kg,
         (1000 - 8) as i128 * 500 * 3600 / 1_000_000
     );
-    assert_eq!(
-        res.p_removal_kg,
-        (100 - 1) as i128 * 500 * 3600 / 1_000_000
-    );
+    assert_eq!(res.p_removal_kg, (100 - 1) as i128 * 500 * 3600 / 1_000_000);
 }
 
 /// Edge case: med_n exactly equals baseline_n → zero removal (boundary test).
@@ -249,8 +246,14 @@ fn test_reading_equals_baseline_zero_removal() {
     }
 
     let res = f.oracle_client.get_last_result(&proj).unwrap();
-    assert_eq!(res.n_removal_kg, 0, "n_removed should be 0 when med_n == baseline_n");
-    assert_eq!(res.p_removal_kg, 0, "p_removed should be 0 when med_p == baseline_p");
+    assert_eq!(
+        res.n_removal_kg, 0,
+        "n_removed should be 0 when med_n == baseline_n"
+    );
+    assert_eq!(
+        res.p_removal_kg, 0,
+        "p_removed should be 0 when med_p == baseline_p"
+    );
 }
 
 /// Edge case: reading above baseline → zero removal (no negative credits).
