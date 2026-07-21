@@ -17,6 +17,7 @@ fn deploy_oracle(e: &Env, admin: &Address) -> (Address, VerificationOracleClient
             min_oracles: 3,
             max_oracles: 10,
             quality_threshold_ph: 600,
+            quality_threshold_ph_max: 700,
             quality_threshold_turbidity: 50,
             quality_threshold_do: 50,
             quality_threshold_temp: 300,

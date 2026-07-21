@@ -78,7 +78,13 @@ pub struct VerificationResult {
 pub struct OracleConfig {
     pub min_oracles: u32,
     pub max_oracles: u32,
+    /// Lower bound (inclusive) of the acceptable pH band, ×100 (e.g. 600 = pH 6.00).
     pub quality_threshold_ph: i64,
+    /// Upper bound (inclusive) of the acceptable pH band, ×100. Previously
+    /// hardcoded as `quality_threshold_ph + 100`; now independently configurable
+    /// so the band width isn't tied to a fixed offset that may not make physical
+    /// sense for a given `quality_threshold_ph` (Issue: credit formula boundary hardening).
+    pub quality_threshold_ph_max: i64,
     pub quality_threshold_turbidity: i64,
     pub quality_threshold_do: i64,
     pub quality_threshold_temp: i64,
@@ -391,6 +397,160 @@ fn mint_credits_respecting_cap(
     mintable
 }
 
+/// Reject sensor readings that are structurally valid `i64` values but physically
+/// impossible, before they can enter median aggregation and the credit formula.
+/// Without this, a negative or malformed reading (e.g. a malfunctioning sensor
+/// reporting `total_nitrogen = -1`) would inflate `baseline - med_n` and mint
+/// credits far beyond any physically plausible removal.
+///
+/// `pub` (rather than the on-chain `#[contractimpl]` surface) purely so the
+/// integration-test crate can unit-test the panic paths directly: soroban's
+/// native test-contract dispatch (`Env::register_contract` + client calls)
+/// cannot catch a contract panic in this SDK/toolchain combination — it
+/// aborts the whole test process instead of unwinding — so panic-path
+/// coverage has to bypass that dispatch entirely and call the plain
+/// function.
+pub fn validate_sensor_reading(
+    ph: i64,
+    flow_rate: i64,
+    total_nitrogen: i64,
+    total_phosphorus: i64,
+    dissolved_oxygen: i64,
+) {
+    if !(0..=1400).contains(&ph) {
+        panic!("ph out of valid range [0, 1400]");
+    }
+    if flow_rate < 0 {
+        panic!("flow_rate must be non-negative");
+    }
+    if total_nitrogen < 0 {
+        panic!("total_nitrogen must be non-negative");
+    }
+    if total_phosphorus < 0 {
+        panic!("total_phosphorus must be non-negative");
+    }
+    if dissolved_oxygen < 0 {
+        panic!("dissolved_oxygen must be non-negative");
+    }
+}
+
+/// Result of the credit finalization formula (nutrient removal, quality penalty,
+/// volumetric credit, and the penalty-adjusted total).
+pub struct FinalizationResult {
+    pub n_removed: i128,
+    pub p_removed: i128,
+    pub penalty: i64,
+    pub volumetric_credit: i128,
+    pub total: i128,
+}
+
+/// Shared finalization arithmetic used by both `submit_reading_impl` and
+/// `finalize_reveals`. Every multiplication uses `checked_mul` so that
+/// near-`i64::MAX` intermediate values (e.g. `flow_rate` at the top of its
+/// valid range) panic and revert the transaction instead of silently
+/// wrapping in `i128`. `total` is floored at 0 so a maximal quality penalty
+/// can never be misread as a negative credit balance.
+///
+/// `baseline_n` / `baseline_p` and `temp_threshold` are passed in rather than
+/// read from config/project state here, since the two call sites use
+/// different baseline sources (per-project baselines in the direct-submit
+/// path vs. the global config in the commit-reveal path — see doc/MATH.md).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_finalization(
+    config: &OracleConfig,
+    med_ph: i64,
+    med_turb: i64,
+    med_do: i64,
+    med_temp: i64,
+    med_flow: i64,
+    med_n: i64,
+    med_p: i64,
+    baseline_n: i128,
+    baseline_p: i128,
+    temp_threshold: i128,
+) -> FinalizationResult {
+    let med_flow_i128 = med_flow as i128;
+    let med_n_i128 = med_n as i128;
+    let med_p_i128 = med_p as i128;
+
+    let n_removed: i128 = if med_n_i128 < baseline_n {
+        (baseline_n - med_n_i128)
+            .checked_mul(med_flow_i128)
+            .unwrap_or_else(|| panic!("n removal: flow multiplication overflow"))
+            .checked_mul(3600)
+            .unwrap_or_else(|| panic!("n removal: time-window multiplication overflow"))
+            / 1_000_000
+    } else {
+        0
+    };
+
+    let p_removed: i128 = if med_p_i128 < baseline_p {
+        (baseline_p - med_p_i128)
+            .checked_mul(med_flow_i128)
+            .unwrap_or_else(|| panic!("p removal: flow multiplication overflow"))
+            .checked_mul(3600)
+            .unwrap_or_else(|| panic!("p removal: time-window multiplication overflow"))
+            / 1_000_000
+    } else {
+        0
+    };
+
+    // Quality penalty (basis points: 0-10000)
+    let mut penalty: i64 = 0;
+    if med_ph < config.quality_threshold_ph || med_ph > config.quality_threshold_ph_max {
+        penalty += 2000;
+    }
+    if med_turb > config.quality_threshold_turbidity {
+        penalty += 2000;
+    }
+    if med_do < config.quality_threshold_do {
+        penalty += 2000;
+    }
+    if (med_temp as i128) > temp_threshold {
+        penalty += 1000;
+    }
+    if penalty > 8000 {
+        penalty = 8000;
+    }
+
+    // Volumetric credit based on flow
+    let volumetric_credit: i128 = if med_flow > 0 {
+        med_flow_i128
+            .checked_mul(100)
+            .unwrap_or_else(|| panic!("volumetric credit multiplication overflow"))
+            / 1000
+    } else {
+        0
+    };
+
+    let n_credit: i128 = n_removed
+        .checked_mul(config.credit_per_kg_n)
+        .unwrap_or_else(|| panic!("n credit multiplication overflow"));
+    let p_credit: i128 = p_removed
+        .checked_mul(config.credit_per_kg_p)
+        .unwrap_or_else(|| panic!("p credit multiplication overflow"));
+    let gross: i128 = n_credit
+        .checked_add(p_credit)
+        .and_then(|s| s.checked_add(volumetric_credit))
+        .unwrap_or_else(|| panic!("gross credit addition overflow"));
+
+    // Apply quality penalty; `penalty` is capped at 8000 above so
+    // `10000 - penalty` is always in [2000, 10000] and cannot underflow.
+    let total: i128 = (gross
+        .checked_mul(10000 - penalty as i128)
+        .unwrap_or_else(|| panic!("total credit multiplication overflow"))
+        / 10000)
+        .max(0);
+
+    FinalizationResult {
+        n_removed,
+        p_removed,
+        penalty,
+        volumetric_credit,
+        total,
+    }
+}
+
 #[contract]
 pub struct VerificationOracle;
 
@@ -412,6 +572,7 @@ impl VerificationOracle {
             min_oracles: 3,
             max_oracles: 10,
             quality_threshold_ph: 600,
+            quality_threshold_ph_max: 700,
             quality_threshold_turbidity: 50,
             quality_threshold_do: 50,
             quality_threshold_temp: 300,
@@ -632,6 +793,14 @@ impl VerificationOracle {
             }
         }
 
+        validate_sensor_reading(
+            ph,
+            flow_rate,
+            total_nitrogen,
+            total_phosphorus,
+            dissolved_oxygen,
+        );
+
         let nonce_key = DataKey::OracleNonce((project_id.clone(), oracle.clone()));
         let expected_nonce: u64 = e.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
         if nonce != expected_nonce {
@@ -774,62 +943,27 @@ impl VerificationOracle {
                 _ => default_baseline_temp,
             };
 
-            // N removal (checked arithmetic: baseline - med_n is non-negative
-            // because we only enter this branch when med_n < baseline).
-            let n_removed: i128 = if (med_n as i128) < baseline_n {
-                (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 1000000
-            } else {
-                0
-            };
-
-            // P removal
-            let p_removed: i128 = if (med_p as i128) < baseline_p {
-                (baseline_p - med_p as i128) * med_flow as i128 * 3600 / 1000000
-            } else {
-                0
-            };
-
-            // Quality penalty (basis points: 0-10000)
-            let mut penalty: i64 = 0;
-            if med_ph < config.quality_threshold_ph || med_ph > (config.quality_threshold_ph + 100)
-            {
-                penalty += 2000;
-            }
-            if med_turb > config.quality_threshold_turbidity {
-                penalty += 2000;
-            }
-            if med_do < config.quality_threshold_do {
-                penalty += 2000;
-            }
-            if (med_temp as i128) > baseline_temp {
-                penalty += 1000;
-            }
-            if penalty > 8000 {
-                penalty = 8000;
-            }
-
-            // Volumetric credit based on flow
-            let volumetric_credit: i128 = if med_flow > 0 {
-                med_flow as i128 * 100 / 1000
-            } else {
-                0
-            };
-
-            // Gross credit
-            let n_credit: i128 = n_removed * config.credit_per_kg_n;
-            let p_credit: i128 = p_removed * config.credit_per_kg_p;
-            let gross = n_credit + p_credit + volumetric_credit;
-
-            // Apply quality penalty
-            let total: i128 = gross * (10000 - penalty as i128) / 10000;
+            let fin = compute_finalization(
+                &config,
+                med_ph,
+                med_turb,
+                med_do,
+                med_temp,
+                med_flow,
+                med_n,
+                med_p,
+                baseline_n,
+                baseline_p,
+                baseline_temp,
+            );
 
             let mut result = VerificationResult {
                 project_id: project_id.clone(),
-                n_removal_kg: n_removed,
-                p_removal_kg: p_removed,
-                quality_penalty: penalty,
-                volumetric_credit,
-                total_credits: total,
+                n_removal_kg: fin.n_removed,
+                p_removal_kg: fin.p_removed,
+                quality_penalty: fin.penalty,
+                volumetric_credit: fin.volumetric_credit,
+                total_credits: fin.total,
                 credits_minted: 0,
                 oracle_count: window.submissions.len(),
                 finalized_at: e.ledger().timestamp(),
@@ -1552,6 +1686,14 @@ impl VerificationOracle {
             panic!("hash mismatch: revealed values do not match commitment");
         }
 
+        validate_sensor_reading(
+            params.ph,
+            params.flow_rate,
+            params.total_nitrogen,
+            params.total_phosphorus,
+            params.dissolved_oxygen,
+        );
+
         // Track per-oracle and global submission counts
         let submit_key = DataKey::OracleSubmitCount(oracle.clone());
         let oracle_submit_count: u64 = e.storage().persistent().get(&submit_key).unwrap_or(0);
@@ -1773,54 +1915,30 @@ impl VerificationOracle {
         let med_p = median_i64(&e, &p_vals);
 
         let baseline_n: i128 = 10;
-        let n_removed: i128 = if (med_n as i128) < baseline_n {
-            (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 1000000
-        } else {
-            0
-        };
-
         let baseline_p: i128 = 2;
-        let p_removed: i128 = if (med_p as i128) < baseline_p {
-            (baseline_p - med_p as i128) * med_flow as i128 * 3600 / 1000000
-        } else {
-            0
-        };
+        let temp_threshold: i128 = config.quality_threshold_temp as i128;
 
-        let mut penalty: i64 = 0;
-        if med_ph < config.quality_threshold_ph || med_ph > (config.quality_threshold_ph + 100) {
-            penalty += 2000;
-        }
-        if med_turb > config.quality_threshold_turbidity {
-            penalty += 2000;
-        }
-        if med_do < config.quality_threshold_do {
-            penalty += 2000;
-        }
-        if med_temp > config.quality_threshold_temp {
-            penalty += 1000;
-        }
-        if penalty > 8000 {
-            penalty = 8000;
-        }
-
-        let volumetric_credit: i128 = if med_flow > 0 {
-            med_flow as i128 * 100 / 1000
-        } else {
-            0
-        };
-
-        let n_credit: i128 = n_removed * config.credit_per_kg_n;
-        let p_credit: i128 = p_removed * config.credit_per_kg_p;
-        let gross = n_credit + p_credit + volumetric_credit;
-        let total: i128 = gross * (10000 - penalty as i128) / 10000;
+        let fin = compute_finalization(
+            &config,
+            med_ph,
+            med_turb,
+            med_do,
+            med_temp,
+            med_flow,
+            med_n,
+            med_p,
+            baseline_n,
+            baseline_p,
+            temp_threshold,
+        );
 
         let mut result = VerificationResult {
             project_id: project_id.clone(),
-            n_removal_kg: n_removed,
-            p_removal_kg: p_removed,
-            quality_penalty: penalty,
-            volumetric_credit,
-            total_credits: total,
+            n_removal_kg: fin.n_removed,
+            p_removal_kg: fin.p_removed,
+            quality_penalty: fin.penalty,
+            volumetric_credit: fin.volumetric_credit,
+            total_credits: fin.total,
             credits_minted: 0,
             oracle_count: window.submissions.len(),
             finalized_at: e.ledger().timestamp(),
@@ -2183,6 +2301,7 @@ mod tests {
             min_oracles: 5,
             max_oracles: 15,
             quality_threshold_ph: 550,
+            quality_threshold_ph_max: 650,
             quality_threshold_turbidity: 40,
             quality_threshold_do: 60,
             quality_threshold_temp: 310,

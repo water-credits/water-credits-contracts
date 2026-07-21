@@ -49,6 +49,27 @@ All sensor readings are passed into `submit_reading` as **raw integers**. The ca
 > **Note:** The contract never de-scales these values. Every formula shown below
 > operates on the already-encoded integers so the scaling factors carry through.
 
+### 1.1 Entry Validation
+
+Every call to `submit_reading` and `reveal_reading` validates the raw sensor fields
+before they can enter median aggregation. A reading that fails validation panics
+(reverting the transaction) rather than being accepted:
+
+| Field | Valid range |
+|---|---|
+| `ph` | `[0, 1400]` (pH 0.0 – 14.0, encoded ×100) |
+| `flow_rate` | `≥ 0` |
+| `total_nitrogen` | `≥ 0` |
+| `total_phosphorus` | `≥ 0` |
+| `dissolved_oxygen` | `≥ 0` |
+
+These bounds reject structurally-valid-but-physically-impossible `i64` values (e.g. a
+malfunctioning sensor reporting negative nitrogen), which would otherwise inflate
+`baseline − med_n` in [§3](#3-nutrient-removal-formulas) and mint credits far beyond
+any physically plausible removal. `turbidity` and `temperature` are not bounded at
+entry — only the quality-penalty thresholds in [§5](#5-quality-penalty-calculation)
+apply to them.
+
 ---
 
 ## 2. Multi-Oracle Median Aggregation
@@ -162,11 +183,14 @@ continuous scaling. Each threshold breach adds a fixed number of basis points.
 
 ### 5.1 pH Penalty
 
-The acceptable pH range is `[quality_threshold_ph, quality_threshold_ph + 100]`  
-(default: `[600, 700]` → physical range **6.00 – 7.00**).
+The acceptable pH range is `[quality_threshold_ph, quality_threshold_ph_max]`  
+(default: `[600, 700]` → physical range **6.00 – 7.00**). Both bounds are
+independently configurable `OracleConfig` fields — the upper bound is no longer
+hardcoded to `quality_threshold_ph + 100`, since a fixed +100 offset doesn't make
+physical sense for every choice of `quality_threshold_ph`.
 
 ```
-if med_ph < quality_threshold_ph OR med_ph > (quality_threshold_ph + 100):
+if med_ph < quality_threshold_ph OR med_ph > quality_threshold_ph_max:
     penalty += 2000
 ```
 
@@ -222,7 +246,7 @@ changes would otherwise exceed it.
 n_credit   = n_removal_kg  × credit_per_kg_n    # default: ×10
 p_credit   = p_removal_kg  × credit_per_kg_p    # default: ×20
 gross      = n_credit + p_credit + volumetric_credit
-total      = gross × (10000 − penalty) / 10000
+total      = max(0, gross × (10000 − penalty) / 10000)
 ```
 
 All arithmetic uses `i128` (Rust signed 128-bit integers) with integer division.
@@ -231,8 +255,23 @@ never rounded up**. This ensures the on-chain supply can never exceed the true
 calculated entitlement.
 
 If `gross = 0` (zero flow, nutrients above baseline, etc.) and `penalty > 0`, the
-multiplication still yields `0 × anything = 0`, so `total_credits` is 0 and
-cannot go negative.
+multiplication still yields `0 × anything = 0`, so `total_credits` is 0. `total` is
+also explicitly floored at 0 (`.max(0)`): `gross` is normally non-negative, but an
+admin-configured negative `credit_per_kg_n` / `credit_per_kg_p` can legitimately
+drive it negative, and the floor guarantees `total_credits` can never be
+misread as a negative balance regardless of configuration.
+
+### Overflow handling
+
+Every multiplication in §3, §4, and §6 (`baseline − med`, `× med_flow`, `× 3600`,
+`× credit_per_kg_*`, the final `× (10000 − penalty)`, and the `n_credit + p_credit +
+volumetric_credit` addition) uses `checked_mul` / `checked_add` and panics with a
+descriptive message on overflow, instead of silently wrapping in `i128`. This matters
+because `med_flow` (and an admin-set per-project `baseline_n`/`baseline_p`) are only
+bounded to be non-negative `i64` values — a value near `i64::MAX` combined with a
+large baseline can overflow the `× 3600` step before the division, and an
+unchecked wraparound there would silently mint a corrupted (and potentially
+enormous) credit amount rather than reverting the transaction.
 
 ---
 
@@ -246,6 +285,7 @@ admin via `update_config`.
 | `min_oracles` | `3` | Readings required before window finalises |
 | `max_oracles` | `10` | Hard cap on whitelisted oracles |
 | `quality_threshold_ph` | `600` | Lower end of acceptable pH range (= 6.00) |
+| `quality_threshold_ph_max` | `700` | Upper end of acceptable pH range (= 7.00) |
 | `quality_threshold_turbidity` | `50` | Max acceptable turbidity (= 5.0 NTU) |
 | `quality_threshold_do` | `50` | Min acceptable dissolved oxygen (= 5.0 mg/L) |
 | `quality_threshold_temp` | `300` | Max acceptable temperature (= 30.0 °C) |
