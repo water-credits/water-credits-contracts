@@ -19,6 +19,7 @@ fn deploy_oracle(e: &Env, admin: &Address) -> (Address, VerificationOracleClient
             min_oracles: 3,
             max_oracles: 10,
             quality_threshold_ph: 600,
+            quality_threshold_ph_max: 700,
             quality_threshold_turbidity: 50,
             quality_threshold_do: 50,
             quality_threshold_temp: 300,
@@ -123,7 +124,7 @@ fn test_oracle_mints_credits_to_beneficiary() {
     token_client.set_minter(&admin, &oracle_id);
 
     // Configure: oracle project config for auto-mint
-    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary);
+    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &10, &2, &300);
 
     // Add 3 oracles
     let o1 = Address::generate(&e);

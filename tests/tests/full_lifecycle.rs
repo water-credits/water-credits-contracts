@@ -143,6 +143,7 @@ fn test_full_six_contract_lifecycle() {
             min_oracles: 3,
             max_oracles: 10,
             quality_threshold_ph: 600,
+            quality_threshold_ph_max: 700,
             quality_threshold_turbidity: 50,
             quality_threshold_do: 50,
             quality_threshold_temp: 300,
@@ -243,7 +244,15 @@ fn test_full_six_contract_lifecycle() {
     // …which must whitelist the token contract as a caller.
     retirement_registry.set_authorized_caller(&admin, &token_id, &true);
     // Auto-mint config: verified credits go to the project owner.
-    oracle.set_project_config(&admin, &project_id, &token_id, &project_owner);
+    oracle.set_project_config(
+        &admin,
+        &project_id,
+        &token_id,
+        &project_owner,
+        &10,
+        &2,
+        &300,
+    );
     // Governance tracks the token for emergency pause coverage.
     governance.register_token(&admin, &token_id);
     assert_eq!(

@@ -38,6 +38,20 @@ pub struct ReadingSubmission {
 pub struct ProjectConfig {
     pub token_contract: Address,
     pub beneficiary: Address,
+    /// Per-project nitrogen baseline (mg/L, raw integer — same encoding as
+    /// `total_nitrogen`; see doc/MATH.md §1). Falls back to the global
+    /// `OracleConfig` default when unset (0).
+    pub baseline_n: i64,
+    /// Per-project phosphorus baseline (mg/L, raw integer — same encoding as
+    /// `total_phosphorus`; see doc/MATH.md §1). Falls back to the global
+    /// `OracleConfig` default when unset (0).
+    pub baseline_p: i64,
+    /// Per-project temperature baseline (×10 °C — same encoding as
+    /// `temperature`; see doc/MATH.md §1). Used as the implicit baseline for the
+    /// temperature quality penalty (compared against the project baseline rather
+    /// than the global `quality_threshold_temp` max threshold). Falls back to the
+    /// global `OracleConfig` default when unset (0).
+    pub baseline_temp: i64,
 }
 
 #[contracttype]
@@ -64,7 +78,13 @@ pub struct VerificationResult {
 pub struct OracleConfig {
     pub min_oracles: u32,
     pub max_oracles: u32,
+    /// Lower bound (inclusive) of the acceptable pH band, ×100 (e.g. 600 = pH 6.00).
     pub quality_threshold_ph: i64,
+    /// Upper bound (inclusive) of the acceptable pH band, ×100. Previously
+    /// hardcoded as `quality_threshold_ph + 100`; now independently configurable
+    /// so the band width isn't tied to a fixed offset that may not make physical
+    /// sense for a given `quality_threshold_ph` (Issue: credit formula boundary hardening).
+    pub quality_threshold_ph_max: i64,
     pub quality_threshold_turbidity: i64,
     pub quality_threshold_do: i64,
     pub quality_threshold_temp: i64,
@@ -241,54 +261,36 @@ pub fn sha256_commitment(
     e.crypto().sha256(&data)
 }
 
-fn median_i64(e: &Env, values: &Vec<i64>) -> i64 {
-    let mut sorted: Vec<i64> = Vec::new(e);
-    for i in 0..values.len() {
-        let val = values.get(i).unwrap();
-        let mut inserted = false;
-        for j in 0..sorted.len() {
-            if val < sorted.get(j).unwrap() {
-                sorted.insert(j, val);
-                inserted = true;
-                break;
-            }
-        }
-        if !inserted {
-            sorted.push_back(val);
-        }
+/// Compute the median of a `Vec<i64>`. Copies values into a local fixed-size
+/// array (max 10 elements, matching `max_oracles`) and uses an insertion sort
+/// on the stack — zero Soroban host allocations. For the hard config bound of
+/// `max_oracles = 10` this runs at most 45 local comparisons, a dramatic
+/// improvement over the previous O(n²) host-call-based insertion sort.
+///
+/// Even-length median: `(sorted[n/2-1] + sorted[n/2]) / 2` (Rust integer
+/// division truncates toward zero, matching the historical behaviour).
+fn median_i64(values: &Vec<i64>) -> i64 {
+    let n = values.len() as usize;
+    // `max_oracles = 10` is a hard config bound enforced at `add_oracle`,
+    // so `n` is always in [1, 10].
+    let mut arr = [0i64; 10];
+    for (i, val) in values.iter().enumerate() {
+        arr[i] = val;
     }
-    let len = sorted.len();
-    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
-    if len % 2 == 0 {
-        (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
+    // Insertion sort on the local stack array — zero host calls.
+    for i in 1..n {
+        let key = arr[i];
+        let mut j = i;
+        while j > 0 && arr[j - 1] > key {
+            arr[j] = arr[j - 1];
+            j -= 1;
+        }
+        arr[j] = key;
+    }
+    if n % 2 == 0 {
+        (arr[n / 2 - 1] + arr[n / 2]) / 2
     } else {
-        sorted.get(len / 2).unwrap()
-    }
-}
-
-#[allow(unused)]
-fn median_i128(e: &Env, values: &Vec<i128>) -> i128 {
-    let mut sorted: Vec<i128> = Vec::new(e);
-    for i in 0..values.len() {
-        let val = values.get(i).unwrap();
-        let mut inserted = false;
-        for j in 0..sorted.len() {
-            if val < sorted.get(j).unwrap() {
-                sorted.insert(j, val);
-                inserted = true;
-                break;
-            }
-        }
-        if !inserted {
-            sorted.push_back(val);
-        }
-    }
-    let len = sorted.len();
-    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
-    if len % 2 == 0 {
-        (sorted.get(len / 2 - 1).unwrap() + sorted.get(len / 2).unwrap()) / 2
-    } else {
-        sorted.get(len / 2).unwrap()
+        arr[n / 2]
     }
 }
 
@@ -400,6 +402,160 @@ fn mint_credits_respecting_cap(
     mintable
 }
 
+/// Reject sensor readings that are structurally valid `i64` values but physically
+/// impossible, before they can enter median aggregation and the credit formula.
+/// Without this, a negative or malformed reading (e.g. a malfunctioning sensor
+/// reporting `total_nitrogen = -1`) would inflate `baseline - med_n` and mint
+/// credits far beyond any physically plausible removal.
+///
+/// `pub` (rather than the on-chain `#[contractimpl]` surface) purely so the
+/// integration-test crate can unit-test the panic paths directly: soroban's
+/// native test-contract dispatch (`Env::register_contract` + client calls)
+/// cannot catch a contract panic in this SDK/toolchain combination — it
+/// aborts the whole test process instead of unwinding — so panic-path
+/// coverage has to bypass that dispatch entirely and call the plain
+/// function.
+pub fn validate_sensor_reading(
+    ph: i64,
+    flow_rate: i64,
+    total_nitrogen: i64,
+    total_phosphorus: i64,
+    dissolved_oxygen: i64,
+) {
+    if !(0..=1400).contains(&ph) {
+        panic!("ph out of valid range [0, 1400]");
+    }
+    if flow_rate < 0 {
+        panic!("flow_rate must be non-negative");
+    }
+    if total_nitrogen < 0 {
+        panic!("total_nitrogen must be non-negative");
+    }
+    if total_phosphorus < 0 {
+        panic!("total_phosphorus must be non-negative");
+    }
+    if dissolved_oxygen < 0 {
+        panic!("dissolved_oxygen must be non-negative");
+    }
+}
+
+/// Result of the credit finalization formula (nutrient removal, quality penalty,
+/// volumetric credit, and the penalty-adjusted total).
+pub struct FinalizationResult {
+    pub n_removed: i128,
+    pub p_removed: i128,
+    pub penalty: i64,
+    pub volumetric_credit: i128,
+    pub total: i128,
+}
+
+/// Shared finalization arithmetic used by both `submit_reading_impl` and
+/// `finalize_reveals`. Every multiplication uses `checked_mul` so that
+/// near-`i64::MAX` intermediate values (e.g. `flow_rate` at the top of its
+/// valid range) panic and revert the transaction instead of silently
+/// wrapping in `i128`. `total` is floored at 0 so a maximal quality penalty
+/// can never be misread as a negative credit balance.
+///
+/// `baseline_n` / `baseline_p` and `temp_threshold` are passed in rather than
+/// read from config/project state here, since the two call sites use
+/// different baseline sources (per-project baselines in the direct-submit
+/// path vs. the global config in the commit-reveal path — see doc/MATH.md).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_finalization(
+    config: &OracleConfig,
+    med_ph: i64,
+    med_turb: i64,
+    med_do: i64,
+    med_temp: i64,
+    med_flow: i64,
+    med_n: i64,
+    med_p: i64,
+    baseline_n: i128,
+    baseline_p: i128,
+    temp_threshold: i128,
+) -> FinalizationResult {
+    let med_flow_i128 = med_flow as i128;
+    let med_n_i128 = med_n as i128;
+    let med_p_i128 = med_p as i128;
+
+    let n_removed: i128 = if med_n_i128 < baseline_n {
+        (baseline_n - med_n_i128)
+            .checked_mul(med_flow_i128)
+            .unwrap_or_else(|| panic!("n removal: flow multiplication overflow"))
+            .checked_mul(3600)
+            .unwrap_or_else(|| panic!("n removal: time-window multiplication overflow"))
+            / 1_000_000
+    } else {
+        0
+    };
+
+    let p_removed: i128 = if med_p_i128 < baseline_p {
+        (baseline_p - med_p_i128)
+            .checked_mul(med_flow_i128)
+            .unwrap_or_else(|| panic!("p removal: flow multiplication overflow"))
+            .checked_mul(3600)
+            .unwrap_or_else(|| panic!("p removal: time-window multiplication overflow"))
+            / 1_000_000
+    } else {
+        0
+    };
+
+    // Quality penalty (basis points: 0-10000)
+    let mut penalty: i64 = 0;
+    if med_ph < config.quality_threshold_ph || med_ph > config.quality_threshold_ph_max {
+        penalty += 2000;
+    }
+    if med_turb > config.quality_threshold_turbidity {
+        penalty += 2000;
+    }
+    if med_do < config.quality_threshold_do {
+        penalty += 2000;
+    }
+    if (med_temp as i128) > temp_threshold {
+        penalty += 1000;
+    }
+    if penalty > 8000 {
+        penalty = 8000;
+    }
+
+    // Volumetric credit based on flow
+    let volumetric_credit: i128 = if med_flow > 0 {
+        med_flow_i128
+            .checked_mul(100)
+            .unwrap_or_else(|| panic!("volumetric credit multiplication overflow"))
+            / 1000
+    } else {
+        0
+    };
+
+    let n_credit: i128 = n_removed
+        .checked_mul(config.credit_per_kg_n)
+        .unwrap_or_else(|| panic!("n credit multiplication overflow"));
+    let p_credit: i128 = p_removed
+        .checked_mul(config.credit_per_kg_p)
+        .unwrap_or_else(|| panic!("p credit multiplication overflow"));
+    let gross: i128 = n_credit
+        .checked_add(p_credit)
+        .and_then(|s| s.checked_add(volumetric_credit))
+        .unwrap_or_else(|| panic!("gross credit addition overflow"));
+
+    // Apply quality penalty; `penalty` is capped at 8000 above so
+    // `10000 - penalty` is always in [2000, 10000] and cannot underflow.
+    let total: i128 = (gross
+        .checked_mul(10000 - penalty as i128)
+        .unwrap_or_else(|| panic!("total credit multiplication overflow"))
+        / 10000)
+        .max(0);
+
+    FinalizationResult {
+        n_removed,
+        p_removed,
+        penalty,
+        volumetric_credit,
+        total,
+    }
+}
+
 #[contract]
 pub struct VerificationOracle;
 
@@ -421,6 +577,7 @@ impl VerificationOracle {
             min_oracles: 3,
             max_oracles: 10,
             quality_threshold_ph: 600,
+            quality_threshold_ph_max: 700,
             quality_threshold_turbidity: 50,
             quality_threshold_do: 50,
             quality_threshold_temp: 300,
@@ -571,14 +728,321 @@ impl VerificationOracle {
             .unwrap_or_else(|| Vec::new(&e))
     }
 
+    /// Submit a sensor reading for a project. Uses nonce-based replay protection.
+    /// When min_oracles submissions are collected, computes median values, calculates
+    /// nutrient removal, quality penalty, and volumetric credits. If a ProjectConfig
+    /// is set, automatically mints credits to the configured beneficiary.
+    pub fn submit_reading(
+        e: Env,
+        oracle: Address,
+        project_id: BytesN<32>,
+        nonce: u64,
+        ph: i64,
+        turbidity: i64,
+        dissolved_oxygen: i64,
+        flow_rate: i64,
+        temperature: i64,
+        total_nitrogen: i64,
+        total_phosphorus: i64,
+    ) -> Option<VerificationResult> {
+        Self::submit_reading_impl(
+            e,
+            oracle,
+            project_id,
+            nonce,
+            ph,
+            turbidity,
+            dissolved_oxygen,
+            flow_rate,
+            temperature,
+            total_nitrogen,
+            total_phosphorus,
+        )
+    }
+
+    fn submit_reading_impl(
+        e: Env,
+        oracle: Address,
+        project_id: BytesN<32>,
+        nonce: u64,
+        ph: i64,
+        turbidity: i64,
+        dissolved_oxygen: i64,
+        flow_rate: i64,
+        temperature: i64,
+        total_nitrogen: i64,
+        total_phosphorus: i64,
+    ) -> Option<VerificationResult> {
+        oracle.require_auth();
+
+        if !e
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleActive(oracle.clone()))
+            .unwrap_or(false)
+        {
+            panic!("oracle not active");
+        }
+
+        let config: OracleConfig = read_config(&e);
+        if config.min_stake > 0 {
+            let stake_info: StakeInfo = e
+                .storage()
+                .persistent()
+                .get(&DataKey::OracleStake(oracle.clone()))
+                .unwrap_or(StakeInfo {
+                    amount: 0,
+                    unstake_request: None,
+                });
+            if stake_info.amount < config.min_stake {
+                panic!("insufficient stake");
+            }
+        }
+
+        validate_sensor_reading(
+            ph,
+            flow_rate,
+            total_nitrogen,
+            total_phosphorus,
+            dissolved_oxygen,
+        );
+
+        let nonce_key = DataKey::OracleNonce((project_id.clone(), oracle.clone()));
+        let expected_nonce: u64 = e.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
+        if nonce != expected_nonce {
+            panic!("invalid nonce");
+        }
+        e.storage().persistent().set(&nonce_key, &nonce);
+        e.storage()
+            .persistent()
+            .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+
+        // Track per-oracle and global submission counts
+        let submit_count_key = DataKey::OracleSubmitCount(oracle.clone());
+        let oracle_count: u64 = e.storage().persistent().get(&submit_count_key).unwrap_or(0);
+        e.storage()
+            .persistent()
+            .set(&submit_count_key, &(oracle_count + 1));
+        e.storage().persistent().extend_ttl(
+            &submit_count_key,
+            ORACLE_TTL_THRESHOLD,
+            ORACLE_TTL_BUMP,
+        );
+
+        let total: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSubmissions)
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalSubmissions, &(total + 1));
+
+        // Prevent duplicate oracle per window (temporary storage)
+        let submitted_key = DataKey::OracleSubmitted(project_id.clone(), oracle.clone());
+        if e.storage().temporary().has(&submitted_key) {
+            panic!("oracle already submitted for this window");
+        }
+
+        let window_key = DataKey::WindowState(project_id.clone());
+        let mut window: WindowState =
+            e.storage()
+                .temporary()
+                .get(&window_key)
+                .unwrap_or(WindowState {
+                    phase: WindowPhase::Reveal,
+                    opened_at: e.ledger().timestamp(),
+                    submissions: Vec::new(&e),
+                    finalized: false,
+                });
+
+        if window.finalized {
+            panic!("window already finalized");
+        }
+
+        add_open_project(&e, &project_id);
+
+        let timestamp = e.ledger().timestamp();
+
+        let submission = ReadingSubmission {
+            oracle: oracle.clone(),
+            nonce,
+            timestamp,
+            ph,
+            turbidity,
+            dissolved_oxygen,
+            flow_rate,
+            temperature,
+            total_nitrogen,
+            total_phosphorus,
+        };
+
+        window.submissions.push_back(submission);
+        e.storage().temporary().set(&window_key, &window);
+        e.storage()
+            .temporary()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
+
+        e.storage().temporary().set(&submitted_key, &true);
+        e.storage()
+            .temporary()
+            .extend_ttl(&submitted_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
+
+        if window.submissions.len() >= config.min_oracles {
+            let subs = &window.submissions;
+            let n_subs = subs.len();
+
+            let mut ph_vals: Vec<i64> = Vec::new(&e);
+            let mut turb_vals: Vec<i64> = Vec::new(&e);
+            let mut do_vals: Vec<i64> = Vec::new(&e);
+            let mut temp_vals: Vec<i64> = Vec::new(&e);
+            let mut flow_vals: Vec<i64> = Vec::new(&e);
+            let mut n_vals: Vec<i64> = Vec::new(&e);
+            let mut p_vals: Vec<i64> = Vec::new(&e);
+            for k in 0..n_subs {
+                let s = subs.get(k).unwrap();
+                ph_vals.push_back(s.ph);
+                turb_vals.push_back(s.turbidity);
+                do_vals.push_back(s.dissolved_oxygen);
+                temp_vals.push_back(s.temperature);
+                flow_vals.push_back(s.flow_rate);
+                n_vals.push_back(s.total_nitrogen);
+                p_vals.push_back(s.total_phosphorus);
+            }
+
+            let med_ph = median_i64(&ph_vals);
+            let med_turb = median_i64(&turb_vals);
+            let med_do = median_i64(&do_vals);
+            let med_temp = median_i64(&temp_vals);
+            let med_flow = median_i64(&flow_vals);
+            let med_n = median_i64(&n_vals);
+            let med_p = median_i64(&p_vals);
+
+            // Per-project baselines (doc/MATH.md §1: N/P raw mg/L, temp ×10 °C).
+            //
+            // Scale note (Issue #26): `total_nitrogen` and `total_phosphorus` are
+            // raw integers in mg/L (no ×100 scaling — see doc/MATH.md §1 table).
+            // `temperature` is ×10 °C. The previous hardcoded `baseline_n = 10`
+            // and `baseline_p = 2` were already in the same raw mg/L encoding,
+            // so there is no scale mismatch. `baseline_temp = 300` matches the
+            // ×10 °C encoding (30.0 °C).
+            //
+            // Fall back to the global defaults when a project has not set its
+            // own baselines (ProjectConfig.baseline_* == 0). This preserves
+            // backward compatibility: existing projects with old ProjectConfig
+            // structs that predate these fields will deserialise with all-zero
+            // baselines and behave identically to the old hardcoded constants.
+            let proj_cfg = Self::get_project_config(e.clone(), project_id.clone());
+            let default_baseline_n: i128 = 10;
+            let default_baseline_p: i128 = 2;
+            let default_baseline_temp: i128 = 300;
+            let baseline_n: i128 = match proj_cfg {
+                Some(ref pc) if pc.baseline_n != 0 => pc.baseline_n as i128,
+                _ => default_baseline_n,
+            };
+            let baseline_p: i128 = match proj_cfg {
+                Some(ref pc) if pc.baseline_p != 0 => pc.baseline_p as i128,
+                _ => default_baseline_p,
+            };
+            let baseline_temp: i128 = match proj_cfg {
+                Some(ref pc) if pc.baseline_temp != 0 => pc.baseline_temp as i128,
+                _ => default_baseline_temp,
+            };
+
+            let fin = compute_finalization(
+                &config,
+                med_ph,
+                med_turb,
+                med_do,
+                med_temp,
+                med_flow,
+                med_n,
+                med_p,
+                baseline_n,
+                baseline_p,
+                baseline_temp,
+            );
+
+            let mut result = VerificationResult {
+                project_id: project_id.clone(),
+                n_removal_kg: fin.n_removed,
+                p_removal_kg: fin.p_removed,
+                quality_penalty: fin.penalty,
+                volumetric_credit: fin.volumetric_credit,
+                total_credits: fin.total,
+                credits_minted: 0,
+                oracle_count: window.submissions.len(),
+                finalized_at: e.ledger().timestamp(),
+            };
+
+            // Mint credits to the beneficiary, clamped to the token's
+            // max_supply cap. This runs BEFORE the result is persisted so that
+            // `credits_minted` is recorded accurately and so a cap breach can
+            // never roll back finalization (Issue #36). If no project token is
+            // configured, or the cap is already exhausted, no mint occurs and
+            // the window still finalizes cleanly.
+            let cfg_key = DataKey::ProjectConfig(project_id.clone());
+            if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
+                result.credits_minted = mint_credits_respecting_cap(
+                    &e,
+                    &config.token_contract,
+                    &config.beneficiary,
+                    result.total_credits,
+                );
+            }
+
+            // Persist last result
+            let last_key = DataKey::LastResult(project_id.clone());
+            e.storage().persistent().set(&last_key, &result);
+            e.storage()
+                .persistent()
+                .extend_ttl(&last_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+
+            // Append to paginated history
+            let count_key = DataKey::ResultCount(project_id.clone());
+            let hist_pos: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
+            let hist_key = DataKey::ResultAt(project_id.clone(), hist_pos);
+            e.storage().persistent().set(&hist_key, &result);
+            e.storage()
+                .persistent()
+                .extend_ttl(&hist_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+            e.storage().persistent().set(&count_key, &(hist_pos + 1));
+            e.storage()
+                .persistent()
+                .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+
+            window.finalized = true;
+            e.storage().temporary().set(&window_key, &window);
+            // no extend needed — finalized windows can expire
+
+            remove_open_project(&e, &project_id);
+
+            e.events()
+                .publish((EVENT_READING_VERIFIED,), (project_id, result.clone()));
+
+            Some(result)
+        } else {
+            None
+        }
+    }
+
     /// Configure the credit token contract and beneficiary for a project.
     /// When enabled, the oracle will auto-mint credits to the beneficiary upon verification finalization.
+    ///
+    /// `baseline_n` / `baseline_p` are per-project nutrient baselines in mg/L
+    /// (raw integer, same encoding as `total_nitrogen` / `total_phosphorus`;
+    /// see doc/MATH.md §1). `baseline_temp` is the per-project temperature
+    /// baseline in ×10 °C (same encoding as `temperature`). Pass the protocol
+    /// defaults (e.g. `10`, `2`, `300`) to preserve the previous behavior.
     pub fn set_project_config(
         e: Env,
         admin: Address,
         project_id: BytesN<32>,
         token_contract: Address,
         beneficiary: Address,
+        baseline_n: i64,
+        baseline_p: i64,
+        baseline_temp: i64,
     ) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -588,6 +1052,9 @@ impl VerificationOracle {
         let config = ProjectConfig {
             token_contract,
             beneficiary,
+            baseline_n,
+            baseline_p,
+            baseline_temp,
         };
         let key = DataKey::ProjectConfig(project_id);
         e.storage().persistent().set(&key, &config);
@@ -1239,6 +1706,14 @@ impl VerificationOracle {
             panic!("hash mismatch: revealed values do not match commitment");
         }
 
+        validate_sensor_reading(
+            params.ph,
+            params.flow_rate,
+            params.total_nitrogen,
+            params.total_phosphorus,
+            params.dissolved_oxygen,
+        );
+
         // Track per-oracle and global submission counts
         let submit_key = DataKey::OracleSubmitCount(oracle.clone());
         let oracle_submit_count: u64 = e.storage().persistent().get(&submit_key).unwrap_or(0);
@@ -1450,63 +1925,39 @@ impl VerificationOracle {
             p_vals.push_back(s.total_phosphorus);
         }
 
-        let med_ph = median_i64(&e, &ph_vals);
-        let med_turb = median_i64(&e, &turb_vals);
-        let med_do = median_i64(&e, &do_vals);
-        let med_temp = median_i64(&e, &temp_vals);
-        let med_flow = median_i64(&e, &flow_vals);
-        let med_n = median_i64(&e, &n_vals);
-        let med_p = median_i64(&e, &p_vals);
+        let med_ph = median_i64(&ph_vals);
+        let med_turb = median_i64(&turb_vals);
+        let med_do = median_i64(&do_vals);
+        let med_temp = median_i64(&temp_vals);
+        let med_flow = median_i64(&flow_vals);
+        let med_n = median_i64(&n_vals);
+        let med_p = median_i64(&p_vals);
 
         let baseline_n: i128 = 10;
-        let n_removed: i128 = if (med_n as i128) < baseline_n {
-            (baseline_n - med_n as i128) * med_flow as i128 * 3600 / 1000000
-        } else {
-            0
-        };
-
         let baseline_p: i128 = 2;
-        let p_removed: i128 = if (med_p as i128) < baseline_p {
-            (baseline_p - med_p as i128) * med_flow as i128 * 3600 / 1000000
-        } else {
-            0
-        };
+        let temp_threshold: i128 = config.quality_threshold_temp as i128;
 
-        let mut penalty: i64 = 0;
-        if med_ph < config.quality_threshold_ph || med_ph > (config.quality_threshold_ph + 100) {
-            penalty += 2000;
-        }
-        if med_turb > config.quality_threshold_turbidity {
-            penalty += 2000;
-        }
-        if med_do < config.quality_threshold_do {
-            penalty += 2000;
-        }
-        if med_temp > config.quality_threshold_temp {
-            penalty += 1000;
-        }
-        if penalty > 8000 {
-            penalty = 8000;
-        }
-
-        let volumetric_credit: i128 = if med_flow > 0 {
-            med_flow as i128 * 100 / 1000
-        } else {
-            0
-        };
-
-        let n_credit: i128 = n_removed * config.credit_per_kg_n;
-        let p_credit: i128 = p_removed * config.credit_per_kg_p;
-        let gross = n_credit + p_credit + volumetric_credit;
-        let total: i128 = gross * (10000 - penalty as i128) / 10000;
+        let fin = compute_finalization(
+            &config,
+            med_ph,
+            med_turb,
+            med_do,
+            med_temp,
+            med_flow,
+            med_n,
+            med_p,
+            baseline_n,
+            baseline_p,
+            temp_threshold,
+        );
 
         let mut result = VerificationResult {
             project_id: project_id.clone(),
-            n_removal_kg: n_removed,
-            p_removal_kg: p_removed,
-            quality_penalty: penalty,
-            volumetric_credit,
-            total_credits: total,
+            n_removal_kg: fin.n_removed,
+            p_removal_kg: fin.p_removed,
+            quality_penalty: fin.penalty,
+            volumetric_credit: fin.volumetric_credit,
+            total_credits: fin.total,
             credits_minted: 0,
             oracle_count: window.submissions.len(),
             finalized_at: e.ledger().timestamp(),
@@ -2015,8 +2466,9 @@ mod tests {
 
         let new_config = OracleConfig {
             min_oracles: 5,
-            max_oracles: 15,
+            max_oracles: 10,
             quality_threshold_ph: 550,
+            quality_threshold_ph_max: 650,
             quality_threshold_turbidity: 40,
             quality_threshold_do: 60,
             quality_threshold_temp: 310,
@@ -3922,5 +4374,101 @@ mod tests {
             client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
+    }
+
+    // ── median_i64 unit tests ──
+
+    /// Build a `Vec<i64>` of length `n` from a Rust slice. Requires `Env`
+    /// for Soroban `Vec` construction and `#[cfg(test)]` (`extern crate std`).
+    fn make_i64_vec(e: &Env, values: &[i64]) -> Vec<i64> {
+        let mut v = Vec::new(e);
+        for val in values {
+            v.push_back(*val);
+        }
+        v
+    }
+
+    #[test]
+    fn test_median_odd_count() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[30, 10, 20]);
+        assert_eq!(median_i64(&v), 20);
+    }
+
+    #[test]
+    fn test_median_odd_count_five() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[50, 10, 30, 40, 20]);
+        assert_eq!(median_i64(&v), 30);
+    }
+
+    #[test]
+    fn test_median_even_count_averages_two_middles() {
+        let e = Env::default();
+        // [10, 20, 30, 40] → middles are 20 and 30 → (20+30)/2 = 25
+        let v = make_i64_vec(&e, &[40, 10, 30, 20]);
+        assert_eq!(median_i64(&v), 25);
+    }
+
+    #[test]
+    fn test_median_even_count_truncates_toward_zero() {
+        let e = Env::default();
+        // [11, 20] → (11+20)/2 = 15 (truncates toward zero)
+        let v = make_i64_vec(&e, &[11, 20]);
+        assert_eq!(median_i64(&v), 15);
+    }
+
+    #[test]
+    fn test_median_with_negative_values_odd() {
+        let e = Env::default();
+        // [-50, -10, -30] → sorted: [-50, -30, -10] → median = -30
+        let v = make_i64_vec(&e, &[-10, -50, -30]);
+        assert_eq!(median_i64(&v), -30);
+    }
+
+    #[test]
+    fn test_median_with_negative_values_even() {
+        let e = Env::default();
+        // [-2, -1] → (-2 + -1)/2 = -3/2 = -1 (truncates toward zero)
+        let v = make_i64_vec(&e, &[-2, -1]);
+        assert_eq!(median_i64(&v), -1);
+    }
+
+    #[test]
+    fn test_median_mixed_signs_even() {
+        let e = Env::default();
+        // [-5, 5] → (5 + -5)/2 = 0/2 = 0
+        let v = make_i64_vec(&e, &[-5, 5]);
+        assert_eq!(median_i64(&v), 0);
+    }
+
+    #[test]
+    fn test_median_single_element() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[42]);
+        assert_eq!(median_i64(&v), 42);
+    }
+
+    #[test]
+    fn test_median_ten_elements_max_oracles() {
+        let e = Env::default();
+        // 10 elements — max_oracles boundary. Sorted: [0,1,2,3,4,5,6,7,8,9]
+        // even → (4 + 5)/2 = 4
+        let v = make_i64_vec(&e, &[5, 3, 8, 1, 9, 7, 2, 6, 0, 4]);
+        assert_eq!(median_i64(&v), 4);
+    }
+
+    #[test]
+    fn test_median_all_same_values() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[7, 7, 7, 7, 7]);
+        assert_eq!(median_i64(&v), 7);
+    }
+
+    #[test]
+    fn test_median_extreme_i64_values() {
+        let e = Env::default();
+        let v = make_i64_vec(&e, &[i64::MAX, i64::MIN, 0]);
+        assert_eq!(median_i64(&v), 0);
     }
 }
