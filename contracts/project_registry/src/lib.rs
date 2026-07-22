@@ -54,6 +54,11 @@ fn read_admin(e: &Env) -> Address {
     e.storage().instance().get(&DataKey::Admin).unwrap()
 }
 
+// ── Bounded-list constants ──
+/// Maximum number of projects returned by `list_all()`.
+/// For unbounded queries, use `list_paginated(offset, limit)`.
+const MAX_LIST_ALL: u32 = 100;
+
 #[contract]
 pub struct ProjectRegistry;
 
@@ -187,12 +192,13 @@ impl ProjectRegistry {
         e.storage().instance().get(&DataKey::ProjectCount).unwrap()
     }
 
-    /// List registered projects with pagination.
-    /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    /// List registered projects (bounded to MAX_LIST_ALL entries).
+    /// Use `list_paginated(offset, limit)` for unbounded pagination.
     pub fn list_all(e: Env) -> Vec<ProjectEntry> {
         let total: u64 = e.storage().instance().get(&DataKey::ProjectCount).unwrap();
+        let end = total.min(MAX_LIST_ALL as u64);
         let mut projects: Vec<ProjectEntry> = Vec::new(&e);
-        for pos in 0..total {
+        for pos in 0..end {
             let idx_key = DataKey::ProjectIdAt(pos);
             if let Some(id) = e.storage().persistent().get::<_, BytesN<32>>(&idx_key) {
                 let proj_key = DataKey::Project(id);

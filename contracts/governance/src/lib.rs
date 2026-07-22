@@ -631,12 +631,70 @@ impl Governance {
             .set(&DataKey::RegisteredTokens, &filtered);
     }
 
-    /// Return the list of all registered credit token contract addresses.
+    /// Return the list of all registered credit token contract addresses
+    /// (bounded — use `list_registered_tokens_paginated` for large sets).
     pub fn list_registered_tokens(e: Env) -> Vec<Address> {
         e.storage()
             .instance()
             .get(&DataKey::RegisteredTokens)
             .unwrap_or_else(|| Vec::new(&e))
+    }
+
+    /// Return the number of registered credit token contracts.
+    pub fn registered_token_count(e: Env) -> u32 {
+        let tokens: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredTokens)
+            .unwrap_or_else(|| Vec::new(&e));
+        tokens.len()
+    }
+
+    /// Paginated list of registered credit token contract addresses.
+    pub fn list_registered_tokens_paginated(
+        e: Env,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<Address> {
+        let tokens: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredTokens)
+            .unwrap_or_else(|| Vec::new(&e));
+        let total = tokens.len() as u64;
+        let end = (offset + limit as u64).min(total);
+        let mut result: Vec<Address> = Vec::new(&e);
+        for pos in offset..end {
+            result.push_back(tokens.get(pos).unwrap());
+        }
+        result
+    }
+
+    /// Return the list of active proposal IDs (paginated).
+    /// `offset` is the zero-based start position; `limit` is the max IDs to return.
+    pub fn get_active_proposals(e: Env, offset: u64, limit: u32) -> Vec<u64> {
+        let active: Vec<u64> = e
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveProposals)
+            .unwrap_or_else(|| Vec::new(&e));
+        let total = active.len() as u64;
+        let end = (offset + limit as u64).min(total);
+        let mut result: Vec<u64> = Vec::new(&e);
+        for pos in offset..end {
+            result.push_back(active.get(pos).unwrap());
+        }
+        result
+    }
+
+    /// Return the total number of currently active proposals.
+    pub fn active_proposal_count(e: Env) -> u32 {
+        let active: Vec<u64> = e
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveProposals)
+            .unwrap_or_else(|| Vec::new(&e));
+        active.len()
     }
 
     // ── Emergency Pause ──
