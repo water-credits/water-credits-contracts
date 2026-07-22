@@ -446,12 +446,15 @@ fn mint_credits_respecting_cap(
 /// aborts the whole test process instead of unwinding — so panic-path
 /// coverage has to bypass that dispatch entirely and call the plain
 /// function.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_sensor_reading(
     ph: i64,
     flow_rate: i64,
     total_nitrogen: i64,
     total_phosphorus: i64,
     dissolved_oxygen: i64,
+    turbidity: i64,
+    temperature: i64,
 ) {
     if !(0..=1400).contains(&ph) {
         panic!("ph out of valid range [0, 1400]");
@@ -467,6 +470,12 @@ pub fn validate_sensor_reading(
     }
     if dissolved_oxygen < 0 {
         panic!("dissolved_oxygen must be non-negative");
+    }
+    if !(0..=10_000).contains(&turbidity) {
+        panic!("turbidity out of valid range [0, 10000]");
+    }
+    if !(0..=500).contains(&temperature) {
+        panic!("temperature out of valid range [0, 500]");
     }
 }
 
@@ -844,6 +853,8 @@ impl VerificationOracle {
             total_nitrogen,
             total_phosphorus,
             dissolved_oxygen,
+            turbidity,
+            temperature,
         );
 
         let nonce_key = DataKey::OracleNonce((project_id.clone(), oracle.clone()));
@@ -1768,6 +1779,8 @@ impl VerificationOracle {
             params.total_nitrogen,
             params.total_phosphorus,
             params.dissolved_oxygen,
+            params.turbidity,
+            params.temperature,
         );
 
         // Track per-oracle and global submission counts

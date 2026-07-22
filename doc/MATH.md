@@ -63,13 +63,17 @@ before they can enter median aggregation. A reading that fails validation panics
 | `total_nitrogen` | `≥ 0` |
 | `total_phosphorus` | `≥ 0` |
 | `dissolved_oxygen` | `≥ 0` |
+| `turbidity` | `[0, 10000]` (0 – 1000 NTU, encoded ×10) |
+| `temperature` | `[0, 500]` (0 – 50 °C, encoded ×10) |
 
 These bounds reject structurally-valid-but-physically-impossible `i64` values (e.g. a
 malfunctioning sensor reporting negative nitrogen), which would otherwise inflate
 `baseline − med_n` in [§3](#3-nutrient-removal-formulas) and mint credits far beyond
-any physically plausible removal. `turbidity` and `temperature` are not bounded at
-entry — only the quality-penalty thresholds in [§5](#5-quality-penalty-calculation)
-apply to them.
+any physically plausible removal. `turbidity` and `temperature` are bounded at entry
+too: a negative `turbidity` would make the median negative, which makes
+`med_turb > quality_threshold_turbidity` in [§5](#5-quality-penalty-calculation)
+always false and disables the turbidity penalty; a negative `temperature` similarly
+lets a reading dodge the `med_temp > quality_threshold_temp` penalty.
 
 ---
 

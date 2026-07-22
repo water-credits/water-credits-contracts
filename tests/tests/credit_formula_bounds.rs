@@ -52,50 +52,87 @@ use verification_oracle::{
 #[test]
 #[should_panic(expected = "ph out of valid range")]
 fn test_negative_ph_rejected() {
-    validate_sensor_reading(-1, 500, 8, 1, 80);
+    validate_sensor_reading(-1, 500, 8, 1, 80, 10, 250);
 }
 
 #[test]
 #[should_panic(expected = "ph out of valid range")]
 fn test_ph_above_1400_rejected() {
-    validate_sensor_reading(1401, 500, 8, 1, 80);
+    validate_sensor_reading(1401, 500, 8, 1, 80, 10, 250);
 }
 
 #[test]
 #[should_panic(expected = "flow_rate must be non-negative")]
 fn test_negative_flow_rate_rejected() {
-    validate_sensor_reading(700, -1, 8, 1, 80);
+    validate_sensor_reading(700, -1, 8, 1, 80, 10, 250);
 }
 
 #[test]
 #[should_panic(expected = "total_nitrogen must be non-negative")]
 fn test_negative_total_nitrogen_rejected() {
-    validate_sensor_reading(700, 500, -1, 1, 80);
+    validate_sensor_reading(700, 500, -1, 1, 80, 10, 250);
 }
 
 #[test]
 #[should_panic(expected = "total_phosphorus must be non-negative")]
 fn test_negative_total_phosphorus_rejected() {
-    validate_sensor_reading(700, 500, 8, -1, 80);
+    validate_sensor_reading(700, 500, 8, -1, 80, 10, 250);
 }
 
 #[test]
 #[should_panic(expected = "dissolved_oxygen must be non-negative")]
 fn test_negative_dissolved_oxygen_rejected() {
-    validate_sensor_reading(700, 500, 8, 1, -1);
+    validate_sensor_reading(700, 500, 8, 1, -1, 10, 250);
+}
+
+/// A malicious or malfunctioning oracle submitting negative turbidity would
+/// otherwise make `med_turb > quality_threshold_turbidity` always false and
+/// disable the turbidity penalty (issue #60) — this must be rejected instead.
+#[test]
+#[should_panic(expected = "turbidity out of valid range")]
+fn test_negative_turbidity_rejected() {
+    validate_sensor_reading(700, 500, 8, 1, 80, -1, 250);
+}
+
+#[test]
+#[should_panic(expected = "turbidity out of valid range")]
+fn test_turbidity_above_max_rejected() {
+    validate_sensor_reading(700, 500, 8, 1, 80, 10_001, 250);
+}
+
+/// A malicious or malfunctioning oracle submitting an extreme negative
+/// temperature would otherwise avoid the `med_temp > temp_threshold` penalty
+/// entirely (issue #60) — this must be rejected instead.
+#[test]
+#[should_panic(expected = "temperature out of valid range")]
+fn test_negative_temperature_rejected() {
+    validate_sensor_reading(700, 500, 8, 1, 80, 10, -1);
+}
+
+#[test]
+#[should_panic(expected = "temperature out of valid range")]
+fn test_temperature_above_max_rejected() {
+    validate_sensor_reading(700, 500, 8, 1, 80, 10, 501);
 }
 
 /// pH 0 and 1400 (the inclusive boundary values) must be accepted, not rejected.
 #[test]
 fn test_ph_boundary_values_accepted() {
-    validate_sensor_reading(0, 500, 8, 1, 80);
-    validate_sensor_reading(1400, 500, 8, 1, 80);
+    validate_sensor_reading(0, 500, 8, 1, 80, 10, 250);
+    validate_sensor_reading(1400, 500, 8, 1, 80, 10, 250);
 }
 
 /// Zero is a valid (non-negative) boundary for every other field too.
 #[test]
 fn test_zero_boundary_values_accepted() {
-    validate_sensor_reading(700, 0, 0, 0, 0);
+    validate_sensor_reading(700, 0, 0, 0, 0, 0, 0);
+}
+
+/// Turbidity and temperature at their inclusive upper bounds (1000 NTU / 50°C,
+/// ×10 encoded) must be accepted, not rejected.
+#[test]
+fn test_turbidity_and_temperature_upper_boundary_accepted() {
+    validate_sensor_reading(700, 500, 8, 1, 80, 10_000, 500);
 }
 
 fn default_config(e: &Env) -> verification_oracle::OracleConfig {
