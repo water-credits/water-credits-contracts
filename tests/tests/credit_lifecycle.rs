@@ -32,6 +32,9 @@ fn deploy_oracle(e: &Env, admin: &Address) -> (Address, VerificationOracleClient
             commit_phase_secs: 300,
             min_reveal_ledgers: 0,
             max_reveal_ledgers: 60,
+            slash_pct_bps: 1000,
+            min_slash_amount: 0,
+            max_slash_amount: i128::MAX,
         },
     );
     (contract_id, client)

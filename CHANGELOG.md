@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Paused/unpaused event emissions in `credit_token`
 - Deployment script with Soroban deploy commands
 - Math derivations documentation (`doc/MATH.md`)
+- `slash_pct_bps`, `min_slash_amount`, and `max_slash_amount` fields on `OracleConfig` for proportional missed-reveal slashing
 
 ### Fixed
 
@@ -44,6 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Extracted balance/supply storage helpers in `credit_token`
 - Expanded spec documentation with oracle window lifecycle
+- `penalize_non_revealers` now slashes a percentage of an oracle's stake (`stake * slash_pct_bps / 10_000`, clamped to `[min_slash_amount, max_slash_amount]`) instead of a flat `min(stake, min_stake)` amount, so oracles with larger stakes face proportionally larger penalties for missed reveals
+- `update_config` now validates `slash_pct_bps <= 5000` (50% max) and `min_slash_amount <= max_slash_amount`
 
 ### Testing
 

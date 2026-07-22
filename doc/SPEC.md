@@ -185,12 +185,13 @@ passes.
 
 If `finalize_window` runs and an oracle's `Commitment` entry exists but its
 `OracleRevealed` entry does not, the oracle is charged a missed reveal:
-`OracleMissedReveals(oracle)` is incremented, up to `min_stake` is slashed
-from its stake to the treasury, a `SlashReason { reason: 3, .. }` record is
-stored, an `("orc_mr",)` event is emitted, and the stale commitment is
-removed from storage. There is no separate grace period — a commitment not
-revealed within `max_reveal_ledgers` is simply forfeited the next time
-`finalize_window` runs (whether or not `min_oracles` reveals were reached).
+`OracleMissedReveals(oracle)` is incremented, a proportional slash is taken
+from its stake to the treasury (see "Proportional slashing" below), a
+`SlashReason { reason: 3, .. }` record is stored, an `("orc_mr",)` event is
+emitted, and the stale commitment is removed from storage. There is no
+separate grace period — a commitment not revealed within `max_reveal_ledgers`
+is simply forfeited the next time `finalize_window` runs (whether or not
+`min_oracles` reveals were reached).
 
 #### Nonce replay protection
 
@@ -250,11 +251,34 @@ oracle submits fraudulent readings.
 
 **Slashing:**
 
-- Admin calls `slash(admin, oracle, amount, reason)` to penalize an oracle.
-- Reason codes: `1` = admin flag, `2` = fraud proof.
+- Admin calls `slash(admin, oracle, amount, reason)` to penalize an oracle for
+  an explicit, admin-chosen amount.
+- Reason codes: `1` = admin flag, `2` = fraud proof, `3` = missed reveal
+  (see "Proportional slashing" below).
 - Slashed funds are transferred to the treasury address.
 - Slashing does not auto-remove the oracle from the whitelist; admin can
   separately call `remove_oracle`.
+
+**Proportional slashing (missed reveals):**
+
+Unlike the manual `slash` above (where the caller passes an explicit
+`amount`), `penalize_non_revealers` computes the slash amount automatically
+from the oracle's stake so that oracles with more at stake face
+proportionally larger penalties:
+
+```
+raw   = stake * slash_pct_bps / 10_000
+amount = clamp(raw, min_slash_amount, max_slash_amount)
+amount = min(amount, stake)   // never slashes more than is on deposit
+```
+
+- `slash_pct_bps`, `min_slash_amount`, and `max_slash_amount` are fields on
+  `OracleConfig`, tunable via `update_config`.
+- `update_config` rejects `slash_pct_bps > 5000` (50%) and
+  `min_slash_amount > max_slash_amount`.
+- The `min_slash_amount` floor is itself capped at the oracle's actual
+  staked balance, so a missed reveal can never draw down more than what is
+  on deposit.
 
 **Enforcement points:**
 

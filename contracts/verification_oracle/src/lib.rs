@@ -107,6 +107,18 @@ pub struct OracleConfig {
     /// is forfeited: `finalize_window` penalizes the oracle and the window
     /// finalizes without its reading.
     pub max_reveal_ledgers: u32,
+    /// Basis points (of an oracle's total staked amount) slashed by
+    /// `penalize_non_revealers` for a missed reveal, before the
+    /// `min_slash_amount`/`max_slash_amount` clamp is applied. Bounded to
+    /// `[0, 5000]` (max 50%) by `update_config` to limit the blast radius of
+    /// a governance misconfiguration (Issue #61).
+    pub slash_pct_bps: u32,
+    /// Floor applied to the computed slash amount, so a missed reveal always
+    /// carries a meaningful penalty even for oracles with a small stake.
+    pub min_slash_amount: i128,
+    /// Ceiling applied to the computed slash amount, so a single missed
+    /// reveal can never wipe out an outsized stake in one shot.
+    pub max_slash_amount: i128,
 }
 
 #[contracttype]
@@ -293,6 +305,22 @@ fn median_i64(values: &Vec<i64>) -> i64 {
     } else {
         arr[n / 2]
     }
+}
+
+/// Compute a proportional slash amount for a missed reveal: `stake *
+/// slash_pct_bps / 10_000`, clamped to `[min_slash_amount, max_slash_amount]`,
+/// and finally capped at `stake` so a missed reveal can never draw down more
+/// than the oracle actually has on deposit (Issue #61).
+fn compute_slash_amount(stake: i128, config: &OracleConfig) -> i128 {
+    if stake <= 0 {
+        return 0;
+    }
+    let raw = stake
+        .checked_mul(config.slash_pct_bps as i128)
+        .unwrap_or_else(|| panic!("slash amount multiplication overflow"))
+        / 10_000;
+    raw.clamp(config.min_slash_amount, config.max_slash_amount)
+        .min(stake)
 }
 
 fn add_open_project(e: &Env, project_id: &BytesN<32>) {
@@ -591,6 +619,9 @@ impl VerificationOracle {
             commit_phase_secs: 300,
             min_reveal_ledgers: 0,
             max_reveal_ledgers: 60,
+            slash_pct_bps: 1000,
+            min_slash_amount: 0,
+            max_slash_amount: i128::MAX,
         };
         e.storage().instance().set(&DataKey::Config, &config);
     }
@@ -1156,6 +1187,15 @@ impl VerificationOracle {
         let stored: Address = read_admin(&e);
         if admin != stored {
             panic!("unauthorized");
+        }
+        // Cap proportional slashing at 50% per event so a governance
+        // misconfiguration can't wipe out an oracle's entire stake in one
+        // missed reveal (Issue #61).
+        if config.slash_pct_bps > 5000 {
+            panic!("slash_pct_bps exceeds max (5000 = 50%)");
+        }
+        if config.min_slash_amount < 0 || config.max_slash_amount < config.min_slash_amount {
+            panic!("invalid slash amount bounds");
         }
         e.storage().instance().set(&DataKey::Config, &config);
     }
@@ -1847,7 +1887,7 @@ impl VerificationOracle {
                         });
 
                 if stake_info.amount > 0 {
-                    let slash_amount = stake_info.amount.min(config.min_stake);
+                    let slash_amount = compute_slash_amount(stake_info.amount, &config);
                     if slash_amount > 0 {
                         stake_info.amount -= slash_amount;
                         e.storage().persistent().set(&stake_key, &stake_info);
@@ -2500,6 +2540,9 @@ mod tests {
             commit_phase_secs: 600,
             min_reveal_ledgers: 0,
             max_reveal_ledgers: 120,
+            slash_pct_bps: 1000,
+            min_slash_amount: 0,
+            max_slash_amount: i128::MAX,
         };
         client.update_config(&admin, &new_config);
 
@@ -3969,6 +4012,182 @@ mod tests {
             assert!(slash.is_some());
             assert_eq!(slash.unwrap().reason, 3);
         }
+    }
+
+    // ── Proportional slashing (issue #61) ──
+
+    /// Commits a single oracle, advances into and past the reveal phase
+    /// without revealing, and calls `finalize_window` so
+    /// `penalize_non_revealers` runs against that oracle's stake.
+    fn trigger_missed_reveal_penalty(
+        e: &Env,
+        admin: &Address,
+        client: &VerificationOracleClient<'static>,
+        project_id: &BytesN<32>,
+        oracle: &Address,
+    ) {
+        client.open_window(admin, project_id);
+        let commitment = BytesN::from_array(e, &[0xABu8; 32]);
+        client.commit_reading(oracle, project_id, &1u64, &commitment);
+        set_ledger_timestamp(e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(project_id);
+        advance_past_reveal_phase(e);
+        let result = client.finalize_window(project_id);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_update_config_rejects_slash_pct_bps_above_max() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.slash_pct_bps = 5001;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_accepts_slash_pct_bps_at_max() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.slash_pct_bps = 5000;
+        client.update_config(&admin, &config);
+        assert_eq!(client.get_config().slash_pct_bps, 5000);
+    }
+
+    #[test]
+    fn test_update_config_rejects_max_slash_below_min_slash() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.min_slash_amount = 1000;
+        config.max_slash_amount = 500;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_penalize_non_revealers_slashes_proportionally_to_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.slash_pct_bps = 1000; // 10%
+        config.min_slash_amount = 0;
+        config.max_slash_amount = i128::MAX;
+        client.update_config(&admin, &config);
+
+        let oracle = Address::generate(&e);
+        client.stake(&oracle, &10_000);
+        client.add_oracle(&admin, &oracle);
+
+        let project_id = BytesN::from_array(&e, &[201u8; 32]);
+        trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
+
+        // 10,000 staked * 10% = 1,000 slashed.
+        assert_eq!(client.get_stake(&oracle).amount, 9_000);
+    }
+
+    #[test]
+    fn test_penalize_non_revealers_slash_scales_down_with_smaller_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.slash_pct_bps = 1000; // 10%
+        config.min_slash_amount = 0;
+        config.max_slash_amount = i128::MAX;
+        client.update_config(&admin, &config);
+
+        let oracle = Address::generate(&e);
+        client.stake(&oracle, &5_000);
+        client.add_oracle(&admin, &oracle);
+
+        let project_id = BytesN::from_array(&e, &[202u8; 32]);
+        trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
+
+        // 5,000 staked * 10% = 500 slashed.
+        assert_eq!(client.get_stake(&oracle).amount, 4_500);
+    }
+
+    #[test]
+    fn test_penalize_non_revealers_applies_min_slash_floor() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.slash_pct_bps = 100; // 1% — would be 50 on a 5,000 stake
+        config.min_slash_amount = 800;
+        config.max_slash_amount = i128::MAX;
+        client.update_config(&admin, &config);
+
+        let oracle = Address::generate(&e);
+        client.stake(&oracle, &5_000);
+        client.add_oracle(&admin, &oracle);
+
+        let project_id = BytesN::from_array(&e, &[203u8; 32]);
+        trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
+
+        // Raw 1% (50) is floored up to min_slash_amount (800).
+        assert_eq!(client.get_stake(&oracle).amount, 4_200);
+    }
+
+    #[test]
+    fn test_penalize_non_revealers_applies_max_slash_cap() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.slash_pct_bps = 5000; // 50% — would be 50,000 on a 100,000 stake
+        config.min_slash_amount = 0;
+        config.max_slash_amount = 2_000;
+        client.update_config(&admin, &config);
+
+        let oracle = Address::generate(&e);
+        client.stake(&oracle, &100_000);
+        client.add_oracle(&admin, &oracle);
+
+        let project_id = BytesN::from_array(&e, &[204u8; 32]);
+        trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
+
+        // Raw 50% (50,000) is capped down to max_slash_amount (2,000).
+        assert_eq!(client.get_stake(&oracle).amount, 98_000);
+    }
+
+    #[test]
+    fn test_penalize_non_revealers_floor_never_exceeds_actual_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.slash_pct_bps = 100; // 1%
+        config.min_slash_amount = 500;
+        config.max_slash_amount = i128::MAX;
+        client.update_config(&admin, &config);
+
+        // Oracle only has 100 staked — below the 500 floor.
+        let oracle = Address::generate(&e);
+        client.stake(&oracle, &100);
+        client.add_oracle(&admin, &oracle);
+
+        let project_id = BytesN::from_array(&e, &[205u8; 32]);
+        trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
+
+        // The floor is capped at the oracle's actual staked balance — a
+        // missed reveal can never draw down more than what is on deposit.
+        assert_eq!(client.get_stake(&oracle).amount, 0);
     }
 
     // ── Zero-credit window fix (issue #24) ──

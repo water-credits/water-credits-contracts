@@ -116,6 +116,9 @@ fn default_config(e: &Env) -> verification_oracle::OracleConfig {
         commit_phase_secs: 300,
         min_reveal_ledgers: 0,
         max_reveal_ledgers: 60,
+        slash_pct_bps: 1000,
+        min_slash_amount: 0,
+        max_slash_amount: i128::MAX,
     }
 }
 
