@@ -13,6 +13,9 @@ const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_PROJECT_REGISTERED: Symbol = symbol_short!("proj_reg");
 const EVENT_STATUS_CHANGED: Symbol = symbol_short!("stat_chg");
 const EVENT_OWNER_CHANGED: Symbol = symbol_short!("ownr_chg");
+const EVENT_ADMIN_PROPOSED: Symbol = symbol_short!("adm_prop");
+const EVENT_ADMIN_ACCEPTED: Symbol = symbol_short!("adm_acpt");
+const EVENT_ADMIN_CANCELLED: Symbol = symbol_short!("adm_canc");
 
 // ── TTL constants ──
 /// Projects are permanent registrations: 10 years.
@@ -21,6 +24,8 @@ const PROJECT_TTL_BUMP: u32 = 63_072_000;
 /// Index entries match project lifetime.
 const INDEX_TTL_THRESHOLD: u32 = 63_072_000;
 const INDEX_TTL_BUMP: u32 = 63_072_000;
+/// Admin transfer proposal TTL: ~30 days (518,400 ledgers at 5 sec/ledger).
+const ADMIN_TRANSFER_TTL: u32 = 518_400;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -49,6 +54,10 @@ pub enum DataKey {
     // ── Instance ──
     Admin,
     ProjectCount,
+    /// Pending new admin address for propose-then-accept transfer.
+    PendingAdmin,
+    /// Ledger sequence at which a pending admin transfer expires.
+    AdminTransferExpiration,
     // ── Persistent ──
     Project(BytesN<32>),
     ProjectIdAt(u64),
@@ -287,6 +296,80 @@ impl ProjectRegistry {
 
         e.events()
             .publish((EVENT_OWNER_CHANGED,), (project_id, old_owner, new_owner));
+    }
+
+    // ── Admin Transfer (Propose-Then-Accept) ──
+
+    /// Propose transferring admin to a new address. The new admin must call `accept_admin()`
+    /// within the TTL window (~30 days). Replaces any pending proposal.
+    pub fn propose_transfer_admin(e: Env, admin: Address, new_admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        if new_admin == admin {
+            panic!("new admin must differ");
+        }
+
+        let expiration = e.ledger().sequence().checked_add(ADMIN_TRANSFER_TTL).expect("overflow");
+        e.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        e.storage().instance().set(&DataKey::AdminTransferExpiration, &expiration);
+
+        e.events().publish((EVENT_ADMIN_PROPOSED,), (admin, new_admin, expiration));
+    }
+
+    /// Accept a pending admin transfer. Callable only by the proposed new admin.
+    /// Atomically switches the admin if the proposal has not expired.
+    pub fn accept_admin(e: Env, pending: Address) {
+        pending.require_auth();
+        let proposed: Address = e.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic!("no pending transfer"));
+
+        if pending != proposed {
+            panic!("unauthorized");
+        }
+
+        let expiration: u32 = e.storage()
+            .instance()
+            .get(&DataKey::AdminTransferExpiration)
+            .unwrap_or(0);
+        if expiration > 0 && e.ledger().sequence() >= expiration {
+            panic!("transfer expired");
+        }
+
+        let old_admin = read_admin(&e);
+        e.storage().instance().set(&DataKey::Admin, &pending);
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage().instance().remove(&DataKey::AdminTransferExpiration);
+
+        e.events().publish((EVENT_ADMIN_ACCEPTED,), (old_admin, pending));
+    }
+
+    /// Cancel a pending admin transfer. Only the current admin can cancel.
+    pub fn cancel_transfer_admin(e: Env, admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let pending: Option<Address> = e.storage().instance().get(&DataKey::PendingAdmin);
+        if pending.is_none() {
+            panic!("no pending transfer");
+        }
+
+        let old_pending = pending.unwrap();
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage().instance().remove(&DataKey::AdminTransferExpiration);
+
+        e.events().publish((EVENT_ADMIN_CANCELLED,), (admin, old_pending));
+    }
+
+    /// Return the pending admin address, if any.
+    pub fn pending_admin(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::PendingAdmin)
     }
 }
 

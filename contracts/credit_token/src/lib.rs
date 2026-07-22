@@ -16,6 +16,8 @@ const ALLOWANCE_TTL_BUMP: u32 = 1_555_200;
 /// Certificates are permanent records: 10 years.
 const CERT_TTL_THRESHOLD: u32 = 63_072_000;
 const CERT_TTL_BUMP: u32 = 63_072_000;
+/// Admin transfer proposal TTL: ~30 days (518,400 ledgers at 5 sec/ledger).
+const ADMIN_TRANSFER_TTL: u32 = 518_400;
 
 #[cfg(test)]
 extern crate std;
@@ -30,6 +32,9 @@ const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
 const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_APPROVED: Symbol = symbol_short!("approved");
 const EVENT_ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfer");
+const EVENT_ADMIN_PROPOSED: Symbol = symbol_short!("adm_prop");
+const EVENT_ADMIN_ACCEPTED: Symbol = symbol_short!("adm_acpt");
+const EVENT_ADMIN_CANCELLED: Symbol = symbol_short!("adm_canc");
 
 // ── Data Types ──
 
@@ -81,6 +86,10 @@ pub enum DataKey {
     PauseGuardian,
     /// When true, `retire()` panics if no retirement registry is configured.
     RequireRegistry,
+    /// Pending new admin address for propose-then-accept transfer.
+    PendingAdmin,
+    /// Ledger sequence at which a pending admin transfer expires.
+    AdminTransferExpiration,
 }
 
 fn is_paused(e: &Env) -> bool {
@@ -223,17 +232,74 @@ impl CreditToken {
             .publish((EVENT_INITIALIZED,), (admin, project_id));
     }
 
-    /// Transfer contract admin rights to a new address.
-    pub fn set_admin(e: Env, admin: Address, new_admin: Address) {
+    /// Propose a new admin. The current admin calls this to nominate a successor.
+    /// The proposed address must then call `accept_admin()` to finalize the transfer.
+    /// Overwrites any pending proposal. Proposal expires after ADMIN_TRANSFER_TTL ledgers.
+    pub fn propose_transfer_admin(e: Env, admin: Address, new_admin: Address) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
         if admin != stored {
             panic!("unauthorized");
         }
-        e.storage().instance().set(&DataKey::Admin, &new_admin);
+        let expiration = e.ledger().sequence() + ADMIN_TRANSFER_TTL;
+        e.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        e.storage().instance().set(&DataKey::AdminTransferExpiration, &expiration);
 
         e.events()
-            .publish((EVENT_ADMIN_TRANSFERRED,), (stored, new_admin));
+            .publish((EVENT_ADMIN_PROPOSED,), (stored, new_admin, expiration));
+    }
+
+    /// Accept a pending admin transfer. The proposed admin calls this to become the new admin.
+    /// Panics if there is no pending proposal, the caller is not the proposed admin, or the
+    /// proposal has expired.
+    pub fn accept_admin(e: Env, caller: Address) {
+        caller.require_auth();
+        let pending: Option<Address> = e.storage().instance().get(&DataKey::PendingAdmin);
+        let expiration: u32 = e.storage().instance().get(&DataKey::AdminTransferExpiration).unwrap_or(0);
+
+        let Some(pending_admin) = pending else {
+            panic!("no pending admin transfer");
+        };
+        if caller != pending_admin {
+            panic!("unauthorized");
+        }
+        if expiration > 0 && e.ledger().sequence() > expiration {
+            panic!("admin transfer expired");
+        }
+
+        let old_admin = read_admin(&e);
+        e.storage().instance().set(&DataKey::Admin, &caller);
+
+        // Clear pending state
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage().instance().remove(&DataKey::AdminTransferExpiration);
+
+        e.events()
+            .publish((EVENT_ADMIN_ACCEPTED,), (old_admin, caller));
+    }
+
+    /// Cancel any pending admin transfer. Callable by the current admin.
+    pub fn cancel_transfer_admin(e: Env, admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let pending: Option<Address> = e.storage().instance().get(&DataKey::PendingAdmin);
+        let Some(pending_admin) = pending else {
+            panic!("no pending admin transfer");
+        };
+
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage().instance().remove(&DataKey::AdminTransferExpiration);
+
+        e.events()
+            .publish((EVENT_ADMIN_CANCELLED,), (stored, pending_admin));
+    }
+
+    /// Return the pending admin address, if any.
+    pub fn pending_admin(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     /// Designate the address allowed to mint credits (typically the verification oracle).
@@ -1042,14 +1108,105 @@ mod tests {
     }
 
     #[test]
-    fn test_set_admin_transfers_ownership() {
+    fn test_propose_and_accept_admin() {
         let (e, admin, _user1, _user2, _project_id, client) = setup();
         let new_admin = Address::generate(&e);
         e.mock_all_auths();
 
-        client.set_admin(&admin, &new_admin);
+        client.propose_transfer_admin(&admin, &new_admin);
+        assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+
+        client.accept_admin(&new_admin);
+        // New admin can now mint
         client.mint_to(&new_admin, &new_admin, &200);
         assert_eq!(client.balance(&new_admin), 200);
+        // Pending state cleared
+        assert!(client.pending_admin().is_none());
+    }
+
+    #[test]
+    fn test_propose_transfer_admin_emits_event() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+
+        let events = e.events().all();
+        // initialize(1) + propose_transfer_admin(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, _data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("adm_prop"));
+    }
+
+    #[test]
+    fn test_accept_admin_emits_event() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+
+        let events = e.events().all();
+        // initialize(1) + propose(1) + accept(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("adm_acpt"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no pending admin transfer")]
+    fn test_accept_admin_without_proposal_panics() {
+        let (e, _admin, _user1, _user2, _project_id, client) = setup();
+        let someone = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.accept_admin(&someone);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_accept_admin_wrong_caller_panics() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        let new_admin = Address::generate(&e);
+        let impostor = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+        client.accept_admin(&impostor);
+    }
+
+    #[test]
+    fn test_cancel_transfer_admin() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+        assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+
+        client.cancel_transfer_admin(&admin);
+        assert!(client.pending_admin().is_none());
+    }
+
+    #[test]
+    fn test_cancel_transfer_admin_emits_event() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+        client.cancel_transfer_admin(&admin);
+
+        let events = e.events().all();
+        // initialize(1) + propose(1) + cancel(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("adm_canc"));
     }
 
     #[test]
@@ -1082,18 +1239,21 @@ mod tests {
         let new_admin = Address::generate(&e);
         e.mock_all_auths();
 
-        client.set_admin(&admin, &new_admin);
+        client.propose_transfer_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
 
         let events = e.events().all();
-        // initialize(1) + set_admin(1) = 2
-        assert_eq!(events.len(), 2);
-        let (_contract, topics, data) = &events.get(1).unwrap();
+        // initialize(1) + propose(1) + accept(1) = 3
+        assert_eq!(events.len(), 3);
+        // Check propose event
+        let (_contract, topics, _data) = &events.get(1).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
-        assert_eq!(topic, symbol_short!("adm_xfer"));
+        assert_eq!(topic, symbol_short!("adm_prop"));
 
-        let (ev_old_admin, ev_new_admin) = <(Address, Address)>::try_from_val(&e, data).unwrap();
-        assert_eq!(ev_old_admin, admin);
-        assert_eq!(ev_new_admin, new_admin);
+        // Check accept event
+        let (_contract2, topics2, data2) = &events.get(2).unwrap();
+        let topic2: Symbol = Symbol::try_from_val(&e, &topics2.get(0).unwrap()).unwrap();
+        assert_eq!(topic2, symbol_short!("adm_acpt"));
     }
 
     #[test]

@@ -15,6 +15,9 @@ const EVENT_EMERGENCY_PAUSE: Symbol = symbol_short!("emrg_pse");
 const EVENT_EMERGENCY_UNPAUSE: Symbol = symbol_short!("emrg_ups");
 const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfer");
+const EVENT_ADMIN_PROPOSED: Symbol = symbol_short!("adm_prop");
+const EVENT_ADMIN_ACCEPTED: Symbol = symbol_short!("adm_acpt");
+const EVENT_ADMIN_CANCELLED: Symbol = symbol_short!("adm_canc");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -115,6 +118,8 @@ pub enum DataKey {
     Member(Address),
     Proposal(u64),
     HasVoted(u64, Address),
+    PendingAdmin,
+    AdminTransferExpiration,
 }
 
 // ── TTL constants ──
@@ -125,6 +130,8 @@ const PROPOSAL_TTL_THRESHOLD: u32 = 12_614_400;
 const PROPOSAL_TTL_BUMP: u32 = 12_614_400;
 const VOTED_TTL_THRESHOLD: u32 = 12_614_400;
 const VOTED_TTL_BUMP: u32 = 12_614_400;
+/// Admin transfer proposal TTL: ~30 days (518,400 ledgers at 5 sec/ledger).
+const ADMIN_TRANSFER_TTL: u32 = 518_400;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -507,17 +514,70 @@ impl Governance {
         e.storage().instance().set(&DataKey::Config, &config);
     }
 
-    /// Transfer admin rights to a new address. Admin only.
-    pub fn transfer_admin(e: Env, admin: Address, new_admin: Address) {
+    /// Propose a new admin. Only the current admin can call this.
+    /// Stores the proposed new admin address with a TTL of ~30 days.
+    /// Any existing pending proposal is overwritten.
+    pub fn propose_transfer_admin(e: Env, admin: Address, new_admin: Address) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
         if admin != stored {
             panic!("unauthorized");
         }
-        e.storage().instance().set(&DataKey::Admin, &new_admin);
+        e.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        let expiration = e.ledger().sequence() + ADMIN_TRANSFER_TTL;
+        e.storage()
+            .instance()
+            .set(&DataKey::AdminTransferExpiration, &expiration);
 
         e.events()
-            .publish((EVENT_ADMIN_TRANSFERRED,), (stored, new_admin));
+            .publish((EVENT_ADMIN_PROPOSED,), (stored, new_admin));
+    }
+
+    /// Accept the pending admin transfer. Only the proposed new admin can call this.
+    /// Panics if the proposal has expired.
+    pub fn accept_admin(e: Env, caller: Address) {
+        caller.require_auth();
+        let pending: Option<Address> = e.storage().instance().get(&DataKey::PendingAdmin);
+        let Some(pending_admin) = pending else {
+            panic!("no pending admin transfer");
+        };
+        if caller != pending_admin {
+            panic!("unauthorized");
+        }
+        let expiration: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::AdminTransferExpiration)
+            .unwrap_or(0);
+        if expiration > 0 && e.ledger().sequence() > expiration {
+            panic!("admin transfer expired");
+        }
+        let old_admin: Address = read_admin(&e);
+        e.storage().instance().set(&DataKey::Admin, &caller);
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage()
+            .instance()
+            .remove(&DataKey::AdminTransferExpiration);
+
+        e.events()
+            .publish((EVENT_ADMIN_ACCEPTED,), (old_admin, caller));
+    }
+
+    /// Cancel a pending admin transfer. Only the current admin can call this.
+    pub fn cancel_transfer_admin(e: Env, admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage()
+            .instance()
+            .remove(&DataKey::AdminTransferExpiration);
+
+        e.events().publish((EVENT_ADMIN_CANCELLED,), (stored,));
     }
 
     /// Add a new governance member. Admin only.
@@ -1099,12 +1159,13 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_admin() {
+    fn test_propose_and_accept_admin_transfer() {
         let (e, admin, _member1, client) = setup();
         e.mock_all_auths();
 
         let new_admin = Address::generate(&e);
-        client.transfer_admin(&admin, &new_admin);
+        client.propose_transfer_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
 
         // New admin can now perform admin actions
         let config = GovernanceConfig {
@@ -1456,19 +1517,19 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_admin_emits_event() {
+    fn test_propose_admin_emits_event() {
         let (e, admin, _member1, client) = setup();
         e.mock_all_auths();
 
         let new_admin = Address::generate(&e);
-        client.transfer_admin(&admin, &new_admin);
+        client.propose_transfer_admin(&admin, &new_admin);
 
         let events = e.events().all();
-        // initialize(1) + transfer_admin(1) = 2
+        // initialize(1) + propose_transfer_admin(1) = 2
         assert_eq!(events.len(), 2);
         let (_contract, topics, data) = &events.get(1).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
-        assert_eq!(topic, symbol_short!("adm_xfer"));
+        assert_eq!(topic, symbol_short!("adm_prop"));
 
         let (ev_old_admin, ev_new_admin) = <(Address, Address)>::try_from_val(&e, data).unwrap();
         assert_eq!(ev_old_admin, admin);

@@ -10,6 +10,9 @@ extern crate std;
 const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_RETIREMENT_RECORDED: Symbol = symbol_short!("ret_rec");
 const EVENT_AUTH_CALLER_SET: Symbol = symbol_short!("auth_set");
+const EVENT_ADMIN_PROPOSED: Symbol = symbol_short!("adm_prop");
+const EVENT_ADMIN_ACCEPTED: Symbol = symbol_short!("adm_acpt");
+const EVENT_ADMIN_CANCELLED: Symbol = symbol_short!("adm_canc");
 
 // ── TTL constants ──
 /// Retirement records are permanent audit trails: 10 years.
@@ -21,6 +24,8 @@ const INDEX_TTL_BUMP: u32 = 63_072_000;
 /// AuthorizedCaller entries: 1 year.
 const AUTH_TTL_THRESHOLD: u32 = 6_307_200;
 const AUTH_TTL_BUMP: u32 = 6_307_200;
+/// Admin transfer proposal TTL: ~30 days (518,400 ledgers at 5 sec/ledger).
+const ADMIN_TRANSFER_TTL: u32 = 518_400;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +64,10 @@ pub enum DataKey {
     RetireeCount(Address),
     ProjectIndex(BytesN<32>, u64),
     ProjectCount(BytesN<32>),
+    /// Pending new admin address for propose-then-accept transfer.
+    PendingAdmin,
+    /// Ledger sequence at which a pending admin transfer expires.
+    AdminTransferExpiration,
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -312,6 +321,73 @@ impl RetirementRegistry {
             .persistent()
             .get(&DataKey::ProjectCount(project_id))
             .unwrap_or(0)
+    }
+
+    /// Propose a new admin for the contract (propose-then-accept pattern).
+    /// Only the current admin can call this. Any existing pending transfer is overwritten.
+    pub fn propose_transfer_admin(e: Env, admin: Address, new_admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        if new_admin == stored {
+            panic!("new admin must be different");
+        }
+        let expiration = e.ledger().sequence() + ADMIN_TRANSFER_TTL;
+        e.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        e.storage()
+            .instance()
+            .set(&DataKey::AdminTransferExpiration, &expiration);
+
+        e.events()
+            .publish((EVENT_ADMIN_PROPOSED,), (stored, new_admin, expiration));
+    }
+
+    /// Accept a pending admin transfer. Only the proposed new admin can call this.
+    /// The proposal must not have expired.
+    pub fn accept_admin(e: Env, caller: Address) {
+        caller.require_auth();
+        let pending: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic!("no pending transfer"));
+        if caller != pending {
+            panic!("unauthorized");
+        }
+        let expiration: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::AdminTransferExpiration)
+            .unwrap_or(0);
+        if expiration > 0 && e.ledger().sequence() > expiration {
+            panic!("transfer expired");
+        }
+        let old_admin = read_admin(&e);
+        e.storage().instance().set(&DataKey::Admin, &caller);
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage()
+            .instance()
+            .remove(&DataKey::AdminTransferExpiration);
+
+        e.events()
+            .publish((EVENT_ADMIN_ACCEPTED,), (old_admin, caller));
+    }
+
+    /// Cancel a pending admin transfer. Only the current admin can call this.
+    pub fn cancel_transfer_admin(e: Env, admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage()
+            .instance()
+            .remove(&DataKey::AdminTransferExpiration);
+
+        e.events().publish((EVENT_ADMIN_CANCELLED,), (stored,));
     }
 }
 

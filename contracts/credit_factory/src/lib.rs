@@ -14,6 +14,9 @@ const EVENT_PROJ_REG: Symbol = symbol_short!("proj_reg");
 const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_STATUS_CHANGED: Symbol = symbol_short!("stat_chg");
 const EVENT_OWNER_CHANGED: Symbol = symbol_short!("ownr_chg");
+const EVENT_ADMIN_PROPOSED: Symbol = symbol_short!("adm_prop");
+const EVENT_ADMIN_ACCEPTED: Symbol = symbol_short!("adm_acpt");
+const EVENT_ADMIN_CANCELLED: Symbol = symbol_short!("adm_canc");
 
 // ── Data Types ──
 
@@ -40,6 +43,10 @@ pub struct ProjectInfo {
 pub enum DataKey {
     // ── Instance ──
     Admin,
+    /// Pending new admin address for propose-then-accept transfer.
+    PendingAdmin,
+    /// Ledger sequence at which a pending admin transfer expires.
+    AdminTransferExpiration,
     ProjectCount,
     // ── Persistent ──
     Project(BytesN<32>),
@@ -49,6 +56,8 @@ pub enum DataKey {
 /// Projects are permanent registrations: 10 years.
 const PROJECT_TTL_THRESHOLD: u32 = 63_072_000;
 const PROJECT_TTL_BUMP: u32 = 63_072_000;
+/// Admin transfer proposal TTL: ~30 days (518,400 ledgers at 5 sec/ledger).
+const ADMIN_TRANSFER_TTL: u32 = 518_400;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -270,6 +279,80 @@ impl CreditFactory {
         e.events()
             .publish((EVENT_OWNER_CHANGED,), (project_id, old_owner, new_owner));
     }
+
+    // ── Admin Transfer (Propose-Then-Accept) ──
+
+    /// Propose transferring admin to a new address. The new admin must call `accept_admin()`
+    /// within the TTL window (~30 days). Replaces any pending proposal.
+    pub fn propose_transfer_admin(e: Env, admin: Address, new_admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        if new_admin == admin {
+            panic!("new admin must differ");
+        }
+
+        let expiration = e.ledger().sequence().checked_add(ADMIN_TRANSFER_TTL).expect("overflow");
+        e.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        e.storage().instance().set(&DataKey::AdminTransferExpiration, &expiration);
+
+        e.events().publish((EVENT_ADMIN_PROPOSED,), (admin, new_admin, expiration));
+    }
+
+    /// Accept a pending admin transfer. Callable only by the proposed new admin.
+    /// Atomically switches the admin if the proposal has not expired.
+    pub fn accept_admin(e: Env, pending: Address) {
+        pending.require_auth();
+        let proposed: Address = e.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic!("no pending transfer"));
+
+        if pending != proposed {
+            panic!("unauthorized");
+        }
+
+        let expiration: u32 = e.storage()
+            .instance()
+            .get(&DataKey::AdminTransferExpiration)
+            .unwrap_or(0);
+        if expiration > 0 && e.ledger().sequence() >= expiration {
+            panic!("transfer expired");
+        }
+
+        let old_admin = read_admin(&e);
+        e.storage().instance().set(&DataKey::Admin, &pending);
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage().instance().remove(&DataKey::AdminTransferExpiration);
+
+        e.events().publish((EVENT_ADMIN_ACCEPTED,), (old_admin, pending));
+    }
+
+    /// Cancel a pending admin transfer. Only the current admin can cancel.
+    pub fn cancel_transfer_admin(e: Env, admin: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let pending: Option<Address> = e.storage().instance().get(&DataKey::PendingAdmin);
+        if pending.is_none() {
+            panic!("no pending transfer");
+        }
+
+        let old_pending = pending.unwrap();
+        e.storage().instance().remove(&DataKey::PendingAdmin);
+        e.storage().instance().remove(&DataKey::AdminTransferExpiration);
+
+        e.events().publish((EVENT_ADMIN_CANCELLED,), (admin, old_pending));
+    }
+
+    /// Return the pending admin address, if any.
+    pub fn pending_admin(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::PendingAdmin)
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +383,109 @@ mod tests {
         client.initialize(&admin);
 
         (e, admin, owner, wasm_hash, client)
+    }
+
+    // ── Admin Transfer Tests ──
+
+    #[test]
+    fn test_propose_and_accept_admin() {
+        let (e, admin, _owner, _wasm_hash, client) = setup_with_client();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+        assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+
+        client.accept_admin(&new_admin);
+        // New admin is now the admin
+        assert_eq!(client.admin(), new_admin);
+        // Pending state cleared
+        assert!(client.pending_admin().is_none());
+    }
+
+    #[test]
+    fn test_propose_transfer_admin_emits_event() {
+        let (e, admin, _owner, _wasm_hash, client) = setup_with_client();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+
+        let events = e.events().all();
+        // initialize(1) + propose_transfer_admin(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, _data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("adm_prop"));
+    }
+
+    #[test]
+    fn test_accept_admin_emits_event() {
+        let (e, admin, _owner, _wasm_hash, client) = setup_with_client();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+
+        let events = e.events().all();
+        // initialize(1) + propose(1) + accept(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("adm_acpt"));
+    }
+
+    #[test]
+    fn test_cancel_transfer_admin() {
+        let (e, admin, _owner, _wasm_hash, client) = setup_with_client();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+        assert_eq!(client.pending_admin(), Some(new_admin.clone()));
+
+        client.cancel_transfer_admin(&admin);
+        assert!(client.pending_admin().is_none());
+    }
+
+    #[test]
+    fn test_cancel_transfer_admin_emits_event() {
+        let (e, admin, _owner, _wasm_hash, client) = setup_with_client();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+        client.cancel_transfer_admin(&admin);
+
+        let events = e.events().all();
+        // initialize(1) + propose(1) + cancel(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("adm_canc"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no pending transfer")]
+    fn test_accept_admin_without_proposal_panics() {
+        let (e, _admin, _owner, _wasm_hash, client) = setup_with_client();
+        let someone = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.accept_admin(&someone);
+    }
+
+    #[test]
+    #[should_panic(expected = "unauthorized")]
+    fn test_accept_admin_wrong_caller_panics() {
+        let (e, admin, _owner, _wasm_hash, client) = setup_with_client();
+        let new_admin = Address::generate(&e);
+        let impostor = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.propose_transfer_admin(&admin, &new_admin);
+        client.accept_admin(&impostor);
     }
 
     #[test]
