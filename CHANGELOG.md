@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Indexer-facing events across all contracts for off-chain state reconstruction:
+  - `retirement_registry`: `ret_rec` on `record_retirement`, `auth_set` on `set_authorized_caller`, `init` on `initialize`
+  - `project_registry`: `proj_reg` on `register`, `stat_chg` on `update_status`, `ownr_chg` on `update_owner`, `init` on `initialize`
+  - `credit_factory`: `stat_chg` on `update_project_status`, `ownr_chg` on `update_project_owner`, `init` on `initialize`
+  - `credit_token`: `approved` on `approve`, `adm_xfer` on `set_admin`, `init` on `initialize`
+  - `governance` and `verification_oracle`: `adm_xfer` on `transfer_admin`, `init` on `initialize`
 - Oracle staking and slashing mechanism in `verification_oracle`
 - `stake`, `unstake`, `claim_unstake`, `slash` functions
 - Admin-only `slash` with reason codes (admin flag / fraud proof)

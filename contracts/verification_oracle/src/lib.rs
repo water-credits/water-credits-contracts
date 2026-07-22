@@ -17,6 +17,8 @@ const EVENT_ORACLE_COMMITTED: Symbol = symbol_short!("orc_cmt");
 const EVENT_ORACLE_REVEALED: Symbol = symbol_short!("orc_rvl");
 const EVENT_ORACLE_MISSED_REVEAL: Symbol = symbol_short!("orc_mr");
 const EVENT_WINDOW_OPENED: Symbol = symbol_short!("wnd_opn");
+const EVENT_INITIALIZED: Symbol = symbol_short!("init");
+const EVENT_ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfer");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -593,6 +595,8 @@ impl VerificationOracle {
             max_reveal_ledgers: 60,
         };
         e.storage().instance().set(&DataKey::Config, &config);
+
+        e.events().publish((EVENT_INITIALIZED,), (admin,));
     }
 
     /// Transfer admin rights to a new address. Admin only.
@@ -609,6 +613,9 @@ impl VerificationOracle {
             panic!("unauthorized");
         }
         e.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        e.events()
+            .publish((EVENT_ADMIN_TRANSFERRED,), (stored, new_admin));
     }
 
     /// Add an oracle address to the whitelist. Only admin can call.
@@ -2048,8 +2055,9 @@ impl VerificationOracle {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Events;
     use soroban_sdk::testutils::Ledger as _;
-    use soroban_sdk::InvokeError;
+    use soroban_sdk::{InvokeError, TryFromVal};
 
     fn set_ledger_timestamp(e: &Env, timestamp: u64) {
         let mut info = e.ledger().get();
@@ -4512,5 +4520,45 @@ mod tests {
         let e = Env::default();
         let v = make_i64_vec(&e, &[i64::MAX, i64::MIN, 0]);
         assert_eq!(median_i64(&v), 0);
+    }
+
+    // ── Event tests ──
+
+    #[test]
+    fn test_initialize_emits_event() {
+        let e = Env::default();
+        let admin = Address::generate(&e);
+        let treasury = Address::generate(&e);
+        let staking_token = e.register_contract(None, MockToken);
+        let contract_id = e.register_contract(None, VerificationOracle);
+        let client = VerificationOracleClient::new(&e, &contract_id);
+
+        client.initialize(&admin, &staking_token, &treasury);
+
+        let events = e.events().all();
+        assert_eq!(events.len(), 1);
+        let (_contract, topics, _data) = &events.get(0).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("init"));
+    }
+
+    #[test]
+    fn test_transfer_admin_emits_event() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let new_admin = Address::generate(&e);
+        client.transfer_admin(&admin, &new_admin);
+
+        let events = e.events().all();
+        // initialize(1) + transfer_admin(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("adm_xfer"));
+
+        let (ev_old_admin, ev_new_admin) = <(Address, Address)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_old_admin, admin);
+        assert_eq!(ev_new_admin, new_admin);
     }
 }

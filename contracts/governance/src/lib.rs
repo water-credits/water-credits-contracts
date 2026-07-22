@@ -13,6 +13,8 @@ const EVENT_MEMBER_ADDED: Symbol = symbol_short!("memb_add");
 const EVENT_MEMBER_REMOVED: Symbol = symbol_short!("memb_rmv");
 const EVENT_EMERGENCY_PAUSE: Symbol = symbol_short!("emrg_pse");
 const EVENT_EMERGENCY_UNPAUSE: Symbol = symbol_short!("emrg_ups");
+const EVENT_INITIALIZED: Symbol = symbol_short!("init");
+const EVENT_ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfer");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -198,6 +200,8 @@ impl Governance {
         e.storage()
             .instance()
             .set(&DataKey::RegisteredTokens, &Vec::<Address>::new(&e));
+
+        e.events().publish((EVENT_INITIALIZED,), (admin,));
     }
 
     /// Get the current governance configuration (fee, voting period, thresholds).
@@ -511,6 +515,9 @@ impl Governance {
             panic!("unauthorized");
         }
         e.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        e.events()
+            .publish((EVENT_ADMIN_TRANSFERRED,), (stored, new_admin));
     }
 
     /// Add a new governance member. Admin only.
@@ -718,7 +725,8 @@ impl Governance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
+    use soroban_sdk::TryFromVal;
 
     mod mock_target {
         use soroban_sdk::{contract, contractimpl, contracttype, Env};
@@ -1425,5 +1433,45 @@ mod tests {
         assert!(client.is_protocol_paused());
         let proposal = client.get_proposal(&proposal_id).unwrap();
         assert!(matches!(proposal.status, ProposalStatus::Executed));
+    }
+
+    // ── Event tests ──
+
+    #[test]
+    fn test_initialize_emits_event() {
+        let e = Env::default();
+        let admin = Address::generate(&e);
+        let member1 = Address::generate(&e);
+        let contract_id = e.register_contract(None, Governance);
+        let client = GovernanceClient::new(&e, &contract_id);
+
+        let members: Vec<Address> = Vec::from_array(&e, [member1]);
+        client.initialize(&admin, &members);
+
+        let events = e.events().all();
+        assert_eq!(events.len(), 1);
+        let (_contract, topics, _data) = &events.get(0).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("init"));
+    }
+
+    #[test]
+    fn test_transfer_admin_emits_event() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let new_admin = Address::generate(&e);
+        client.transfer_admin(&admin, &new_admin);
+
+        let events = e.events().all();
+        // initialize(1) + transfer_admin(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("adm_xfer"));
+
+        let (ev_old_admin, ev_new_admin) = <(Address, Address)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_old_admin, admin);
+        assert_eq!(ev_new_admin, new_admin);
     }
 }

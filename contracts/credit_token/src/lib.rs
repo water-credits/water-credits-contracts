@@ -27,6 +27,9 @@ const EVENT_RETIRED: Symbol = symbol_short!("retired");
 const EVENT_BURNED: Symbol = symbol_short!("burned");
 const EVENT_PAUSED: Symbol = symbol_short!("paused");
 const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
+const EVENT_INITIALIZED: Symbol = symbol_short!("init");
+const EVENT_APPROVED: Symbol = symbol_short!("approved");
+const EVENT_ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfer");
 
 // ── Data Types ──
 
@@ -201,7 +204,7 @@ impl CreditToken {
         }
         let timestamp = e.ledger().timestamp();
         let metadata = CreditMetadata {
-            project_id,
+            project_id: project_id.clone(),
             methodology,
             vintage: timestamp,
             issuance_date: timestamp,
@@ -215,6 +218,9 @@ impl CreditToken {
         e.storage().instance().set(&DataKey::TotalBurned, &0i128);
         e.storage().instance().set(&DataKey::Metadata, &metadata);
         e.storage().instance().set(&DataKey::CertCount, &0u64);
+
+        e.events()
+            .publish((EVENT_INITIALIZED,), (admin, project_id));
     }
 
     /// Transfer contract admin rights to a new address.
@@ -225,6 +231,9 @@ impl CreditToken {
             panic!("unauthorized");
         }
         e.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        e.events()
+            .publish((EVENT_ADMIN_TRANSFERRED,), (stored, new_admin));
     }
 
     /// Designate the address allowed to mint credits (typically the verification oracle).
@@ -514,11 +523,16 @@ impl CreditToken {
         }
         from.require_auth();
         save_allowance(&e, &from, &spender, amount);
-        let exp_key = DataKey::AllowanceExpiration(from, spender);
+        let exp_key = DataKey::AllowanceExpiration(from.clone(), spender.clone());
         e.storage().persistent().set(&exp_key, &expiration_ledger);
         e.storage()
             .persistent()
             .extend_ttl(&exp_key, ALLOWANCE_TTL_THRESHOLD, ALLOWANCE_TTL_BUMP);
+
+        // Minimal payload: this event is high-frequency, so we omit the expiration
+        // ledger and rely on the allowance() read for the full current state.
+        e.events()
+            .publish((EVENT_APPROVED,), (from, spender, amount));
     }
 
     /// Permanently retire credits and optionally record in the retirement registry.
@@ -737,8 +751,9 @@ mod tests {
         client.mint_to(&admin, &user, &500);
 
         let events = e.events().all();
-        assert_eq!(events.len(), 1);
-        let (_contract, topics, _data) = &events.get(0).unwrap();
+        // initialize(1) + mint_to(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, _data) = &events.get(1).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("minted"));
     }
@@ -770,8 +785,9 @@ mod tests {
         client.burn(&admin, &user, &300);
 
         let events = e.events().all();
-        assert_eq!(events.len(), 2);
-        let (_contract, topics, _data) = &events.get(1).unwrap();
+        // initialize(1) + mint_to(1) + burn(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("burned"));
     }
@@ -794,14 +810,14 @@ mod tests {
         // Verify the burned events are present (topic check is sufficient;
         // tuple-encoded event data requires XDR decoding which is out of scope here)
         let events = e.events().all();
-        // Events: minted(1) + burned(1) + burned(1) = 3
-        assert_eq!(events.len(), 3);
+        // Events: initialize(1) + minted(1) + burned(1) + burned(1) = 4
+        assert_eq!(events.len(), 4);
 
-        let (_contract, topics1, _data1) = &events.get(1).unwrap();
+        let (_contract, topics1, _data1) = &events.get(2).unwrap();
         let topic1: Symbol = Symbol::try_from_val(&e, &topics1.get(0).unwrap()).unwrap();
         assert_eq!(topic1, symbol_short!("burned"));
 
-        let (_contract, topics2, _data2) = &events.get(2).unwrap();
+        let (_contract, topics2, _data2) = &events.get(3).unwrap();
         let topic2: Symbol = Symbol::try_from_val(&e, &topics2.get(0).unwrap()).unwrap();
         assert_eq!(topic2, symbol_short!("burned"));
     }
@@ -828,8 +844,9 @@ mod tests {
         client.transfer(&user1, &user2, &200);
 
         let events = e.events().all();
-        assert_eq!(events.len(), 2);
-        let (_contract, topics, _data) = &events.get(1).unwrap();
+        // initialize(1) + mint_to(1) + transfer(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("xfer"));
     }
@@ -870,14 +887,13 @@ mod tests {
         client.mint_to(&admin, &owner, &1000);
         client.approve(&owner, &spender, &500, &100000);
 
-        // Clear events from mint + approve
         client.transfer_from(&spender, &owner, &recipient, &200);
 
         // transfer_from should emit an xfer event
-        // Count events: mint(1) + approve(0 events) + transfer_from(1) = 2
+        // Count events: initialize(1) + mint(1) + approve(1) + transfer_from(1) = 4
         let events = e.events().all();
-        assert_eq!(events.len(), 2);
-        let (_contract, topics, _data) = &events.get(1).unwrap();
+        assert_eq!(events.len(), 4);
+        let (_contract, topics, _data) = &events.get(3).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("xfer"));
     }
@@ -1001,8 +1017,9 @@ mod tests {
         client.retire(&user, &200, &purpose, &uri);
 
         let events = e.events().all();
-        assert_eq!(events.len(), 2);
-        let (_contract, topics, _data) = &events.get(1).unwrap();
+        // initialize(1) + mint_to(1) + retire(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("retired"));
     }
@@ -1033,6 +1050,71 @@ mod tests {
         client.set_admin(&admin, &new_admin);
         client.mint_to(&new_admin, &new_admin, &200);
         assert_eq!(client.balance(&new_admin), 200);
+    }
+
+    #[test]
+    fn test_initialize_emits_event() {
+        let e = Env::default();
+        let admin = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[3u8; 32]);
+        let name = String::from_str(&e, "Init Event Credit");
+        let symbol = String::from_str(&e, "IEC");
+        let methodology = String::from_str(&e, "v1");
+        let contract_id = e.register_contract(None, CreditToken);
+        let client = CreditTokenClient::new(&e, &contract_id);
+
+        client.initialize(&admin, &name, &symbol, &project_id, &methodology);
+
+        let events = e.events().all();
+        assert_eq!(events.len(), 1);
+        let (_contract, topics, data) = &events.get(0).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("init"));
+
+        let (ev_admin, ev_project_id) = <(Address, BytesN<32>)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_admin, admin);
+        assert_eq!(ev_project_id, project_id);
+    }
+
+    #[test]
+    fn test_set_admin_emits_event() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        let new_admin = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.set_admin(&admin, &new_admin);
+
+        let events = e.events().all();
+        // initialize(1) + set_admin(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("adm_xfer"));
+
+        let (ev_old_admin, ev_new_admin) = <(Address, Address)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_old_admin, admin);
+        assert_eq!(ev_new_admin, new_admin);
+    }
+
+    #[test]
+    fn test_approve_emits_event() {
+        let (e, _admin, owner, spender, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.approve(&owner, &spender, &100, &100000);
+
+        let events = e.events().all();
+        // initialize(1) + approve(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("approved"));
+
+        let (ev_from, ev_spender, ev_amount) =
+            <(Address, Address, i128)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_from, owner);
+        assert_eq!(ev_spender, spender);
+        assert_eq!(ev_amount, 100);
     }
 
     #[test]

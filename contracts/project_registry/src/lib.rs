@@ -1,10 +1,18 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 use shared::{generate_project_id, is_valid_status, is_valid_status_transition};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 #[cfg(test)]
 extern crate std;
+
+// ── Events ──
+const EVENT_INITIALIZED: Symbol = symbol_short!("init");
+const EVENT_PROJECT_REGISTERED: Symbol = symbol_short!("proj_reg");
+const EVENT_STATUS_CHANGED: Symbol = symbol_short!("stat_chg");
+const EVENT_OWNER_CHANGED: Symbol = symbol_short!("ownr_chg");
 
 // ── TTL constants ──
 /// Projects are permanent registrations: 10 years.
@@ -67,6 +75,8 @@ impl ProjectRegistry {
         }
         e.storage().instance().set(&DataKey::Admin, &admin);
         e.storage().instance().set(&DataKey::ProjectCount, &0u64);
+
+        e.events().publish((EVENT_INITIALIZED,), (admin,));
     }
 
     /// Register a new project. Admin only. Returns the unique project ID.
@@ -109,8 +119,8 @@ impl ProjectRegistry {
 
         let project = ProjectEntry {
             id: project_id.clone(),
-            name,
-            owner,
+            name: name.clone(),
+            owner: owner.clone(),
             latitude,
             longitude,
             methodology,
@@ -136,6 +146,11 @@ impl ProjectRegistry {
         e.storage()
             .instance()
             .set(&DataKey::ProjectCount, &(count + 1));
+
+        e.events().publish(
+            (EVENT_PROJECT_REGISTERED,),
+            (project_id.clone(), owner, name, timestamp),
+        );
 
         project_id
     }
@@ -186,11 +201,15 @@ impl ProjectRegistry {
             panic!("invalid status transition");
         }
 
-        project.status = status;
+        let old_status = project.status.clone();
+        project.status = status.clone();
         e.storage().persistent().set(&key, &project);
         e.storage()
             .persistent()
             .extend_ttl(&key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
+
+        e.events()
+            .publish((EVENT_STATUS_CHANGED,), (project_id, old_status, status));
     }
 
     /// Get the total number of registered projects.
@@ -259,11 +278,15 @@ impl ProjectRegistry {
             panic!("unauthorized");
         }
 
-        project.owner = new_owner;
+        let old_owner = project.owner.clone();
+        project.owner = new_owner.clone();
         e.storage().persistent().set(&key, &project);
         e.storage()
             .persistent()
             .extend_ttl(&key, PROJECT_TTL_THRESHOLD, PROJECT_TTL_BUMP);
+
+        e.events()
+            .publish((EVENT_OWNER_CHANGED,), (project_id, old_owner, new_owner));
     }
 }
 
@@ -271,6 +294,8 @@ impl ProjectRegistry {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::TryFromVal;
 
     fn setup() -> (Env, Address, ProjectRegistryClient<'static>) {
         let e = Env::default();
@@ -676,5 +701,145 @@ mod tests {
         client.update_status(&admin, &id, &String::from_str(&e, "suspended"));
         // This should panic
         client.update_status(&admin, &id, &String::from_str(&e, "completed"));
+    }
+
+    // ── Event tests ──
+
+    #[test]
+    fn test_initialize_emits_event() {
+        let e = Env::default();
+        let admin = Address::generate(&e);
+        let contract_id = e.register_contract(None, ProjectRegistry);
+        let client = ProjectRegistryClient::new(&e, &contract_id);
+
+        client.initialize(&admin);
+
+        let events = e.events().all();
+        assert_eq!(events.len(), 1);
+        let (_contract, topics, _data) = &events.get(0).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("init"));
+    }
+
+    #[test]
+    fn test_register_emits_event() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let owner = Address::generate(&e);
+        let name = String::from_str(&e, "Event Test Project");
+        let methodology = String::from_str(&e, "v1");
+
+        let id = client.register(
+            &admin,
+            &name,
+            &38897700,
+            &(-77036500),
+            &methodology,
+            &owner,
+            &500,
+        );
+
+        let events = e.events().all();
+        // initialize(1) + register(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("proj_reg"));
+
+        let (ev_id, ev_owner, ev_name, _ev_timestamp) =
+            <(BytesN<32>, Address, String, u64)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_id, id);
+        assert_eq!(ev_owner, owner);
+        assert_eq!(ev_name, name);
+    }
+
+    #[test]
+    fn test_update_status_emits_event() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let owner = Address::generate(&e);
+        let id = client.register(
+            &admin,
+            &String::from_str(&e, "Status Event"),
+            &38897700,
+            &(-77036500),
+            &String::from_str(&e, "v1"),
+            &owner,
+            &100,
+        );
+
+        client.update_status(&admin, &id, &String::from_str(&e, "active"));
+
+        let events = e.events().all();
+        // initialize(1) + register(1) + update_status(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, data) = &events.get(2).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("stat_chg"));
+
+        let (ev_id, ev_old, ev_new) =
+            <(BytesN<32>, String, String)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_id, id);
+        assert_eq!(ev_old, String::from_str(&e, "registered"));
+        assert_eq!(ev_new, String::from_str(&e, "active"));
+    }
+
+    #[test]
+    fn test_update_status_noop_does_not_emit_event() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let owner = Address::generate(&e);
+        let id = client.register(
+            &admin,
+            &String::from_str(&e, "Noop Event"),
+            &38897700,
+            &(-77036500),
+            &String::from_str(&e, "v1"),
+            &owner,
+            &100,
+        );
+
+        // Same-status update is a no-op and must not emit a status-changed event.
+        client.update_status(&admin, &id, &String::from_str(&e, "registered"));
+
+        let events = e.events().all();
+        // Only initialize(1) + register(1) should be present — no stat_chg event.
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn test_update_owner_emits_event() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let owner = Address::generate(&e);
+        let new_owner = Address::generate(&e);
+        let id = client.register(
+            &admin,
+            &String::from_str(&e, "Owner Event"),
+            &38897700,
+            &(-77036500),
+            &String::from_str(&e, "v1"),
+            &owner,
+            &100,
+        );
+
+        client.update_owner(&admin, &id, &new_owner);
+
+        let events = e.events().all();
+        // initialize(1) + register(1) + update_owner(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, data) = &events.get(2).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("ownr_chg"));
+
+        let (ev_id, ev_old, ev_new) =
+            <(BytesN<32>, Address, Address)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_id, id);
+        assert_eq!(ev_old, owner);
+        assert_eq!(ev_new, new_owner);
     }
 }

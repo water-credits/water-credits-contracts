@@ -1,8 +1,15 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 #[cfg(test)]
 extern crate std;
+
+// ── Events ──
+const EVENT_INITIALIZED: Symbol = symbol_short!("init");
+const EVENT_RETIREMENT_RECORDED: Symbol = symbol_short!("ret_rec");
+const EVENT_AUTH_CALLER_SET: Symbol = symbol_short!("auth_set");
 
 // ── TTL constants ──
 /// Retirement records are permanent audit trails: 10 years.
@@ -75,6 +82,8 @@ impl RetirementRegistry {
         e.storage().instance().set(&DataKey::Admin, &admin);
         e.storage().instance().set(&DataKey::RecordCount, &0u64);
         e.storage().instance().set(&DataKey::TotalRetired, &0i128);
+
+        e.events().publish((EVENT_INITIALIZED,), (admin,));
     }
 
     /// Record a retirement. Only callable by admin or an authorized caller contract.
@@ -174,6 +183,11 @@ impl RetirementRegistry {
             .instance()
             .set(&DataKey::RecordCount, &record_id);
 
+        e.events().publish(
+            (EVENT_RETIREMENT_RECORDED,),
+            (record_id, retiree, project_id, amount, purpose, timestamp),
+        );
+
         record_id
     }
 
@@ -206,11 +220,14 @@ impl RetirementRegistry {
         if admin != stored {
             panic!("unauthorized");
         }
-        let key = DataKey::AuthorizedCaller(caller);
+        let key = DataKey::AuthorizedCaller(caller.clone());
         e.storage().persistent().set(&key, &authorized);
         e.storage()
             .persistent()
             .extend_ttl(&key, AUTH_TTL_THRESHOLD, AUTH_TTL_BUMP);
+
+        e.events()
+            .publish((EVENT_AUTH_CALLER_SET,), (caller, authorized));
     }
 
     /// Get paginated retirement records for a given retiree address.
@@ -302,6 +319,8 @@ impl RetirementRegistry {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::TryFromVal;
 
     fn setup() -> (Env, Address, RetirementRegistryClient<'static>) {
         let e = Env::default();
@@ -509,5 +528,73 @@ mod tests {
         assert_eq!(client.project_retirement_count(&project_id), 0);
         client.record_retirement(&admin, &retiree, &project_id, &100, &purpose, &uri);
         assert_eq!(client.project_retirement_count(&project_id), 1);
+    }
+
+    // ── Event tests ──
+
+    #[test]
+    fn test_initialize_emits_event() {
+        let e = Env::default();
+        let admin = Address::generate(&e);
+        let contract_id = e.register_contract(None, RetirementRegistry);
+        let client = RetirementRegistryClient::new(&e, &contract_id);
+
+        client.initialize(&admin);
+
+        let events = e.events().all();
+        assert_eq!(events.len(), 1);
+        let (_contract, topics, _data) = &events.get(0).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("init"));
+    }
+
+    #[test]
+    fn test_record_retirement_emits_event() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[9u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        let record_id =
+            client.record_retirement(&admin, &retiree, &project_id, &500, &purpose, &uri);
+
+        let events = e.events().all();
+        // initialize(1) + record_retirement(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("ret_rec"));
+
+        let (ev_id, ev_retiree, ev_project_id, ev_amount, ev_purpose, ev_timestamp) =
+            <(u64, Address, BytesN<32>, i128, String, u64)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_id, record_id);
+        assert_eq!(ev_retiree, retiree);
+        assert_eq!(ev_project_id, project_id);
+        assert_eq!(ev_amount, 500);
+        assert_eq!(ev_purpose, purpose);
+        assert_eq!(ev_timestamp, e.ledger().timestamp());
+    }
+
+    #[test]
+    fn test_set_authorized_caller_emits_event() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let caller = Address::generate(&e);
+        client.set_authorized_caller(&admin, &caller, &true);
+
+        let events = e.events().all();
+        // initialize(1) + set_authorized_caller(1) = 2
+        assert_eq!(events.len(), 2);
+        let (_contract, topics, data) = &events.get(1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("auth_set"));
+
+        let (ev_caller, ev_authorized) = <(Address, bool)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_caller, caller);
+        assert!(ev_authorized);
     }
 }
