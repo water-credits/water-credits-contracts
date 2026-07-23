@@ -121,6 +121,20 @@ pub struct OracleConfig {
     /// Ceiling applied to the computed slash amount, so a single missed
     /// reveal can never wipe out an outsized stake in one shot.
     pub max_slash_amount: i128,
+    pub reputation_reward: u64,
+    pub reputation_penalty: u64,
+    pub reputation_max: u64,
+    pub reputation_bootstrap: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleInfo {
+    pub is_active: bool,
+    pub reputation_score: u64,
+    pub stake: i128,
+    pub submissions: u64,
+    pub missed_reveals: u64,
 }
 
 #[contracttype]
@@ -200,6 +214,7 @@ pub enum DataKey {
     OracleStake(Address),
     OracleSlashed(Address),
     OracleMissedReveals(Address),
+    OracleReputation(Address),
     /// Index of project IDs with open (non-finalized) windows
     OpenProjects,
     // ── Temporary (window-scoped, can expire after finalization) ──
@@ -633,6 +648,10 @@ impl VerificationOracle {
             slash_pct_bps: 1000,
             min_slash_amount: 0,
             max_slash_amount: i128::MAX,
+            reputation_reward: 1,
+            reputation_penalty: 5,
+            reputation_max: 1000,
+            reputation_bootstrap: 100,
         };
         e.storage().instance().set(&DataKey::Config, &config);
 
@@ -703,8 +722,14 @@ impl VerificationOracle {
             .set(&DataKey::OracleCount, &(count + 1));
 
         let mut list: Vec<Address> = e.storage().instance().get(&DataKey::OracleList).unwrap();
-        list.push_back(oracle);
+        list.push_back(oracle.clone());
         e.storage().instance().set(&DataKey::OracleList, &list);
+
+        let rep_key = DataKey::OracleReputation(oracle);
+        if !e.storage().persistent().has(&rep_key) {
+            e.storage().persistent().set(&rep_key, &config.reputation_bootstrap);
+            e.storage().persistent().extend_ttl(&rep_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+        }
     }
 
     /// Remove an oracle from the whitelist. Must maintain at least min_oracles.
@@ -766,6 +791,34 @@ impl VerificationOracle {
             .persistent()
             .get(&DataKey::OracleActive(oracle))
             .unwrap_or(false)
+    }
+
+    /// Get detailed information about an oracle, including its reputation score.
+    pub fn get_oracle_info(e: Env, oracle: Address) -> OracleInfo {
+        let is_active = Self::is_oracle_active(e.clone(), oracle.clone());
+        let rep_key = DataKey::OracleReputation(oracle.clone());
+        let config: OracleConfig = read_config(&e);
+        let reputation_score = e.storage().persistent().get(&rep_key).unwrap_or(config.reputation_bootstrap);
+        
+        let stake_key = DataKey::OracleStake(oracle.clone());
+        let stake_info: StakeInfo = e.storage().persistent().get(&stake_key).unwrap_or(StakeInfo {
+            amount: 0,
+            unstake_request: None,
+        });
+
+        let submit_key = DataKey::OracleSubmitCount(oracle.clone());
+        let submissions = e.storage().persistent().get(&submit_key).unwrap_or(0);
+
+        let missed_key = DataKey::OracleMissedReveals(oracle);
+        let missed_reveals = e.storage().persistent().get(&missed_key).unwrap_or(0);
+
+        OracleInfo {
+            is_active,
+            reputation_score,
+            stake: stake_info.amount,
+            submissions,
+            missed_reveals,
+        }
     }
 
     /// Get the list of all currently active oracle addresses.
@@ -1895,6 +1948,13 @@ impl VerificationOracle {
                     ORACLE_TTL_BUMP,
                 );
 
+                // Decrement reputation
+                let rep_key = DataKey::OracleReputation(oracle.clone());
+                let rep: u64 = e.storage().persistent().get(&rep_key).unwrap_or(config.reputation_bootstrap);
+                let new_rep = rep.saturating_sub(config.reputation_penalty);
+                e.storage().persistent().set(&rep_key, &new_rep);
+                e.storage().persistent().extend_ttl(&rep_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+
                 // Slash the oracle's stake
                 let stake_key = DataKey::OracleStake(oracle.clone());
                 let mut stake_info: StakeInfo =
@@ -1971,6 +2031,15 @@ impl VerificationOracle {
         let config: OracleConfig = read_config(&e);
         let subs = &window.submissions;
         let n_subs = subs.len();
+
+        for k in 0..n_subs {
+            let s = subs.get(k).unwrap();
+            let rep_key = DataKey::OracleReputation(s.oracle.clone());
+            let rep: u64 = e.storage().persistent().get(&rep_key).unwrap_or(config.reputation_bootstrap);
+            let new_rep = rep.saturating_add(config.reputation_reward).min(config.reputation_max);
+            e.storage().persistent().set(&rep_key, &new_rep);
+            e.storage().persistent().extend_ttl(&rep_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+        }
 
         if n_subs < config.min_oracles {
             return None;
@@ -2564,6 +2633,10 @@ mod tests {
             slash_pct_bps: 1000,
             min_slash_amount: 0,
             max_slash_amount: i128::MAX,
+            reputation_reward: 1,
+            reputation_penalty: 5,
+            reputation_max: 1000,
+            reputation_bootstrap: 100,
         };
         client.update_config(&admin, &new_config);
 
@@ -4792,5 +4865,154 @@ mod tests {
         let (ev_old_admin, ev_new_admin) = <(Address, Address)>::try_from_val(&e, data).unwrap();
         assert_eq!(ev_old_admin, admin);
         assert_eq!(ev_new_admin, new_admin);
+    }
+
+    #[test]
+    fn test_reputation_bootstrap() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+        client.add_oracle(&admin, &oracle);
+        let info = client.get_oracle_info(&oracle);
+        assert_eq!(info.reputation_score, 100);
+    }
+
+    #[test]
+    fn test_reputation_increment_on_reveal() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1000);
+        let project_id = BytesN::from_array(&e, &[1; 32]);
+        
+        let salt = BytesN::from_array(&e, &[0; 32]);
+        let reading = (700, 10, 80, 10, 200, 5, 1);
+        
+        client.open_window(&admin, &project_id);
+        commit_reveal_round_no_open(&e, &client, &project_id, &oracles, 1, &[reading, reading, reading], &salt);
+        
+        for i in 0..oracles.len() {
+            let o = oracles.get(i).unwrap();
+            let info = client.get_oracle_info(&o);
+            assert_eq!(info.reputation_score, 101); // 100 + 1
+        }
+    }
+
+    #[test]
+    fn test_reputation_decrement_on_miss() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1000);
+        let project_id = BytesN::from_array(&e, &[1; 32]);
+        let salt = BytesN::from_array(&e, &[0; 32]);
+        let reading = (700, 10, 80, 10, 200, 5, 1);
+        
+        client.open_window(&admin, &project_id);
+        
+        // Commit all 3
+        for i in 0..3 {
+            let o = oracles.get(i as u32).unwrap();
+            let commitment = sha256_commitment(&e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt);
+            client.commit_reading(&o, &project_id, &1, &commitment);
+        }
+        
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(&project_id);
+        
+        // Only Oracle 0 & 1 reveal
+        for i in 0..2 {
+            let o = oracles.get(i as u32).unwrap();
+            let params = make_reveal_params(&e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt);
+            client.reveal_reading(&o, &project_id, &params);
+        }
+        
+        // Advance time to force end of window
+        advance_past_reveal_phase(&e);
+        client.finalize_window(&project_id);
+        
+        // Oracle 0 & 1 incremented (+1), Oracle 2 missed (-5)
+        let info0 = client.get_oracle_info(&oracles.get(0).unwrap());
+        assert_eq!(info0.reputation_score, 101);
+        
+        let info2 = client.get_oracle_info(&oracles.get(2).unwrap());
+        assert_eq!(info2.reputation_score, 95);
+    }
+    
+    #[test]
+    fn test_reputation_bounds() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        
+        let mut config = client.get_config();
+        config.min_stake = 0;
+        config.min_oracles = 2;
+        config.reputation_penalty = 200;
+        config.reputation_reward = 950; // To easily hit max
+        client.update_config(&admin, &config);
+        
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1000);
+        let project_id = BytesN::from_array(&e, &[1; 32]);
+        let salt = BytesN::from_array(&e, &[0; 32]);
+        let reading = (700, 10, 80, 10, 200, 5, 1);
+        
+        client.open_window(&admin, &project_id);
+        
+        for i in 0..3 {
+            let o = oracles.get(i as u32).unwrap();
+            let commitment = sha256_commitment(&e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt);
+            client.commit_reading(&o, &project_id, &1, &commitment);
+        }
+        
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(&project_id);
+        
+        // Only Oracle 0 reveals
+        let params = make_reveal_params(&e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt);
+        client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params);
+        
+        advance_past_reveal_phase(&e);
+        client.finalize_window(&project_id); // missed reveal, -200, should bound at 0
+        
+        let info2 = client.get_oracle_info(&oracles.get(2).unwrap());
+        assert_eq!(info2.reputation_score, 0); // 100 - 200 clamped to 0
+        
+        // Let's do a successful round with a new oracle to test upper bound
+        let project_id2 = BytesN::from_array(&e, &[2; 32]);
+        client.open_window(&admin, &project_id2);
+        
+        let o2 = Address::generate(&e);
+        client.stake(&o2, &1000);
+        client.add_oracle(&admin, &o2);
+        
+        let mut single_oracle2 = Vec::new(&e);
+        single_oracle2.push_back(o2.clone());
+        commit_reveal_round_no_open(&e, &client, &project_id2, &single_oracle2, 1, &[reading], &salt);
+        
+        advance_past_reveal_phase(&e);
+        client.finalize_window(&project_id2);
+        
+        // New oracle had 100, now +950 = 1050 clamped to 1000
+        let info_new = client.get_oracle_info(&o2);
+        assert_eq!(info_new.reputation_score, 1000); 
+    }
+    
+    #[test]
+    fn test_reputation_multiple_windows() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1000);
+        let project_id = BytesN::from_array(&e, &[1; 32]);
+        let salt = BytesN::from_array(&e, &[0; 32]);
+        let reading = (700, 10, 80, 10, 200, 5, 1);
+        
+        for w in 1..4 {
+            client.open_window(&admin, &project_id);
+            commit_reveal_round_no_open(&e, &client, &project_id, &oracles, w as u64, &[reading, reading, reading], &salt);
+        }
+        
+        for i in 0..oracles.len() {
+            let o = oracles.get(i).unwrap();
+            let info = client.get_oracle_info(&o);
+            assert_eq!(info.reputation_score, 103);
+        }
     }
 }
