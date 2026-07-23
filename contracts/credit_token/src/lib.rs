@@ -64,6 +64,7 @@ pub enum DataKey {
     RetirementRegistry,
     TotalSupply,
     TotalRetired,
+    EverMinted,
     /// Running total of credits destroyed via `burn()` (admin-only, no retirement record).
     /// Maintained separately from `TotalRetired` so that supply conservation can be
     /// verified on-chain: `total_supply + total_retired + total_burned == ever_minted`.
@@ -166,6 +167,17 @@ fn save_total_burned(e: &Env, amount: i128) {
     e.storage().instance().set(&DataKey::TotalBurned, &amount);
 }
 
+fn read_ever_minted(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&DataKey::EverMinted)
+        .unwrap_or(0)
+}
+
+fn save_ever_minted(e: &Env, amount: i128) {
+    e.storage().instance().set(&DataKey::EverMinted, &amount);
+}
+
 fn read_allowance(e: &Env, from: &Address, spender: &Address) -> i128 {
     let key = DataKey::Allowance(from.clone(), spender.clone());
     let val: i128 = e.storage().persistent().get(&key).unwrap_or(0);
@@ -216,6 +228,7 @@ impl CreditToken {
         e.storage().instance().set(&DataKey::TotalSupply, &0i128);
         e.storage().instance().set(&DataKey::TotalRetired, &0i128);
         e.storage().instance().set(&DataKey::TotalBurned, &0i128);
+        e.storage().instance().set(&DataKey::EverMinted, &0i128);
         e.storage().instance().set(&DataKey::Metadata, &metadata);
         e.storage().instance().set(&DataKey::CertCount, &0u64);
 
@@ -353,6 +366,7 @@ impl CreditToken {
         require_minter(&e, &minter);
 
         let total = read_total_supply(&e);
+        let ever_minted = read_ever_minted(&e);
         let max: i128 = e.storage().instance().get(&DataKey::MaxSupply).unwrap_or(0);
         if max > 0 && total.checked_add(amount).expect("overflow") > max {
             panic!("max supply exceeded");
@@ -361,6 +375,7 @@ impl CreditToken {
         let balance = read_balance(&e, &to);
         save_balance(&e, &to, balance.checked_add(amount).expect("overflow"));
         save_total_supply(&e, total.checked_add(amount).expect("overflow"));
+        save_ever_minted(&e, ever_minted.checked_add(amount).expect("overflow"));
 
         e.events().publish((EVENT_MINTED,), (to, amount));
     }
@@ -379,6 +394,7 @@ impl CreditToken {
         require_minter(&e, &minter);
 
         let mut total = read_total_supply(&e);
+        let mut ever_minted = read_ever_minted(&e);
         let max: i128 = e.storage().instance().get(&DataKey::MaxSupply).unwrap_or(0);
 
         for i in 0..recipients.len() {
@@ -393,10 +409,12 @@ impl CreditToken {
             let balance = read_balance(&e, &to);
             save_balance(&e, &to, balance.checked_add(amount).expect("overflow"));
             total = total.checked_add(amount).expect("overflow");
+            ever_minted = ever_minted.checked_add(amount).expect("overflow");
             e.events().publish((EVENT_MINTED,), (to, amount));
         }
 
         save_total_supply(&e, total);
+        save_ever_minted(&e, ever_minted);
     }
 
     /// Burn credits from a holder. Admin only.
@@ -642,6 +660,30 @@ impl CreditToken {
     /// where `ever_minted` is the cumulative sum of all `mint_to` / `batch_mint_to` calls.
     pub fn total_burned(e: Env) -> i128 {
         read_total_burned(&e)
+    }
+
+    /// Cumulative sum of all minted credits.
+    pub fn ever_minted(e: Env) -> i128 {
+        read_ever_minted(&e)
+    }
+
+    /// Checks the supply conservation invariant on-chain.
+    /// Returns (total_supply, total_retired, total_burned, ever_minted, is_valid).
+    /// Panics if the invariant is violated.
+    pub fn verify_invariant(e: Env) -> (i128, i128, i128, i128, bool) {
+        let supply = read_total_supply(&e);
+        let retired = read_total_retired(&e);
+        let burned = read_total_burned(&e);
+        let minted = read_ever_minted(&e);
+
+        let sum = supply.checked_add(retired).expect("overflow").checked_add(burned).expect("overflow");
+        let is_valid = sum == minted;
+
+        if !is_valid {
+            panic!("supply invariant violated");
+        }
+
+        (supply, retired, burned, minted, is_valid)
     }
 
     pub fn allowance(e: Env, from: Address, spender: Address) -> i128 {
@@ -1333,5 +1375,97 @@ mod tests {
             }
         }
         assert!(found);
+    }
+    #[test]
+    fn test_invariant_holds_after_mint() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        let recipient = Address::generate(&e);
+        client.mint_to(&admin, &recipient, &1000);
+
+        let (supply, retired, burned, minted, is_valid) = client.verify_invariant();
+        assert!(is_valid);
+        assert_eq!(supply, 1000);
+        assert_eq!(retired, 0);
+        assert_eq!(burned, 0);
+        assert_eq!(minted, 1000);
+        assert_eq!(client.ever_minted(), 1000);
+    }
+
+    #[test]
+    fn test_invariant_holds_after_retire() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        let recipient = Address::generate(&e);
+        client.mint_to(&admin, &recipient, &1000);
+
+        client.retire(
+            &recipient,
+            &500,
+            &String::from_str(&e, "Retirement purpose"),
+            &String::from_str(&e, "Metadata"),
+        );
+
+        let (supply, retired, burned, minted, is_valid) = client.verify_invariant();
+        assert!(is_valid);
+        assert_eq!(supply, 500);
+        assert_eq!(retired, 500);
+        assert_eq!(burned, 0);
+        assert_eq!(minted, 1000);
+        assert_eq!(client.ever_minted(), 1000);
+    }
+
+    #[test]
+    fn test_invariant_holds_after_burn() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        let recipient = Address::generate(&e);
+        client.mint_to(&admin, &recipient, &1000);
+
+        client.burn(&admin, &recipient, &300);
+
+        let (supply, retired, burned, minted, is_valid) = client.verify_invariant();
+        assert!(is_valid);
+        assert_eq!(supply, 700);
+        assert_eq!(retired, 0);
+        assert_eq!(burned, 300);
+        assert_eq!(minted, 1000);
+        assert_eq!(client.ever_minted(), 1000);
+    }
+
+    #[test]
+    fn test_ever_minted_tracks_cumulative() {
+        let (e, admin, _user1, _user2, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        let r1 = Address::generate(&e);
+        let r2 = Address::generate(&e);
+
+        client.mint_to(&admin, &r1, &500);
+        
+        let mut recipients = Vec::new(&e);
+        recipients.push_back(r1.clone());
+        recipients.push_back(r2.clone());
+        let mut amounts = Vec::new(&e);
+        amounts.push_back(250);
+        amounts.push_back(250);
+        
+        client.batch_mint_to(&admin, &recipients, &amounts);
+
+        assert_eq!(client.ever_minted(), 1000);
+
+        client.burn(&admin, &r1, &100);
+        client.retire(&r2, &250, &String::from_str(&e, "Purpose"), &String::from_str(&e, "Meta"));
+
+        let (supply, retired, burned, minted, is_valid) = client.verify_invariant();
+        assert!(is_valid);
+        assert_eq!(supply, 650);
+        assert_eq!(retired, 250);
+        assert_eq!(burned, 100);
+        assert_eq!(minted, 1000);
+        assert_eq!(client.ever_minted(), 1000);
     }
 }
