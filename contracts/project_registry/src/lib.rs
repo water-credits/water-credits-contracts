@@ -99,6 +99,12 @@ impl ProjectRegistry {
         if name.len() == 0 {
             panic!("name must not be empty");
         }
+        if name.len() > 128 {
+            panic!("name too long");
+        }
+        if methodology.len() > 128 {
+            panic!("methodology too long");
+        }
         if area_hectares == 0 {
             panic!("area must be positive");
         }
@@ -701,6 +707,54 @@ mod tests {
         client.update_status(&admin, &id, &String::from_str(&e, "suspended"));
         // This should panic
         client.update_status(&admin, &id, &String::from_str(&e, "completed"));
+    }
+
+    #[test]
+    fn test_register_128_char_name_succeeds() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let owner = Address::generate(&e);
+        let mut name_bytes = [0u8; 128];
+        name_bytes.fill(b'A');
+        let name = String::from_str(&e, core::str::from_utf8(&name_bytes).unwrap());
+        let methodology = String::from_str(&e, "v1");
+
+        let id = client.register(
+            &admin,
+            &name,
+            &38897700,
+            &(-77036500),
+            &methodology,
+            &owner,
+            &500,
+        );
+
+        let project = client.get(&id).unwrap();
+        assert_eq!(project.name, name);
+    }
+
+    #[test]
+    #[should_panic(expected = "name too long")]
+    fn test_register_129_char_name_panics() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let owner = Address::generate(&e);
+        let mut name_bytes = [0u8; 129];
+        name_bytes.fill(b'A');
+        let name = String::from_str(&e, core::str::from_utf8(&name_bytes).unwrap());
+        let methodology = String::from_str(&e, "v1");
+
+        client.register(
+            &admin,
+            &name,
+            &38897700,
+            &(-77036500),
+            &methodology,
+            &owner,
+            &500,
+        );
     }
 
     // ── Event tests ──

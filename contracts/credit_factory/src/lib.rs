@@ -101,6 +101,12 @@ impl CreditFactory {
         if name.len() == 0 {
             panic!("name must not be empty");
         }
+        if name.len() > 128 {
+            panic!("name too long");
+        }
+        if methodology.len() > 128 {
+            panic!("methodology too long");
+        }
         if !(-90000000..=90000000).contains(&latitude) {
             panic!("invalid latitude");
         }

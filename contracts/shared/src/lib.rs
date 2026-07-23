@@ -92,6 +92,13 @@ pub fn generate_project_id(
     longitude: i64,
     area_hectares: u64,
 ) -> BytesN<32> {
+    if name.len() > 128 {
+        panic!("name too long");
+    }
+    if methodology.len() > 128 {
+        panic!("methodology too long");
+    }
+
     let mut preimage: Bytes = Bytes::new(e);
 
     let count_bytes = count.to_be_bytes();
@@ -104,6 +111,7 @@ pub fn generate_project_id(
     preimage.append(&Bytes::from_array(e, &name_len.to_be_bytes()));
     let name_len_usize = name_len as usize;
     if name_len_usize > 0 {
+        // Safe: name is bounded to 128 bytes by validation above
         let mut name_buf = [0u8; 256];
         name.copy_into_slice(&mut name_buf[..name_len_usize]);
         preimage.append(&Bytes::from_slice(e, &name_buf[..name_len_usize]));
@@ -113,6 +121,7 @@ pub fn generate_project_id(
     preimage.append(&Bytes::from_array(e, &methodology_len.to_be_bytes()));
     let methodology_len_usize = methodology_len as usize;
     if methodology_len_usize > 0 {
+        // Safe: methodology is bounded to 128 bytes by validation above
         let mut methodology_buf = [0u8; 256];
         methodology.copy_into_slice(&mut methodology_buf[..methodology_len_usize]);
         preimage.append(&Bytes::from_slice(
@@ -369,6 +378,41 @@ mod tests {
         let name = String::from_str(&e, "A");
         let methodology = String::from_str(&e, "B");
         let id = generate_project_id(&e, 42, 9999, &name, &methodology, 1, 2, 3);
+        assert_eq!(id.len(), 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "name too long")]
+    fn test_name_too_long() {
+        let e = Env::default();
+        let mut name_bytes = [0u8; 129];
+        name_bytes.fill(b'A');
+        let name = String::from_str(&e, core::str::from_utf8(&name_bytes).unwrap());
+        let methodology = String::from_str(&e, "B");
+        generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "methodology too long")]
+    fn test_methodology_too_long() {
+        let e = Env::default();
+        let name = String::from_str(&e, "A");
+        let mut meth_bytes = [0u8; 129];
+        meth_bytes.fill(b'B');
+        let methodology = String::from_str(&e, core::str::from_utf8(&meth_bytes).unwrap());
+        generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
+    }
+
+    #[test]
+    fn test_max_length_success() {
+        let e = Env::default();
+        let mut name_bytes = [0u8; 128];
+        name_bytes.fill(b'A');
+        let name = String::from_str(&e, core::str::from_utf8(&name_bytes).unwrap());
+        let mut meth_bytes = [0u8; 128];
+        meth_bytes.fill(b'B');
+        let methodology = String::from_str(&e, core::str::from_utf8(&meth_bytes).unwrap());
+        let id = generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
         assert_eq!(id.len(), 32);
     }
 }
