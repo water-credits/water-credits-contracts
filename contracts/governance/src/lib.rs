@@ -100,7 +100,8 @@ pub struct VoteCounts {
 ///
 /// Instance:   Admin, Config, MemberCount, ProposalCount, ProtocolPaused,
 ///             RegisteredTokens, ActiveProposals
-/// Persistent: Member(Address), Proposal(u64), HasVoted(u64, Address)
+/// Persistent: Member(Address), Proposal(u64), HasVoted(u64, Address),
+///             IsRegisteredToken(Address)
 #[contracttype]
 pub enum DataKey {
     // ── Instance ──
@@ -115,6 +116,11 @@ pub enum DataKey {
     Member(Address),
     Proposal(u64),
     HasVoted(u64, Address),
+    /// O(1) dedup flag for the token registry (issue #63). Set to `true`
+    /// by `register_token`, removed by `deregister_token`. Lives in
+    /// persistent storage because the key is unbounded (one entry per
+    /// registered credit-token contract address, in principle).
+    IsRegisteredToken(Address),
 }
 
 // ── TTL constants ──
@@ -125,6 +131,9 @@ const PROPOSAL_TTL_THRESHOLD: u32 = 12_614_400;
 const PROPOSAL_TTL_BUMP: u32 = 12_614_400;
 const VOTED_TTL_THRESHOLD: u32 = 12_614_400;
 const VOTED_TTL_BUMP: u32 = 12_614_400;
+/// Token-registry dedup flags have the same lifetime as members/proposals.
+const TOKEN_REG_TTL_THRESHOLD: u32 = 12_614_400;
+const TOKEN_REG_TTL_BUMP: u32 = 12_614_400;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -591,23 +600,36 @@ impl Governance {
 
     /// Register a credit token contract address so it can be paused/unpaused
     /// by governance during an emergency. Admin only.
+    ///
+    /// Gas optimization (issue #63): dedup is an O(1) persistent-storage
+    /// lookup via `DataKey::IsRegisteredToken`, replacing the previous
+    /// linear scan of the `RegisteredTokens` Vec. The Vec is still kept
+    /// as the source of truth for iteration in `do_pause` / `do_unpause`
+    /// and for `list_registered_tokens`.
+    ///
+    /// Idempotent: re-registering an already-present token is a no-op.
     pub fn register_token(e: Env, admin: Address, token: Address) {
         admin.require_auth();
-        let stored: Address = read_admin(&e);
-        if admin != stored {
+        if admin != read_admin(&e) {
             panic!("unauthorized");
         }
+        let reg_key = DataKey::IsRegisteredToken(token.clone());
+        if e.storage().persistent().has(&reg_key) {
+            // Idempotent: already registered, nothing to do.
+            return;
+        }
+        e.storage().persistent().set(&reg_key, &true);
+        e.storage().persistent().extend_ttl(
+            &reg_key,
+            TOKEN_REG_TTL_THRESHOLD,
+            TOKEN_REG_TTL_BUMP,
+        );
+
         let mut tokens: Vec<Address> = e
             .storage()
             .instance()
             .get(&DataKey::RegisteredTokens)
             .unwrap_or_else(|| Vec::new(&e));
-        // Idempotent: only add if not already present.
-        for i in 0..tokens.len() {
-            if tokens.get(i).unwrap() == token {
-                return;
-            }
-        }
         tokens.push_back(token);
         e.storage()
             .instance()
@@ -615,12 +637,22 @@ impl Governance {
     }
 
     /// Remove a credit token contract from the governance registry. Admin only.
+    ///
+    /// Gas optimization (issue #63): pre-check the O(1) dedup flag and
+    /// skip the Vec rebuild entirely if the token is not present.
+    /// Idempotent: deregistering an absent token is a no-op.
     pub fn deregister_token(e: Env, admin: Address, token: Address) {
         admin.require_auth();
-        let stored: Address = read_admin(&e);
-        if admin != stored {
+        if admin != read_admin(&e) {
             panic!("unauthorized");
         }
+        let reg_key = DataKey::IsRegisteredToken(token.clone());
+        if !e.storage().persistent().has(&reg_key) {
+            // Idempotent: not registered, nothing to do.
+            return;
+        }
+        e.storage().persistent().remove(&reg_key);
+
         let tokens: Vec<Address> = e
             .storage()
             .instance()

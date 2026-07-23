@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Symbol,
-    Val, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, Map, String,
+    Symbol, Val, Vec,
 };
 
 use soroban_sdk::IntoVal;
@@ -366,9 +366,13 @@ impl CreditToken {
     }
 
     /// Mint credits to multiple recipients in a single call.
-    /// Each entry in `recipients` receives the corresponding amount from `amounts`.
-    /// The two slices must be the same length. Callable by admin or designated minter.
+    /// Duplicate recipient entries are aggregated so each unique address
+    /// is read and written exactly once. Callable by admin or minter.
     pub fn batch_mint_to(e: Env, minter: Address, recipients: Vec<Address>, amounts: Vec<i128>) {
+        // Gas optimization (issue #63): same-recipient entries collapse to a
+        // single read+write. Per-original-mint events are still emitted for
+        // off-chain indexers; if the cap check fails everything reverts
+        // atomically along with state writes.
         if recipients.len() != amounts.len() {
             panic!("recipients and amounts length mismatch");
         }
@@ -378,25 +382,47 @@ impl CreditToken {
         require_not_paused(&e);
         require_minter(&e, &minter);
 
-        let mut total = read_total_supply(&e);
-        let max: i128 = e.storage().instance().get(&DataKey::MaxSupply).unwrap_or(0);
+        let mut total_mint: i128 = 0;
+        let mut deltas: Map<Address, i128> = Map::new(&e);
 
+        // Single pass: validate every amount, accumulate per-recipient
+        // deltas in a host-side map, and emit one event per original mint
+        // (in original order) so off-chain indexers see the same sequence.
         for i in 0..recipients.len() {
             let to = recipients.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
             if amount <= 0 {
                 panic!("amount must be positive");
             }
-            if max > 0 && total.checked_add(amount).expect("overflow") > max {
-                panic!("max supply exceeded");
-            }
-            let balance = read_balance(&e, &to);
-            save_balance(&e, &to, balance.checked_add(amount).expect("overflow"));
-            total = total.checked_add(amount).expect("overflow");
+            total_mint = total_mint.checked_add(amount).expect("overflow");
+
+            let current_delta = deltas.get(to.clone()).unwrap_or(0);
+            deltas.set(
+                to.clone(),
+                current_delta.checked_add(amount).expect("overflow"),
+            );
             e.events().publish((EVENT_MINTED,), (to, amount));
         }
 
-        save_total_supply(&e, total);
+        let total = read_total_supply(&e);
+        let max: i128 = e.storage().instance().get(&DataKey::MaxSupply).unwrap_or(0);
+        if max > 0 && total.checked_add(total_mint).expect("overflow") > max {
+            panic!("max supply exceeded");
+        }
+
+        // Apply aggregated balance updates: one read + one write per
+        // unique recipient (not per original mint entry).
+        for addr in deltas.keys() {
+            let delta = deltas.get(addr.clone()).unwrap();
+            let balance = read_balance(&e, &addr);
+            save_balance(
+                &e,
+                &addr,
+                balance.checked_add(delta).expect("overflow"),
+            );
+        }
+
+        save_total_supply(&e, total.checked_add(total_mint).expect("overflow"));
     }
 
     /// Burn credits from a holder. Admin only.
@@ -444,10 +470,13 @@ impl CreditToken {
         e.events().publish((EVENT_XFER,), (from, to, amount));
     }
 
-    /// Transfer credits from one holder to multiple recipients in a single call.
-    /// The sender's balance is debited the total of all amounts atomically.
-    /// Each recipient receives the corresponding amount.
+    /// Transfer credits from one holder to multiple recipients atomically.
+    /// Duplicate recipient entries are aggregated so the sender is
+    /// debited once and each unique address is read+written once.
     pub fn batch_transfer(e: Env, from: Address, recipients: Vec<Address>, amounts: Vec<i128>) {
+        // Gas optimization (issue #63): same-recipient entries collapse to
+        // a single read+write. Sender balance check happens after per-entry
+        // validation so the whole batch reverts on insufficient balance.
         if recipients.len() != amounts.len() {
             panic!("recipients and amounts length mismatch");
         }
@@ -457,29 +486,49 @@ impl CreditToken {
         require_not_paused(&e);
         from.require_auth();
 
-        // Calculate total amount to deduct from sender
         let mut total_amount: i128 = 0;
-        for i in 0..amounts.len() {
+        let mut deltas: Map<Address, i128> = Map::new(&e);
+
+        // Single pass: validate every amount, accumulate per-recipient
+        // deltas in a host-side map, and emit one event per original
+        // transfer entry (in original order) so off-chain indexers see
+        // the same sequence as the unoptimized implementation.
+        for i in 0..recipients.len() {
+            let to = recipients.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
             if amount <= 0 {
                 panic!("amount must be positive");
             }
             total_amount = total_amount.checked_add(amount).expect("overflow");
+
+            let current_delta = deltas.get(to.clone()).unwrap_or(0);
+            deltas.set(
+                to.clone(),
+                current_delta.checked_add(amount).expect("overflow"),
+            );
+            e.events()
+                .publish((EVENT_XFER,), (from.clone(), to, amount));
         }
 
+        // Sender is debited exactly once after all per-entry amounts
+        // have been validated. If the balance is insufficient the entire
+        // batch reverts (atomic via the host VM panic).
         let from_balance = read_balance(&e, &from);
         if from_balance < total_amount {
             panic!("insufficient balance");
         }
         save_balance(&e, &from, from_balance - total_amount);
 
-        for i in 0..recipients.len() {
-            let to = recipients.get(i).unwrap();
-            let amount = amounts.get(i).unwrap();
-            let to_balance = read_balance(&e, &to);
-            save_balance(&e, &to, to_balance.checked_add(amount).expect("overflow"));
-            e.events()
-                .publish((EVENT_XFER,), (from.clone(), to, amount));
+        // Apply aggregated balance updates: one read + one write per
+        // unique recipient (not per original transfer entry).
+        for addr in deltas.keys() {
+            let delta = deltas.get(addr.clone()).unwrap();
+            let to_balance = read_balance(&e, &addr);
+            save_balance(
+                &e,
+                &addr,
+                to_balance.checked_add(delta).expect("overflow"),
+            );
         }
     }
 

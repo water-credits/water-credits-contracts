@@ -346,6 +346,14 @@ fn compute_slash_amount(stake: i128, config: &OracleConfig) -> i128 {
         .min(stake)
 }
 
+/// Track a project that has at least one open submission window.
+///
+/// Note (issue #63): this function performs a linear scan of
+/// `OpenProjects` for dedup, which is acceptable given the protocol's
+/// `max_oracles = 10` upper bound on concurrent windows. No secondary
+/// O(1) key has been introduced: the saved gas does not justify the
+/// extra storage entry, and the scan remains bounded by a small
+/// constant under normal operating conditions.
 fn add_open_project(e: &Env, project_id: &BytesN<32>) {
     let mut open: Vec<BytesN<32>> = e
         .storage()

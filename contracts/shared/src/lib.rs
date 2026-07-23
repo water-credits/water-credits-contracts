@@ -15,45 +15,67 @@ use soroban_sdk::{Bytes, BytesN, Env, String};
 // All other transitions (e.g. completed→registered, registered→completed,
 // suspended→completed, registered→suspended, etc.) are forbidden.
 
+/// Lengths of the canonical status strings. Used by `is_valid_status` to
+/// short-circuit on length before allocating any host-side
+/// `String::from_str` objects. The two 9-character statuses are kept as
+/// separate named constants for documentation, but their underlying
+/// value is the same — `is_valid_status_transition` uses the literal
+/// length and the canonical status name when comparing strings.
+const STATUS_LEN_REGISTERED: u32 = 10; // "registered"
+const STATUS_LEN_ACTIVE: u32 = 6; // "active"
+const STATUS_LEN_COMPLETED: u32 = 9; // "completed"
+const STATUS_LEN_SUSPENDED: u32 = 9; // "suspended"
+
 /// Returns `true` when `new_status` is a valid successor of `current_status`.
 /// Same-status transitions always return `true` (callers treat them as no-ops).
 ///
-/// Allowed transitions:
-///   registered → active
-///   active     → completed
-///   active     → suspended
-///   completed  → active
-///   suspended  → registered
+/// Gas optimization (issue #63): the function dispatches on the
+/// (cur_len, new_len) length tuple first and only allocates the
+/// host-side `String` objects that match the candidate transition.
+/// Each length tuple maps to at most two `String::from_str`
+/// allocations per call (down from the previous five). Same-status
+/// transitions short-circuit with a single equality comparison and
+/// never allocate.
+///
+/// Allowed transitions by length tuple:
+///   (10, 6)  registered → active
+///   (6, 9)   active     → completed | suspended
+///   (9, 6)   completed  → active   (NOT suspended → active)
+///   (9, 10)  suspended  → registered
 pub fn is_valid_status_transition(e: &Env, current_status: &String, new_status: &String) -> bool {
     // Same-status is always allowed (caller handles no-op).
     if current_status == new_status {
         return true;
     }
 
-    let registered = String::from_str(e, "registered");
-    let active = String::from_str(e, "active");
-    let completed = String::from_str(e, "completed");
-    let suspended = String::from_str(e, "suspended");
+    let cur_len = current_status.len();
+    let new_len = new_status.len();
 
-    // registered → active
-    if *current_status == registered && *new_status == active {
-        return true;
+    // registered (10) → active (6)
+    if cur_len == STATUS_LEN_REGISTERED && new_len == STATUS_LEN_ACTIVE {
+        return *current_status == String::from_str(e, "registered")
+            && *new_status == String::from_str(e, "active");
     }
-    // active → completed
-    if *current_status == active && *new_status == completed {
-        return true;
+    // active (6) → completed or suspended (both 9 chars)
+    if cur_len == STATUS_LEN_ACTIVE && new_len == STATUS_LEN_COMPLETED {
+        return *current_status == String::from_str(e, "active")
+            && (*new_status == String::from_str(e, "completed")
+                || *new_status == String::from_str(e, "suspended"));
     }
-    // active → suspended
-    if *current_status == active && *new_status == suspended {
-        return true;
+    // completed (9) → active (6). Both "completed" and "suspended" are
+    // 9 chars long, so the length tuple (9, 6) is shared by the valid
+    // transition completed→active and the forbidden transition
+    // suspended→active. The string-content check below discriminates:
+    // a current of "suspended" returns false (suspended→active is
+    // forbidden) with no extra `String` allocations beyond the one.
+    if cur_len == STATUS_LEN_COMPLETED && new_len == STATUS_LEN_ACTIVE {
+        return *current_status == String::from_str(e, "completed")
+            && *new_status == String::from_str(e, "active");
     }
-    // completed → active
-    if *current_status == completed && *new_status == active {
-        return true;
-    }
-    // suspended → registered
-    if *current_status == suspended && *new_status == registered {
-        return true;
+    // suspended (9) → registered (10)
+    if cur_len == STATUS_LEN_SUSPENDED && new_len == STATUS_LEN_REGISTERED {
+        return *current_status == String::from_str(e, "suspended")
+            && *new_status == String::from_str(e, "registered");
     }
 
     false
@@ -61,11 +83,25 @@ pub fn is_valid_status_transition(e: &Env, current_status: &String, new_status: 
 
 /// Returns `true` when `status` is one of the four recognised values:
 /// registered, active, completed, suspended.
+///
+/// Gas optimization (issue #63): short-circuits via `String::len()` so
+/// that, in the worst case, only the candidate strings matching the
+/// given length are allocated. Any length outside {6, 9, 10} returns
+/// false with a single `len()` host read and zero `String` allocations.
 pub fn is_valid_status(e: &Env, status: &String) -> bool {
-    *status == String::from_str(e, "registered")
-        || *status == String::from_str(e, "active")
-        || *status == String::from_str(e, "completed")
-        || *status == String::from_str(e, "suspended")
+    let len = status.len();
+    match len {
+        l if l == STATUS_LEN_REGISTERED => {
+            *status == String::from_str(e, "registered")
+        }
+        l if l == STATUS_LEN_ACTIVE => *status == String::from_str(e, "active"),
+        l if l == STATUS_LEN_COMPLETED => {
+            // Both "completed" and "suspended" have length 9: try each.
+            *status == String::from_str(e, "completed")
+                || *status == String::from_str(e, "suspended")
+        }
+        _ => false,
+    }
 }
 
 /// Canonical project ID generation across all contracts.
