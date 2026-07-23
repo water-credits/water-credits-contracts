@@ -28,7 +28,12 @@ use verification_oracle::{
 
 const LEDGER_TIMESTAMP: u64 = 1_752_710_400;
 
-fn base_config(e: &Env, staking_token: Address, treasury: Address, min_stake: i128) -> OracleConfig {
+fn base_config(
+    e: &Env,
+    staking_token: Address,
+    treasury: Address,
+    min_stake: i128,
+) -> OracleConfig {
     OracleConfig {
         min_oracles: 3,
         max_oracles: 10,
@@ -105,7 +110,11 @@ fn setup_oracle_and_token(
     (oracle, token, project_id)
 }
 
-fn add_three_oracles(e: &Env, admin: &Address, oracle: &VerificationOracleClient) -> (Address, Address, Address) {
+fn add_three_oracles(
+    e: &Env,
+    admin: &Address,
+    oracle: &VerificationOracleClient,
+) -> (Address, Address, Address) {
     let o1 = Address::generate(e);
     let o2 = Address::generate(e);
     let o3 = Address::generate(e);
@@ -143,9 +152,16 @@ fn test_finalize_reveals_when_token_paused_reverts_whole_call() {
     let nonce = 1u64;
     let (params, salt) = reveal_params(&e, nonce);
     let commitment = sha256_commitment(
-        &e, nonce, params.ph, params.turbidity, params.dissolved_oxygen,
-        params.flow_rate, params.temperature, params.total_nitrogen,
-        params.total_phosphorus, &salt,
+        &e,
+        nonce,
+        params.ph,
+        params.turbidity,
+        params.dissolved_oxygen,
+        params.flow_rate,
+        params.temperature,
+        params.total_nitrogen,
+        params.total_phosphorus,
+        &salt,
     );
 
     oracle.open_window(&admin, &project_id);
@@ -204,9 +220,16 @@ fn test_finalize_reveals_credits_capped_at_max_supply() {
     let nonce = 1u64;
     let (params, salt) = reveal_params(&e, nonce);
     let commitment = sha256_commitment(
-        &e, nonce, params.ph, params.turbidity, params.dissolved_oxygen,
-        params.flow_rate, params.temperature, params.total_nitrogen,
-        params.total_phosphorus, &salt,
+        &e,
+        nonce,
+        params.ph,
+        params.turbidity,
+        params.dissolved_oxygen,
+        params.flow_rate,
+        params.temperature,
+        params.total_nitrogen,
+        params.total_phosphorus,
+        &salt,
     );
 
     oracle.open_window(&admin, &project_id);
@@ -270,9 +293,18 @@ fn test_retire_reverts_when_token_not_authorized_on_registry() {
     let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
         &token_id,
         &Symbol::new(&e, "retire"),
-        vec![&e, holder.to_val(), 10i128.into_val(&e), purpose.to_val(), uri.to_val()],
+        vec![
+            &e,
+            holder.to_val(),
+            10i128.into_val(&e),
+            purpose.to_val(),
+            uri.to_val(),
+        ],
     );
-    assert!(result.is_err(), "retire must fail: token not authorized on registry");
+    assert!(
+        result.is_err(),
+        "retire must fail: token not authorized on registry"
+    );
 
     // Whole call reverted — balance and supply untouched, no cert created.
     assert_eq!(token.balance(&holder), 100);
@@ -339,14 +371,18 @@ fn test_governance_execute_reverts_whole_batch_on_one_panic() {
 
     // Jump past timelock so execute() is callable.
     let config = gov.get_config();
-    e.ledger().with_mut(|l| l.timestamp += config.timelock_period + 1);
+    e.ledger()
+        .with_mut(|l| l.timestamp += config.timelock_period + 1);
 
     let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
         &gov_id,
         &Symbol::new(&e, "execute"),
         vec![&e, proposal_id.into_val(&e)],
     );
-    assert!(result.is_err(), "execute must revert when any action panics");
+    assert!(
+        result.is_err(),
+        "execute must revert when any action panics"
+    );
 
     // Because Soroban reverts the whole call, the FIRST action's effect
     // (set_value(42)) must also be rolled back — this is the actual thing
@@ -354,7 +390,10 @@ fn test_governance_execute_reverts_whole_batch_on_one_panic() {
     assert_eq!(mock.get_value(), None);
 
     let proposal = gov.get_proposal(&proposal_id).unwrap();
-    assert!(matches!(proposal.status, governance::ProposalStatus::Approved));
+    assert!(matches!(
+        proposal.status,
+        governance::ProposalStatus::Approved
+    ));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -374,7 +413,9 @@ fn test_set_minter_fails_after_admin_transferred_before_wiring() {
 
     let wasm_bytes = std::fs::read(env!("CREDIT_TOKEN_WASM"))
         .expect("credit_token.wasm should have been built by tests/build.rs");
-    let token_wasm_hash = e.deployer().upload_contract_wasm(Bytes::from_slice(&e, &wasm_bytes));
+    let token_wasm_hash = e
+        .deployer()
+        .upload_contract_wasm(Bytes::from_slice(&e, &wasm_bytes));
 
     let factory_id = e.register_contract(None, CreditFactory);
     let factory = CreditFactoryClient::new(&e, &factory_id);
@@ -404,7 +445,10 @@ fn test_set_minter_fails_after_admin_transferred_before_wiring() {
         &Symbol::new(&e, "set_minter"),
         vec![&e, admin.to_val(), oracle_id_placeholder.to_val()],
     );
-    assert!(result.is_err(), "old admin must not be able to set_minter after transfer");
+    assert!(
+        result.is_err(),
+        "old admin must not be able to set_minter after transfer"
+    );
 
     // New admin CAN wire it correctly.
     token.set_minter(&new_admin, &oracle_id_placeholder);
@@ -432,12 +476,26 @@ fn test_shared_oracle_concurrent_project_windows_are_isolated() {
 
     let token_a_id = e.register_contract(None, CreditToken);
     let token_a = CreditTokenClient::new(&e, &token_a_id);
-    token_a.initialize(&admin, &String::from_str(&e, "A"), &String::from_str(&e, "WC"), &7, &BytesN::from_array(&e, &[1u8; 32]), &String::from_str(&e, "m"));
+    token_a.initialize(
+        &admin,
+        &String::from_str(&e, "A"),
+        &String::from_str(&e, "WC"),
+        &7,
+        &BytesN::from_array(&e, &[1u8; 32]),
+        &String::from_str(&e, "m"),
+    );
     token_a.set_minter(&admin, &oracle_id);
 
     let token_b_id = e.register_contract(None, CreditToken);
     let token_b = CreditTokenClient::new(&e, &token_b_id);
-    token_b.initialize(&admin, &String::from_str(&e, "B"), &String::from_str(&e, "WC"), &7, &BytesN::from_array(&e, &[2u8; 32]), &String::from_str(&e, "m"));
+    token_b.initialize(
+        &admin,
+        &String::from_str(&e, "B"),
+        &String::from_str(&e, "WC"),
+        &7,
+        &BytesN::from_array(&e, &[2u8; 32]),
+        &String::from_str(&e, "m"),
+    );
     token_b.set_minter(&admin, &oracle_id);
 
     let project_a = BytesN::from_array(&e, &[0xAAu8; 32]);
@@ -450,9 +508,16 @@ fn test_shared_oracle_concurrent_project_windows_are_isolated() {
     let nonce = 1u64;
     let (params, salt) = reveal_params(&e, nonce);
     let commitment = sha256_commitment(
-        &e, nonce, params.ph, params.turbidity, params.dissolved_oxygen,
-        params.flow_rate, params.temperature, params.total_nitrogen,
-        params.total_phosphorus, &salt,
+        &e,
+        nonce,
+        params.ph,
+        params.turbidity,
+        params.dissolved_oxygen,
+        params.flow_rate,
+        params.temperature,
+        params.total_nitrogen,
+        params.total_phosphorus,
+        &salt,
     );
 
     // Open BOTH windows before committing to either — this is the
@@ -518,9 +583,16 @@ fn test_reveal_fails_after_stake_slashed_below_min_mid_round() {
     let nonce = 1u64;
     let (params, salt) = reveal_params(&e, nonce);
     let commitment = sha256_commitment(
-        &e, nonce, params.ph, params.turbidity, params.dissolved_oxygen,
-        params.flow_rate, params.temperature, params.total_nitrogen,
-        params.total_phosphorus, &salt,
+        &e,
+        nonce,
+        params.ph,
+        params.turbidity,
+        params.dissolved_oxygen,
+        params.flow_rate,
+        params.temperature,
+        params.total_nitrogen,
+        params.total_phosphorus,
+        &salt,
     );
 
     oracle.open_window(&admin, &project_id);
@@ -547,7 +619,10 @@ fn test_reveal_fails_after_stake_slashed_below_min_mid_round() {
         &Symbol::new(&e, "reveal_reading"),
         vec![&e, o3.to_val(), project_id.to_val(), params.into_val(&e)],
     );
-    assert!(result.is_err(), "slashed-below-min oracle must not be able to reveal");
+    assert!(
+        result.is_err(),
+        "slashed-below-min oracle must not be able to reveal"
+    );
 
     // With only 2 valid reveals and min_oracles=3, the window is not
     // finalized — this documents the resulting stuck-window state.
@@ -577,9 +652,16 @@ fn test_oracle_paused_mid_reveal_blocks_further_reveals_but_keeps_commits() {
     let nonce = 1u64;
     let (params, salt) = reveal_params(&e, nonce);
     let commitment = sha256_commitment(
-        &e, nonce, params.ph, params.turbidity, params.dissolved_oxygen,
-        params.flow_rate, params.temperature, params.total_nitrogen,
-        params.total_phosphorus, &salt,
+        &e,
+        nonce,
+        params.ph,
+        params.turbidity,
+        params.dissolved_oxygen,
+        params.flow_rate,
+        params.temperature,
+        params.total_nitrogen,
+        params.total_phosphorus,
+        &salt,
     );
 
     oracle.open_window(&admin, &project_id);
@@ -602,9 +684,17 @@ fn test_oracle_paused_mid_reveal_blocks_further_reveals_but_keeps_commits() {
     let result = e.try_invoke_contract::<Val, soroban_sdk::Error>(
         &oracle.address,
         &Symbol::new(&e, "reveal_reading"),
-        vec![&e, o2.to_val(), project_id.to_val(), params.clone().into_val(&e)],
+        vec![
+            &e,
+            o2.to_val(),
+            project_id.to_val(),
+            params.clone().into_val(&e),
+        ],
     );
-    assert!(result.is_err(), "reveal must be rejected while oracle is paused");
+    assert!(
+        result.is_err(),
+        "reveal must be rejected while oracle is paused"
+    );
 
     // ...but the already-committed readings (o2, o3) are not discarded —
     // unpausing must let the round resume and finalize normally.
