@@ -43,31 +43,8 @@ pub struct GovernanceConfig {
     pub quorum_bps: u32,
     pub min_proposal_deposit: i128,
     pub max_active_proposals: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct Proposal {
-    pub id: u64,
-    pub proposer: Address,
-    pub title: String,
-    pub description: String,
-    pub actions: Vec<GovernanceAction>,
-    /// Number of "yes" votes. Stored as a count (not a voter list) for bounded
-    /// storage and O(1) updates. Per-voter dedup is enforced via
-    /// `DataKey::HasVoted`.
-    pub votes_for: u32,
-    /// Number of "no" votes. See `votes_for` for rationale.
-    pub votes_against: u32,
-    /// Number of eligible voters snapshotted at proposal creation time. Used as
-    /// the stable denominator for both quorum and approval math so that
-    /// members added/removed after creation cannot change the threshold
-    /// retroactively.
-    pub eligible_voters: u32,
-    pub status: ProposalStatus,
-    pub created_at: u64,
-    pub voting_ends_at: u64,
-    pub timelock_ends_at: u64,
+    /// Whitelisted actions that governance can invoke via execute
+    pub allowed_actions: Vec<(Address, Symbol)>,
 }
 
 #[contracttype]
@@ -104,6 +81,8 @@ pub struct VoteCounts {
 #[contracttype]
 pub enum DataKey {
     // ── Instance ──
+    //
+    // Existing variants
     Admin,
     Config,
     MemberCount,
@@ -111,6 +90,8 @@ pub enum DataKey {
     ActiveProposals,
     ProtocolPaused,
     RegisteredTokens,
+    // New whitelist storage
+    AllowedActions,
     // ── Persistent ──
     Member(Address),
     Proposal(u64),
@@ -161,6 +142,22 @@ impl Governance {
         }
         e.storage().instance().set(&DataKey::Admin, &admin);
 
+        let gov_addr = e.current_contract_address();
+        let initial_allowed_actions: Vec<(Address, Symbol)> = Vec::from_array(
+            &e,
+            [
+                (gov_addr.clone(), soroban_sdk::Symbol::new(&e, "update_config")),
+                (gov_addr.clone(), soroban_sdk::Symbol::new(&e, "update_allowed_actions")),
+                (gov_addr.clone(), soroban_sdk::Symbol::new(&e, "transfer_admin")),
+                (gov_addr.clone(), soroban_sdk::Symbol::new(&e, "add_member")),
+                (gov_addr.clone(), soroban_sdk::Symbol::new(&e, "remove_member")),
+                (gov_addr.clone(), soroban_sdk::Symbol::new(&e, "register_token")),
+                (gov_addr.clone(), soroban_sdk::Symbol::new(&e, "deregister_token")),
+                (gov_addr.clone(), soroban_sdk::Symbol::new(&e, "emergency_pause")),
+                (gov_addr.clone(), soroban_sdk::Symbol::new(&e, "emergency_unpause")),
+            ],
+        );
+
         let config = GovernanceConfig {
             fee_bps: 50,
             voting_period: 604800,
@@ -169,8 +166,10 @@ impl Governance {
             quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
+            allowed_actions: initial_allowed_actions.clone(),
         };
         e.storage().instance().set(&DataKey::Config, &config);
+        e.storage().instance().set(&DataKey::AllowedActions, &initial_allowed_actions);
         e.storage().instance().set(&DataKey::ProposalCount, &0u64);
         e.storage()
             .instance()
@@ -475,11 +474,24 @@ impl Governance {
         // `Approved` status and can be retried or superseded by a new proposal.
         for i in 0..proposal.actions.len() {
             let action = proposal.actions.get(i).unwrap();
+            // Built-in protocol actions are identified by the `function` field:
+            //   "emergency_pause"   → pause all registered token contracts
+            //   "emergency_unpause" → unpause all registered token contracts
+            //
+            // All other actions are executed as generic cross-contract invocations
+            // via `e.invoke_contract()`, but only if whitelisted.
             if action.function == soroban_sdk::Symbol::new(&e, "emergency_pause") {
                 Self::do_pause(&e);
             } else if action.function == soroban_sdk::Symbol::new(&e, "emergency_unpause") {
                 Self::do_unpause(&e);
             } else {
+                let config = read_config(&e);
+                let allowed = config.allowed_actions.iter().any(|(target, function)| {
+                    target == action.target && function == action.function
+                });
+                if !allowed {
+                    panic!("action not whitelisted");
+                }
                 e.invoke_contract::<()>(&action.target, &action.function, action.args.clone());
             }
         }
@@ -505,6 +517,20 @@ impl Governance {
             panic!("unauthorized");
         }
         e.storage().instance().set(&DataKey::Config, &config);
+        e.storage().instance().set(&DataKey::AllowedActions, &config.allowed_actions);
+    }
+
+    /// Update allowed actions whitelist. Admin only.
+    pub fn update_allowed_actions(e: Env, admin: Address, actions: Vec<(Address, Symbol)>) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let mut config: GovernanceConfig = read_config(&e);
+        config.allowed_actions = actions.clone();
+        e.storage().instance().set(&DataKey::Config, &config);
+        e.storage().instance().set(&DataKey::AllowedActions, &actions);
     }
 
     /// Transfer admin rights to a new address. Admin only.
@@ -1090,6 +1116,7 @@ mod tests {
             quorum_bps: 5000,
             min_proposal_deposit: 500,
             max_active_proposals: 20,
+            allowed_actions: Vec::new(&e),
         };
         client.update_config(&admin, &new_config);
 
@@ -1115,6 +1142,7 @@ mod tests {
             quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
+            allowed_actions: Vec::new(&e),
         };
         client.update_config(&new_admin, &config);
         assert_eq!(client.get_config().fee_bps, 200);
@@ -1128,6 +1156,7 @@ mod tests {
             quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
+            allowed_actions: Vec::new(&e),
         };
         let result = client.try_update_config(&admin, &config2);
         assert!(result.is_err());
@@ -1228,6 +1257,10 @@ mod tests {
         let gov_id = e.register_contract(None, Governance);
         let gov_client = GovernanceClient::new(&e, &gov_id);
         gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
+        gov_client.update_allowed_actions(
+            &admin,
+            &Vec::from_array(&e, [(mock_id.clone(), soroban_sdk::Symbol::new(&e, "set_value"))]),
+        );
 
         let action = GovernanceAction {
             target: mock_id.clone(),
@@ -1273,6 +1306,10 @@ mod tests {
         let gov_id = e.register_contract(None, Governance);
         let gov_client = GovernanceClient::new(&e, &gov_id);
         gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
+        gov_client.update_allowed_actions(
+            &admin,
+            &Vec::from_array(&e, [(mock_id.clone(), soroban_sdk::Symbol::new(&e, "set_value"))]),
+        );
 
         let action1 = GovernanceAction {
             target: mock_id.clone(),
@@ -1319,6 +1356,10 @@ mod tests {
         let gov_id = e.register_contract(None, Governance);
         let gov_client = GovernanceClient::new(&e, &gov_id);
         gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
+        gov_client.update_allowed_actions(
+            &admin,
+            &Vec::from_array(&e, [(mock_id.clone(), soroban_sdk::Symbol::new(&e, "always_fail"))]),
+        );
 
         let action = GovernanceAction {
             target: mock_id.clone(),
@@ -1366,6 +1407,10 @@ mod tests {
         gov_client.initialize(
             &admin,
             &Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]),
+        );
+        gov_client.update_allowed_actions(
+            &admin,
+            &Vec::from_array(&e, [(mock_id.clone(), soroban_sdk::Symbol::new(&e, "set_value"))]),
         );
 
         let action = GovernanceAction {
@@ -1433,6 +1478,132 @@ mod tests {
         assert!(client.is_protocol_paused());
         let proposal = client.get_proposal(&proposal_id).unwrap();
         assert!(matches!(proposal.status, ProposalStatus::Executed));
+    }
+
+    #[test]
+    fn test_execute_unwhitelisted_action_panics() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let member = Address::generate(&e);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        let gov_id = e.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&e, &gov_id);
+        gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
+
+        // Do not add (mock_id, "set_value") to whitelist
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "set_value"),
+            args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&42i128, &e)]),
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let proposal_id = gov_client.propose(
+            &member,
+            &String::from_str(&e, "Unwhitelisted"),
+            &String::from_str(&e, "Should panic on execute"),
+            &actions,
+        );
+
+        gov_client.vote(&member, &proposal_id, &true);
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        let result = gov_client.try_execute(&member, &proposal_id);
+        assert!(result.is_err(), "execute must panic on unwhitelisted action");
+    }
+
+    #[test]
+    fn test_update_allowed_actions_by_admin() {
+        let (e, admin, _member, client) = setup();
+        e.mock_all_auths();
+
+        let target = Address::generate(&e);
+        let actions = Vec::from_array(
+            &e,
+            [(target.clone(), soroban_sdk::Symbol::new(&e, "some_func"))],
+        );
+        client.update_allowed_actions(&admin, &actions);
+
+        let config = client.get_config();
+        assert_eq!(config.allowed_actions.len(), 1);
+        assert_eq!(
+            config.allowed_actions.get(0).unwrap(),
+            (target, soroban_sdk::Symbol::new(&e, "some_func"))
+        );
+    }
+
+    #[test]
+    fn test_update_allowed_actions_unauthorized() {
+        let (e, _admin, member, client) = setup();
+        e.mock_all_auths();
+
+        let target = Address::generate(&e);
+        let actions = Vec::from_array(
+            &e,
+            [(target, soroban_sdk::Symbol::new(&e, "some_func"))],
+        );
+        let result = client.try_update_allowed_actions(&member, &actions);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_governance_proposal_can_update_allowed_actions() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let member = Address::generate(&e);
+
+        let gov_id = e.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&e, &gov_id);
+        gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
+
+        let target = Address::generate(&e);
+        let new_allowed = Vec::from_array(
+            &e,
+            [(target.clone(), soroban_sdk::Symbol::new(&e, "custom_func"))],
+        );
+
+        let action = GovernanceAction {
+            target: gov_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "update_allowed_actions"),
+            args: Vec::from_array(
+                &e,
+                [gov_id.clone().to_val(), new_allowed.to_val()],
+            ),
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let proposal_id = gov_client.propose(
+            &member,
+            &String::from_str(&e, "Update Whitelist Proposal"),
+            &String::from_str(&e, "Update allowed actions via proposal"),
+            &actions,
+        );
+
+        gov_client.vote(&member, &proposal_id, &true);
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        gov_client.execute(&member, &proposal_id);
+
+        let config = gov_client.get_config();
+        assert_eq!(config.allowed_actions.len(), 1);
+        assert_eq!(
+            config.allowed_actions.get(0).unwrap(),
+            (target, soroban_sdk::Symbol::new(&e, "custom_func"))
+        );
     }
 
     // ── Event tests ──

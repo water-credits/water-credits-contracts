@@ -40,6 +40,15 @@ fn test_proposal_updates_oracle_config_via_cross_contract_execution() {
         &Vec::from_array(&e, [member1.clone(), member2.clone()]),
     );
 
+    // Whitelist oracle update_config action for governance execution
+    gov_client.update_allowed_actions(
+        &admin,
+        &Vec::from_array(
+            &e,
+            [(oracle_id.clone(), Symbol::new(&e, "update_config"))],
+        ),
+    );
+
     // Delegate oracle admin authority to the governance contract.
     oracle_client.transfer_admin(&admin, &gov_id);
 
