@@ -727,8 +727,12 @@ impl VerificationOracle {
 
         let rep_key = DataKey::OracleReputation(oracle);
         if !e.storage().persistent().has(&rep_key) {
-            e.storage().persistent().set(&rep_key, &config.reputation_bootstrap);
-            e.storage().persistent().extend_ttl(&rep_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+            e.storage()
+                .persistent()
+                .set(&rep_key, &config.reputation_bootstrap);
+            e.storage()
+                .persistent()
+                .extend_ttl(&rep_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
         }
     }
 
@@ -798,13 +802,21 @@ impl VerificationOracle {
         let is_active = Self::is_oracle_active(e.clone(), oracle.clone());
         let rep_key = DataKey::OracleReputation(oracle.clone());
         let config: OracleConfig = read_config(&e);
-        let reputation_score = e.storage().persistent().get(&rep_key).unwrap_or(config.reputation_bootstrap);
-        
+        let reputation_score = e
+            .storage()
+            .persistent()
+            .get(&rep_key)
+            .unwrap_or(config.reputation_bootstrap);
+
         let stake_key = DataKey::OracleStake(oracle.clone());
-        let stake_info: StakeInfo = e.storage().persistent().get(&stake_key).unwrap_or(StakeInfo {
-            amount: 0,
-            unstake_request: None,
-        });
+        let stake_info: StakeInfo = e
+            .storage()
+            .persistent()
+            .get(&stake_key)
+            .unwrap_or(StakeInfo {
+                amount: 0,
+                unstake_request: None,
+            });
 
         let submit_key = DataKey::OracleSubmitCount(oracle.clone());
         let submissions = e.storage().persistent().get(&submit_key).unwrap_or(0);
@@ -1950,10 +1962,18 @@ impl VerificationOracle {
 
                 // Decrement reputation
                 let rep_key = DataKey::OracleReputation(oracle.clone());
-                let rep: u64 = e.storage().persistent().get(&rep_key).unwrap_or(config.reputation_bootstrap);
+                let rep: u64 = e
+                    .storage()
+                    .persistent()
+                    .get(&rep_key)
+                    .unwrap_or(config.reputation_bootstrap);
                 let new_rep = rep.saturating_sub(config.reputation_penalty);
                 e.storage().persistent().set(&rep_key, &new_rep);
-                e.storage().persistent().extend_ttl(&rep_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+                e.storage().persistent().extend_ttl(
+                    &rep_key,
+                    ORACLE_TTL_THRESHOLD,
+                    ORACLE_TTL_BUMP,
+                );
 
                 // Slash the oracle's stake
                 let stake_key = DataKey::OracleStake(oracle.clone());
@@ -2035,10 +2055,18 @@ impl VerificationOracle {
         for k in 0..n_subs {
             let s = subs.get(k).unwrap();
             let rep_key = DataKey::OracleReputation(s.oracle.clone());
-            let rep: u64 = e.storage().persistent().get(&rep_key).unwrap_or(config.reputation_bootstrap);
-            let new_rep = rep.saturating_add(config.reputation_reward).min(config.reputation_max);
+            let rep: u64 = e
+                .storage()
+                .persistent()
+                .get(&rep_key)
+                .unwrap_or(config.reputation_bootstrap);
+            let new_rep = rep
+                .saturating_add(config.reputation_reward)
+                .min(config.reputation_max);
             e.storage().persistent().set(&rep_key, &new_rep);
-            e.storage().persistent().extend_ttl(&rep_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+            e.storage()
+                .persistent()
+                .extend_ttl(&rep_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
         }
 
         if n_subs < config.min_oracles {
@@ -4883,13 +4911,21 @@ mod tests {
         e.mock_all_auths();
         let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1000);
         let project_id = BytesN::from_array(&e, &[1; 32]);
-        
+
         let salt = BytesN::from_array(&e, &[0; 32]);
         let reading = (700, 10, 80, 10, 200, 5, 1);
-        
+
         client.open_window(&admin, &project_id);
-        commit_reveal_round_no_open(&e, &client, &project_id, &oracles, 1, &[reading, reading, reading], &salt);
-        
+        commit_reveal_round_no_open(
+            &e,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            &[reading, reading, reading],
+            &salt,
+        );
+
         for i in 0..oracles.len() {
             let o = oracles.get(i).unwrap();
             let info = client.get_oracle_info(&o);
@@ -4905,96 +4941,116 @@ mod tests {
         let project_id = BytesN::from_array(&e, &[1; 32]);
         let salt = BytesN::from_array(&e, &[0; 32]);
         let reading = (700, 10, 80, 10, 200, 5, 1);
-        
+
         client.open_window(&admin, &project_id);
-        
+
         // Commit all 3
         for i in 0..3 {
             let o = oracles.get(i as u32).unwrap();
-            let commitment = sha256_commitment(&e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt);
+            let commitment = sha256_commitment(
+                &e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6,
+                &salt,
+            );
             client.commit_reading(&o, &project_id, &1, &commitment);
         }
-        
+
         set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
         client.begin_reveal_phase(&project_id);
-        
+
         // Only Oracle 0 & 1 reveal
         for i in 0..2 {
             let o = oracles.get(i as u32).unwrap();
-            let params = make_reveal_params(&e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt);
+            let params = make_reveal_params(
+                &e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6,
+                &salt,
+            );
             client.reveal_reading(&o, &project_id, &params);
         }
-        
+
         // Advance time to force end of window
         advance_past_reveal_phase(&e);
         client.finalize_window(&project_id);
-        
+
         // Oracle 0 & 1 incremented (+1), Oracle 2 missed (-5)
         let info0 = client.get_oracle_info(&oracles.get(0).unwrap());
         assert_eq!(info0.reputation_score, 101);
-        
+
         let info2 = client.get_oracle_info(&oracles.get(2).unwrap());
         assert_eq!(info2.reputation_score, 95);
     }
-    
+
     #[test]
     fn test_reputation_bounds() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
-        
+
         let mut config = client.get_config();
         config.min_stake = 0;
         config.min_oracles = 2;
         config.reputation_penalty = 200;
         config.reputation_reward = 950; // To easily hit max
         client.update_config(&admin, &config);
-        
+
         let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1000);
         let project_id = BytesN::from_array(&e, &[1; 32]);
         let salt = BytesN::from_array(&e, &[0; 32]);
         let reading = (700, 10, 80, 10, 200, 5, 1);
-        
+
         client.open_window(&admin, &project_id);
-        
+
         for i in 0..3 {
             let o = oracles.get(i as u32).unwrap();
-            let commitment = sha256_commitment(&e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt);
+            let commitment = sha256_commitment(
+                &e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6,
+                &salt,
+            );
             client.commit_reading(&o, &project_id, &1, &commitment);
         }
-        
+
         set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
         client.begin_reveal_phase(&project_id);
-        
+
         // Only Oracle 0 reveals
-        let params = make_reveal_params(&e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt);
+        let params = make_reveal_params(
+            &e, 1, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6,
+            &salt,
+        );
         client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params);
-        
+
         advance_past_reveal_phase(&e);
         client.finalize_window(&project_id); // missed reveal, -200, should bound at 0
-        
+
         let info2 = client.get_oracle_info(&oracles.get(2).unwrap());
         assert_eq!(info2.reputation_score, 0); // 100 - 200 clamped to 0
-        
+
         // Let's do a successful round with a new oracle to test upper bound
         let project_id2 = BytesN::from_array(&e, &[2; 32]);
         client.open_window(&admin, &project_id2);
-        
+
         let o2 = Address::generate(&e);
         client.stake(&o2, &1000);
         client.add_oracle(&admin, &o2);
-        
+
         let mut single_oracle2 = Vec::new(&e);
         single_oracle2.push_back(o2.clone());
-        commit_reveal_round_no_open(&e, &client, &project_id2, &single_oracle2, 1, &[reading], &salt);
-        
+        commit_reveal_round_no_open(
+            &e,
+            &client,
+            &project_id2,
+            &single_oracle2,
+            1,
+            &[reading],
+            &salt,
+        );
+
         advance_past_reveal_phase(&e);
         client.finalize_window(&project_id2);
-        
+
         // New oracle had 100, now +950 = 1050 clamped to 1000
         let info_new = client.get_oracle_info(&o2);
-        assert_eq!(info_new.reputation_score, 1000); 
+        assert_eq!(info_new.reputation_score, 1000);
     }
-    
+
     #[test]
     fn test_reputation_multiple_windows() {
         let (e, admin, client) = setup_with_client();
@@ -5003,12 +5059,20 @@ mod tests {
         let project_id = BytesN::from_array(&e, &[1; 32]);
         let salt = BytesN::from_array(&e, &[0; 32]);
         let reading = (700, 10, 80, 10, 200, 5, 1);
-        
+
         for w in 1..4 {
             client.open_window(&admin, &project_id);
-            commit_reveal_round_no_open(&e, &client, &project_id, &oracles, w as u64, &[reading, reading, reading], &salt);
+            commit_reveal_round_no_open(
+                &e,
+                &client,
+                &project_id,
+                &oracles,
+                w as u64,
+                &[reading, reading, reading],
+                &salt,
+            );
         }
-        
+
         for i in 0..oracles.len() {
             let o = oracles.get(i).unwrap();
             let info = client.get_oracle_info(&o);
