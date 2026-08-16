@@ -87,6 +87,11 @@ impl RetirementRegistry {
     }
 
     /// Record a retirement. Only callable by admin or an authorized caller contract.
+    ///
+    /// Authorized callers are expected to validate `amount` against the source
+    /// token's supply and the retiree's balance before calling. The registry
+    /// still uses checked arithmetic for its global total so a misconfigured or
+    /// malicious authorized caller cannot wrap `TotalRetired`.
     /// Returns the unique record ID.
     pub fn record_retirement(
         e: Env,
@@ -108,6 +113,9 @@ impl RetirementRegistry {
         if amount <= 0 {
             panic!("amount must be positive");
         }
+
+        let total: i128 = e.storage().instance().get(&DataKey::TotalRetired).unwrap();
+        let new_total = total.checked_add(amount).expect("total_retired overflow");
 
         let count: u64 = e.storage().instance().get(&DataKey::RecordCount).unwrap();
         let record_id = count + 1;
@@ -175,10 +183,9 @@ impl RetirementRegistry {
         );
 
         // Update global scalars
-        let total: i128 = e.storage().instance().get(&DataKey::TotalRetired).unwrap();
         e.storage()
             .instance()
-            .set(&DataKey::TotalRetired, &(total + amount));
+            .set(&DataKey::TotalRetired, &new_total);
         e.storage()
             .instance()
             .set(&DataKey::RecordCount, &record_id);
