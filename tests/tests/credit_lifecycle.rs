@@ -162,6 +162,88 @@ fn test_oracle_mints_credits_to_beneficiary() {
 }
 
 #[test]
+fn test_reset_window_does_not_inflate_oracle_finalized_counts() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let project_id = BytesN::from_array(&e, &[0x95u8; 32]);
+    let (_oracle_id, oracle_client) = deploy_oracle(&e, &admin);
+    let oracles = [
+        Address::generate(&e),
+        Address::generate(&e),
+        Address::generate(&e),
+    ];
+    for oracle in &oracles {
+        oracle_client.add_oracle(&admin, oracle);
+    }
+
+    let salt = BytesN::from_array(&e, &[0x95u8; 32]);
+    let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+    oracle_client.open_window(&admin, &project_id);
+    for oracle in &oracles {
+        oracle_client.commit_reading(oracle, &project_id, &1, &commitment);
+    }
+    advance_ledgers(&e, 301);
+    oracle_client.begin_reveal_phase(&project_id);
+
+    let first_params = RevealParams {
+        nonce: 1,
+        ph: 700,
+        turbidity: 10,
+        dissolved_oxygen: 80,
+        flow_rate: 500,
+        temperature: 250,
+        total_nitrogen: 8,
+        total_phosphorus: 1,
+        salt: salt.clone(),
+    };
+    oracle_client.reveal_reading(&oracles[0], &project_id, &first_params);
+    oracle_client.reveal_reading(&oracles[1], &project_id, &first_params);
+
+    assert_eq!(oracle_client.total_submissions(), 2);
+    for oracle in &oracles {
+        assert_eq!(oracle_client.oracle_reveal_count(oracle), 0);
+        assert_eq!(oracle_client.oracle_submit_count(oracle), 0);
+        assert_eq!(oracle_client.oracle_finalized_count(oracle), 0);
+    }
+
+    oracle_client.reset_window(&admin, &project_id);
+    for oracle in &oracles {
+        assert_eq!(oracle_client.oracle_finalized_count(oracle), 0);
+    }
+
+    let commitment = sha256_commitment(&e, 2, 700, 10, 80, 500, 250, 8, 1, &salt);
+    for oracle in &oracles {
+        oracle_client.commit_reading(oracle, &project_id, &2, &commitment);
+    }
+    advance_ledgers(&e, 301);
+    oracle_client.begin_reveal_phase(&project_id);
+
+    let second_params = RevealParams {
+        nonce: 2,
+        ph: 700,
+        turbidity: 10,
+        dissolved_oxygen: 80,
+        flow_rate: 500,
+        temperature: 250,
+        total_nitrogen: 8,
+        total_phosphorus: 1,
+        salt,
+    };
+    for oracle in &oracles {
+        oracle_client.reveal_reading(oracle, &project_id, &second_params);
+    }
+
+    assert_eq!(oracle_client.total_submissions(), 5);
+    for oracle in &oracles {
+        assert_eq!(oracle_client.oracle_reveal_count(oracle), 1);
+        assert_eq!(oracle_client.oracle_submit_count(oracle), 1);
+        assert_eq!(oracle_client.oracle_finalized_count(oracle), 1);
+    }
+}
+
+#[test]
 fn test_retire_cross_calls_registry() {
     let e = Env::default();
     e.mock_all_auths();

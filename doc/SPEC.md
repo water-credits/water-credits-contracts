@@ -131,14 +131,16 @@ State transitions:
    `"reveal window has closed"`) — this check runs inside `reveal_reading`
    itself, so a late reveal is rejected immediately, not just once someone
    later calls `finalize_window`. Each accepted reveal increments
-   `OracleSubmitCount`/`TotalSubmissions` and is appended to
-   `window.submissions`.
+   `TotalSubmissions` and is appended to `window.submissions`; per-oracle
+   contribution counters do not change yet.
 6. **Finalized window** — As soon as `submissions.len() >= config.min_oracles`
    (checked automatically at the end of each `reveal_reading`, and also by an
    explicit `finalize_window(project_id)` call once
    `max_reveal_ledgers` has elapsed), the contract computes median sensor
    values, evaluates the credit formula, stores a `VerificationResult` under
    `LastResult(project_id)`, marks `finalized = true` and `phase = Finalized`,
+   increments `OracleSubmitCount` and `OracleFinalizedCount` once for each
+   oracle whose reveal contributed to the result,
    emits a `("rdng_vrfy",)` event, and clears the `Commitment`/`OracleRevealed`
    markers for every whitelisted oracle. `finalize_window` additionally
    penalizes (see "Missed reveals" below) any oracle that committed but never
@@ -207,11 +209,16 @@ projects.
 #### Submission statistics
 
 The contract records:
-- `OracleSubmitCount(oracle)` — total accepted reveals by this oracle.
-- `TotalSubmissions` — global total across all oracles.
+- `OracleSubmitCount(oracle)` — legacy counter for this oracle's reveals that
+  contributed to finalized results.
+- `OracleFinalizedCount(oracle)` — explicit counter for this oracle's
+  contributions to finalized windows.
+- `TotalSubmissions` — global total of accepted reveals across all oracles.
 
-These are incremented on each accepted `reveal_reading` call, regardless of
-whether the window finalizes.
+`TotalSubmissions` increments on every accepted `reveal_reading` call.
+`OracleSubmitCount` and `OracleFinalizedCount` increment together only during
+successful finalization. Resetting a non-finalized window therefore discards
+its reveals without increasing either per-oracle reputation counter.
 
 #### Credit calculation (summary)
 
@@ -300,7 +307,9 @@ amount = min(amount, stake)   // never slashes more than is on deposit
 | `get_window_phase(project_id)` | — | Current phase (`Commit`/`Reveal`/`Finalized`) of a project's window |
 | `reset_window(admin, project_id)` | admin | Clear pending commitments/reveals so oracles can restart the round |
 | `window_submission_count(project_id)` | — | Current accepted-reveal count in the open window |
-| `oracle_submit_count(oracle)` | — | Lifetime accepted-reveal count for an oracle |
+| `oracle_reveal_count(oracle)` | — | Lifetime finalized-reveal contribution count for an oracle |
+| `oracle_submit_count(oracle)` | — | Backward-compatible alias for `oracle_reveal_count` |
+| `oracle_finalized_count(oracle)` | — | Lifetime finalized-window contribution count for an oracle |
 | `total_submissions()` | — | Global lifetime accepted-reveal count |
 | `oracle_missed_reveals(oracle)` | — | Lifetime missed-reveal count for an oracle |
 | `stake(oracle, amount)` | oracle | Lock tokens as collateral |
@@ -459,8 +468,9 @@ admin's control.
 | `Config` | `OracleConfig` | Protocol parameters |
 | `OracleNonce(BytesN<32>, Address)` | `u64` | Last accepted nonce per (project, oracle) |
 | `OracleSubmitted(BytesN<32>, Address)` | `bool` | Dedup: oracle × window |
-| `OracleSubmitCount(Address)` | `u64` | Lifetime submission count |
-| `TotalSubmissions` | `u64` | Protocol-wide submission count |
+| `OracleSubmitCount(Address)` | `u64` | Legacy lifetime finalized-reveal contribution count |
+| `OracleFinalizedCount(Address)` | `u64` | Lifetime finalized-window contribution count |
+| `TotalSubmissions` | `u64` | Protocol-wide accepted-reveal count |
 | `WindowState(BytesN<32>)` | `WindowState` | Open/finalized window |
 | `LastResult(BytesN<32>)` | `VerificationResult` | Latest finalized result |
 | `ProjectConfig(BytesN<32>)` | `ProjectConfig` | Auto-mint config |

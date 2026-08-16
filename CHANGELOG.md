@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Duplicate admin set in `governance` initialize
 - Max supply cap enforcement in `credit_token` mint
+- `verification_oracle`: per-oracle submission statistics now count only
+  contributions to finalized windows, so resetting a pending window cannot
+  inflate an oracle's reputation counters
 - `verification_oracle`: `validate_sensor_reading` now rejects out-of-range `turbidity` and `temperature` readings, closing a gap that let a malicious or malfunctioning oracle submit negative values to disable the turbidity/temperature quality penalties
 
 ### Changed

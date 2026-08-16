@@ -197,6 +197,7 @@ pub enum DataKey {
     ResultCount(BytesN<32>),
     ProjectConfig(BytesN<32>),
     OracleSubmitCount(Address),
+    OracleFinalizedCount(Address),
     OracleStake(Address),
     OracleSlashed(Address),
     OracleMissedReveals(Address),
@@ -235,6 +236,22 @@ fn read_admin(e: &Env) -> Address {
 
 fn read_config(e: &Env) -> OracleConfig {
     e.storage().instance().get(&DataKey::Config).unwrap()
+}
+
+fn increment_oracle_counter(e: &Env, key: &DataKey) {
+    let count: u64 = e.storage().persistent().get(key).unwrap_or(0);
+    e.storage().persistent().set(key, &(count + 1));
+    e.storage()
+        .persistent()
+        .extend_ttl(key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+}
+
+fn record_finalized_contributions(e: &Env, submissions: &Vec<ReadingSubmission>) {
+    for i in 0..submissions.len() {
+        let oracle = submissions.get(i).unwrap().oracle;
+        increment_oracle_counter(e, &DataKey::OracleSubmitCount(oracle.clone()));
+        increment_oracle_counter(e, &DataKey::OracleFinalizedCount(oracle));
+    }
 }
 
 /// Compute SHA-256(reading || salt) for commit-reveal scheme.
@@ -888,18 +905,8 @@ impl VerificationOracle {
             .persistent()
             .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
 
-        // Track per-oracle and global submission counts
-        let submit_count_key = DataKey::OracleSubmitCount(oracle.clone());
-        let oracle_count: u64 = e.storage().persistent().get(&submit_count_key).unwrap_or(0);
-        e.storage()
-            .persistent()
-            .set(&submit_count_key, &(oracle_count + 1));
-        e.storage().persistent().extend_ttl(
-            &submit_count_key,
-            ORACLE_TTL_THRESHOLD,
-            ORACLE_TTL_BUMP,
-        );
-
+        // Track raw accepted submissions globally. Per-oracle contribution
+        // counters advance only if this window successfully finalizes.
         let total: u64 = e
             .storage()
             .instance()
@@ -1083,6 +1090,8 @@ impl VerificationOracle {
                 .persistent()
                 .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
 
+            record_finalized_contributions(&e, &window.submissions);
+
             window.finalized = true;
             e.storage().temporary().set(&window_key, &window);
             // no extend needed — finalized windows can expire
@@ -1196,11 +1205,24 @@ impl VerificationOracle {
         read_config(&e)
     }
 
-    /// Get the total number of readings an oracle has submitted across all projects and windows.
-    pub fn oracle_submit_count(e: Env, oracle: Address) -> u64 {
+    /// Get the number of this oracle's reveals included in finalized results.
+    pub fn oracle_reveal_count(e: Env, oracle: Address) -> u64 {
         e.storage()
             .persistent()
             .get(&DataKey::OracleSubmitCount(oracle))
+            .unwrap_or(0)
+    }
+
+    /// Backward-compatible alias for `oracle_reveal_count`.
+    pub fn oracle_submit_count(e: Env, oracle: Address) -> u64 {
+        Self::oracle_reveal_count(e, oracle)
+    }
+
+    /// Get the number of this oracle's contributions to finalized windows.
+    pub fn oracle_finalized_count(e: Env, oracle: Address) -> u64 {
+        e.storage()
+            .persistent()
+            .get(&DataKey::OracleFinalizedCount(oracle))
             .unwrap_or(0)
     }
 
@@ -1804,16 +1826,8 @@ impl VerificationOracle {
             params.temperature,
         );
 
-        // Track per-oracle and global submission counts
-        let submit_key = DataKey::OracleSubmitCount(oracle.clone());
-        let oracle_submit_count: u64 = e.storage().persistent().get(&submit_key).unwrap_or(0);
-        e.storage()
-            .persistent()
-            .set(&submit_key, &(oracle_submit_count + 1));
-        e.storage()
-            .persistent()
-            .extend_ttl(&submit_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
-
+        // Track raw accepted reveals globally. Per-oracle contribution counters
+        // advance only if this window successfully finalizes.
         let total: u64 = e
             .storage()
             .instance()
@@ -2085,6 +2099,8 @@ impl VerificationOracle {
         e.storage()
             .persistent()
             .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+
+        record_finalized_contributions(&e, &window.submissions);
 
         window.finalized = true;
         window.phase = WindowPhase::Finalized;
@@ -2643,7 +2659,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oracle_submit_count_increments() {
+    fn test_oracle_counts_increment_only_after_finalization() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
@@ -2654,40 +2670,37 @@ mod tests {
         let salt = BytesN::from_array(&e, &[0x10u8; 32]);
 
         assert_eq!(client.oracle_submit_count(&o1), 0);
+        assert_eq!(client.oracle_reveal_count(&o1), 0);
+        assert_eq!(client.oracle_finalized_count(&o1), 0);
         assert_eq!(client.total_submissions(), 0);
 
         let project_id = BytesN::from_array(&e, &[10u8; 32]);
-        let mut single = Vec::new(&e);
-        single.push_back(o1.clone());
-        commit_reveal_round_same(
-            &e,
-            &admin,
-            &client,
-            &project_id,
-            &single,
-            1,
-            (700, 10, 80, 500, 250, 8, 1),
-            &salt,
-        );
-        assert_eq!(client.oracle_submit_count(&o1), 1);
-        assert_eq!(client.total_submissions(), 1);
+        client.open_window(&admin, &project_id);
+        let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        for i in 0..oracles.len() {
+            client.commit_reading(&oracles.get(i).unwrap(), &project_id, &1, &commitment);
+        }
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+        client.begin_reveal_phase(&project_id);
+        let params = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
 
-        let project_id2 = BytesN::from_array(&e, &[11u8; 32]);
-        let mut pair = Vec::new(&e);
-        pair.push_back(o2.clone());
-        pair.push_back(o3.clone());
-        commit_reveal_round_same(
-            &e,
-            &admin,
-            &client,
-            &project_id2,
-            &pair,
-            1,
-            (700, 10, 80, 500, 250, 8, 1),
-            &salt,
-        );
+        assert!(client.reveal_reading(&o1, &project_id, &params).is_none());
+        assert!(client.reveal_reading(&o2, &project_id, &params).is_none());
+        assert_eq!(client.oracle_submit_count(&o1), 0);
+        assert_eq!(client.oracle_reveal_count(&o1), 0);
+        assert_eq!(client.oracle_finalized_count(&o1), 0);
+        assert_eq!(client.total_submissions(), 2);
+
+        assert!(client.reveal_reading(&o3, &project_id, &params).is_some());
+        assert_eq!(client.oracle_submit_count(&o1), 1);
+        assert_eq!(client.oracle_reveal_count(&o1), 1);
+        assert_eq!(client.oracle_finalized_count(&o1), 1);
         assert_eq!(client.oracle_submit_count(&o2), 1);
+        assert_eq!(client.oracle_reveal_count(&o2), 1);
+        assert_eq!(client.oracle_finalized_count(&o2), 1);
         assert_eq!(client.oracle_submit_count(&o3), 1);
+        assert_eq!(client.oracle_reveal_count(&o3), 1);
+        assert_eq!(client.oracle_finalized_count(&o3), 1);
         assert_eq!(client.total_submissions(), 3);
     }
 
@@ -2846,9 +2859,13 @@ mod tests {
         client.reveal_reading(&oracles.get(0).unwrap(), &project_id, &params);
         client.reveal_reading(&oracles.get(1).unwrap(), &project_id, &params);
         assert_eq!(client.window_submission_count(&project_id), 2);
+        assert_eq!(client.oracle_finalized_count(&oracles.get(0).unwrap()), 0);
+        assert_eq!(client.oracle_finalized_count(&oracles.get(1).unwrap()), 0);
 
         client.reset_window(&admin, &project_id);
         assert_eq!(client.window_submission_count(&project_id), 0);
+        assert_eq!(client.oracle_finalized_count(&oracles.get(0).unwrap()), 0);
+        assert_eq!(client.oracle_finalized_count(&oracles.get(1).unwrap()), 0);
     }
 
     #[test]
@@ -2872,6 +2889,11 @@ mod tests {
         client.reveal_reading(&oracles.get(1).unwrap(), &project_id, &params1);
 
         client.reset_window(&admin, &project_id);
+        for i in 0..oracles.len() {
+            let oracle = oracles.get(i).unwrap();
+            assert_eq!(client.oracle_submit_count(&oracle), 0);
+            assert_eq!(client.oracle_finalized_count(&oracle), 0);
+        }
 
         // Round 2: o1 and o2 resubmit with nonce 2; o3 submits for the first time
         // with nonce 1 (its nonce is independent of o1/o2's).
@@ -2888,6 +2910,11 @@ mod tests {
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
+        for i in 0..oracles.len() {
+            let oracle = oracles.get(i).unwrap();
+            assert_eq!(client.oracle_submit_count(&oracle), 1);
+            assert_eq!(client.oracle_finalized_count(&oracle), 1);
+        }
     }
 
     #[test]
