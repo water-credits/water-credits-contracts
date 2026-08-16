@@ -889,6 +889,33 @@ PROJ_ID=$(soroban contract invoke \
 echo "Project ID: $PROJ_ID"
 ```
 
+### Wire Governance Emergency Controls
+
+Every initialized project token must designate governance as its pause guardian
+and be registered with governance. Both calls are required for governance
+`emergency_pause` and `emergency_unpause` proposals to reach the token. Use the
+project's deployed `credit_token` address from the factory project record:
+
+```bash
+PROJECT_TOKEN_ID="C..."
+
+# Allow governance to pause and unpause this token
+soroban contract invoke \
+  --id $PROJECT_TOKEN_ID \
+  --fn set_pause_guardian \
+  --arg admin:$ADMIN \
+  --arg guardian:$GOV_ID \
+  --network local
+
+# Include this token in protocol-wide emergency actions
+soroban contract invoke \
+  --id $GOV_ID \
+  --fn register_token \
+  --arg admin:$ADMIN \
+  --arg token:$PROJECT_TOKEN_ID \
+  --network local
+```
+
 ### Testnet & Mainnet
 
 ```bash
