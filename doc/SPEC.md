@@ -225,8 +225,8 @@ its reveals without increasing either per-oracle reputation counter.
 Given medians of all sensor fields across the `min_oracles` submissions:
 
 ```
-N_removed = max(0, baseline_N - med_N) * med_flow * 3600 / 1_000_000   (kg)
-P_removed = max(0, baseline_P - med_P) * med_flow * 3600 / 1_000_000   (kg)
+N_removed = max(0, baseline_N - med_N) * med_flow * window_secs / 1_000_000   (kg)
+P_removed = max(0, baseline_P - med_P) * med_flow * window_secs / 1_000_000   (kg)
 
 quality_penalty = 0..8000 bps based on pH, turbidity, DO, temperature
 
@@ -237,6 +237,33 @@ total = gross * (10_000 - quality_penalty) / 10_000
 ```
 
 All sensor values are fixed-point integers (see MATH.md for scale factors).
+
+#### Monitoring window (`window_secs`)
+
+`window_secs` is the length of the monitoring window in seconds — the `Δt` that
+turns an instantaneous flow rate into a volume over the reporting period. It was
+previously hardcoded to `3600`, which made credits correct only for deployments
+submitting exactly hourly: a 30-minute interval double-counted, a 6-hour interval
+under-counted 6×.
+
+| Property | Value |
+|---|---|
+| Storage | `OracleConfig::window_secs` (instance storage, part of the global config) |
+| Default | `3600` — set in `initialize`, so existing deployments are unaffected |
+| Valid range | `60 ≤ window_secs ≤ 86_400` (1 minute to 1 day), exported as `MIN_WINDOW_SECS` / `MAX_WINDOW_SECS` |
+| Validated in | `update_config` — out-of-range values panic with `window_secs out of valid range [60, 86400]` and leave the stored config untouched |
+| Applied in | `compute_finalization`, reached from both `submit_reading_impl` and `finalize_reveals`, each passing `config.window_secs` |
+
+Only the nutrient-removal terms scale with the window; `volumetric_credit` is a
+flow-rate credit with no `Δt` factor and is unchanged by it. Admins must keep
+`window_secs` in step with the interval at which the deployment's oracles
+actually submit — see doc/MATH.md §3 for the derivation and §8 Example F for a
+worked 30-minute window.
+
+The upper bound is also an overflow bound: the `× window_secs` step uses
+`checked_mul`, and raising the ceiling from `3600` to `86_400` makes the
+intermediate product 24× larger. Values beyond the bound are rejected at
+configuration time rather than reverting later at credit issuance.
 
 #### Oracle staking and slashing
 

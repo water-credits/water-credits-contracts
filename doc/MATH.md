@@ -105,8 +105,18 @@ med_ph, med_turb, med_do, med_temp, med_flow, med_n, med_p
 ## 3. Nutrient Removal Formulas
 
 Nutrient removal credits reward the system for lowering nitrogen and phosphorus
-concentrations below hardcoded baselines. The window is assumed to span **3 600 seconds**
-(one hour) — a fixed constant baked into the contract.
+concentrations below hardcoded baselines, integrated over the monitoring window.
+
+The window length is the configurable **`window_secs`** field of `OracleConfig`
+(seconds). It defaults to **3 600** (one hour), the value the formula previously
+hardcoded, so an untouched deployment behaves exactly as before. `update_config`
+constrains it to `60 ≤ window_secs ≤ 86 400` (1 minute to 1 day), and both
+finalization paths — `submit_reading_impl` and `finalize_reveals` — pass
+`config.window_secs` into `compute_finalization`.
+
+`window_secs` must match the interval at which the deployment's oracles actually
+submit. A deployment reporting every 30 minutes while `window_secs` is left at
+3 600 double-counts its removal; one reporting every 6 hours under-counts by 6×.
 
 ### 3.1 Nitrogen Removal
 
@@ -114,7 +124,7 @@ concentrations below hardcoded baselines. The window is assumed to span **3 600 
 
 ```
 if med_n < baseline_n:
-    n_removal_kg = (baseline_n − med_n) × med_flow × 3600 / 1 000 000
+    n_removal_kg = (baseline_n − med_n) × med_flow × window_secs / 1 000 000
 else:
     n_removal_kg = 0
 ```
@@ -125,9 +135,14 @@ else:
 (mg/L) × (L/s) × (s) / (mg/kg)
 = mg × s / (L × s / L) / mg/kg
 = mg/L × L/s × s ÷ (10⁶ mg/kg)
-= (baseline_n − med_n) [mg/L] × med_flow [L/s] × 3600 [s] ÷ 1 000 000 [mg/kg]
+= (baseline_n − med_n) [mg/L] × med_flow [L/s] × window_secs [s] ÷ 1 000 000 [mg/kg]
 = result in kg
 ```
+
+`window_secs` is the `[s]` factor: it is what turns an instantaneous flow rate
+into a volume over the reporting period, so the result scales linearly with it —
+halving the window halves the removal, and therefore halves the nutrient-removal
+component of the credit total.
 
 `n_removal_kg` is an `i128` representing **kilograms of nitrogen removed** over the window.
 
@@ -140,7 +155,7 @@ freshwater targets.
 
 ```
 if med_p < baseline_p:
-    p_removal_kg = (baseline_p − med_p) × med_flow × 3600 / 1 000 000
+    p_removal_kg = (baseline_p − med_p) × med_flow × window_secs / 1 000 000
 else:
     p_removal_kg = 0
 ```
@@ -271,15 +286,25 @@ misread as a negative balance regardless of configuration.
 
 ### Overflow handling
 
-Every multiplication in §3, §4, and §6 (`baseline − med`, `× med_flow`, `× 3600`,
-`× credit_per_kg_*`, the final `× (10000 − penalty)`, and the `n_credit + p_credit +
-volumetric_credit` addition) uses `checked_mul` / `checked_add` and panics with a
-descriptive message on overflow, instead of silently wrapping in `i128`. This matters
-because `med_flow` (and an admin-set per-project `baseline_n`/`baseline_p`) are only
-bounded to be non-negative `i64` values — a value near `i64::MAX` combined with a
-large baseline can overflow the `× 3600` step before the division, and an
-unchecked wraparound there would silently mint a corrupted (and potentially
-enormous) credit amount rather than reverting the transaction.
+Every multiplication in §3, §4, and §6 (`baseline − med`, `× med_flow`,
+`× window_secs`, `× credit_per_kg_*`, the final `× (10000 − penalty)`, and the
+`n_credit + p_credit + volumetric_credit` addition) uses `checked_mul` /
+`checked_add` and panics with a descriptive message on overflow, instead of
+silently wrapping in `i128`. This matters because `med_flow` (and an admin-set
+per-project `baseline_n`/`baseline_p`) are only bounded to be non-negative `i64`
+values — a value near `i64::MAX` combined with a large baseline can overflow the
+`× window_secs` step before the division, and an unchecked wraparound there would
+silently mint a corrupted (and potentially enormous) credit amount rather than
+reverting the transaction.
+
+Making the window configurable widens that step's exposure: the largest accepted
+`window_secs` (86 400) is 24× the old fixed 3 600, so a product that fit before
+the change may not fit now. Ordering is deliberately multiply-before-divide to
+preserve precision, and the `checked_mul` is what makes that safe — the widened
+ceiling moves the overflow threshold down by 24×, it does not remove the guard.
+`update_config`'s `60 ≤ window_secs ≤ 86 400` bound caps how far that threshold
+can move; anything beyond it reverts at configuration time rather than at credit
+issuance time.
 
 ---
 
@@ -299,6 +324,7 @@ admin via `update_config`.
 | `quality_threshold_temp` | `300` | Max acceptable temperature (= 30.0 °C) |
 | `credit_per_kg_n` | `10` | Credits awarded per kg of N removed |
 | `credit_per_kg_p` | `20` | Credits awarded per kg of P removed |
+| `window_secs` | `3600` | Monitoring window length in seconds (the `Δt` in §3). Validated to `[60, 86400]` by `update_config` |
 
 ---
 
@@ -306,6 +332,8 @@ admin via `update_config`.
 
 The examples below show the complete calculation for a three-oracle window. For
 brevity, all three oracles submit identical values so the median equals the input.
+Unless stated otherwise they assume the default `window_secs = 3600`; Example F
+reworks Example A at a 30-minute window.
 
 ---
 
@@ -538,6 +566,38 @@ in the test suite.
 
 ---
 
+### Example F — Example A at a 30-Minute Window
+
+Same sensor readings as Example A, but the deployment reports every 30 minutes
+and the admin has set `window_secs = 1800` accordingly.
+
+**Nitrogen and phosphorus removal** scale linearly with the window:
+```
+n_removal_kg = (10 − 8) × 500 × 1800 / 1_000_000 = 1_800_000 / 1_000_000 = 1  (kg)
+p_removal_kg = (2 − 1) × 500 × 1800 / 1_000_000 =   900_000 / 1_000_000 = 0  (kg)
+```
+(Example A gave 3 kg and 1 kg at `window_secs = 3600`. The phosphorus figure
+truncates to 0 here — integer division always rounds toward zero, so a shorter
+window can round a small removal away entirely.)
+
+**Volumetric credit is unchanged** — it is a flow-rate credit with no `Δt`
+factor:
+```
+volumetric_credit = 500 × 100 / 1000 = 50
+```
+
+**Total:**
+```
+gross = 1 × 10 + 0 × 20 + 50 = 60
+total = 60 × (10000 − 0) / 10000 = 60      (Example A: 100)
+```
+
+Only the nutrient-removal component halves; the volumetric term does not. Where
+the volumetric credit is zero (flow below 10 L/s, since `flow × 100 / 1000`
+truncates to 0), the total halves exactly with the window.
+
+---
+
 ## Cross-References
 
 | Formula | Source location |
@@ -549,3 +609,4 @@ in the test suite.
 | Volumetric credit | `finalize_reveals`, lines under `// Volumetric credit based on flow` |
 | Total credits | `finalize_reveals`, lines under `// Apply quality penalty` |
 | Default config | `VerificationOracle::initialize`, `OracleConfig { ... }` literal |
+| Monitoring window (`window_secs`) | `OracleConfig::window_secs`; bounds `MIN_WINDOW_SECS`/`MAX_WINDOW_SECS`, validated in `update_config`, applied in `compute_finalization` |

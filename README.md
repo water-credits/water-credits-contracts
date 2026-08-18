@@ -1147,6 +1147,13 @@ submission:
   concurrent_readings: 5
 ```
 
+> **Keep `interval_seconds` in step with the contract's `window_secs`.**
+> `OracleConfig::window_secs` (default `3600`, valid range `[60, 86400]`) is the
+> `Δt` the credit formula multiplies nutrient removal by. If the node submits
+> every 30 minutes while the contract is still configured for 3600 s, every
+> window credits twice the nutrients actually removed. Set it with
+> `update_config`; see doc/MATH.md §3.
+
 ---
 
 ## 📡 Events & Indexing

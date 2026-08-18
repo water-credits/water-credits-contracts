@@ -158,6 +158,7 @@ fn test_full_six_contract_lifecycle() {
             slash_pct_bps: 1000,
             min_slash_amount: 0,
             max_slash_amount: i128::MAX,
+            window_secs: 3600,
         },
     );
 

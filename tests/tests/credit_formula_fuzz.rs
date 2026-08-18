@@ -18,7 +18,9 @@
 //! Fix: promote to i128 before addition. See `verification_oracle/src/lib.rs`.
 
 use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
-use verification_oracle::{compute_finalization, median_i64, OracleConfig};
+use verification_oracle::{
+    compute_finalization, median_i64, OracleConfig, MAX_WINDOW_SECS, MIN_WINDOW_SECS,
+};
 
 // ---------------------------------------------------------------------------
 // Deterministic RNG (LCG + SplitMix for better distribution, no external crate)
@@ -92,6 +94,7 @@ fn default_config(e: &Env) -> OracleConfig {
         slash_pct_bps: 1000,
         min_slash_amount: 0,
         max_slash_amount: i128::MAX,
+        window_secs: 3600,
     }
 }
 
@@ -120,6 +123,10 @@ struct FuzzCase {
     baseline_n: i128,
     baseline_p: i128,
     temp_threshold: i128,
+    /// Monitoring window length in seconds (Issue #93). Drawn from the range
+    /// `update_config` accepts, so the fuzzer exercises the full multiplier
+    /// span the contract can actually be configured with — not just 3600.
+    window_secs: u64,
     config: OracleConfig,
 }
 
@@ -129,13 +136,18 @@ fn generate_valid_case(e: &Env, rng: &mut DeterministicRng) -> FuzzCase {
     let med_turb = rng.gen_range_i64(0, 10000);
     let med_do = rng.gen_range_i64(0, 5000);
     let med_temp = rng.gen_range_i64(-500, 1000);
-    let med_flow = rng.gen_range_i64(0, 1_000_000); // capped to avoid overflow
+    // Capped so that the widest configurable window (MAX_WINDOW_SECS) still
+    // cannot overflow the `(baseline - med) * flow * window_secs` product:
+    // 100 * 1e6 * 86_400 ≈ 8.6e12, far below i128::MAX.
+    let med_flow = rng.gen_range_i64(0, 1_000_000);
     let med_n = rng.gen_range_i64(0, 1000);
     let med_p = rng.gen_range_i64(0, 1000);
     let baseline_n = rng.gen_range_i64(0, 100) as i128;
     let baseline_p = rng.gen_range_i64(0, 100) as i128;
     let temp_threshold = rng.gen_range_i64(-500, 1000) as i128;
-    let config = default_config_with_rng(e, rng);
+    let window_secs = rng.gen_range_i64(MIN_WINDOW_SECS as i64, MAX_WINDOW_SECS as i64) as u64;
+    let mut config = default_config_with_rng(e, rng);
+    config.window_secs = window_secs;
 
     FuzzCase {
         med_ph,
@@ -148,6 +160,7 @@ fn generate_valid_case(e: &Env, rng: &mut DeterministicRng) -> FuzzCase {
         baseline_n,
         baseline_p,
         temp_threshold,
+        window_secs,
         config,
     }
 }
@@ -245,6 +258,7 @@ fn test_fuzz_random_valid_inputs_deterministic_100_cases() {
             case.baseline_n,
             case.baseline_p,
             case.temp_threshold,
+            case.window_secs,
         );
         assert_invariants(&case, &result);
 
@@ -278,6 +292,7 @@ fn test_fuzz_random_valid_inputs_second_seed_50_cases() {
             case.baseline_n,
             case.baseline_p,
             case.temp_threshold,
+            case.window_secs,
         );
         assert_invariants(&case, &result);
     }
@@ -288,7 +303,7 @@ fn test_fuzz_all_valid_fields_zero() {
     // Edge: all zeros (valid per entry validation)
     let e = Env::default();
     let config = default_config(&e);
-    let result = compute_finalization(&config, 0, 0, 0, 0, 0, 0, 0, 10, 2, 300);
+    let result = compute_finalization(&config, 0, 0, 0, 0, 0, 0, 0, 10, 2, 300, 3600);
     assert_eq!(result.total, 0);
     // ph 0 <600 =>2000, turb 0 <=50 =>0, DO 0 <50 =>2000, temp 0 <=300 =>0 => 4000
     assert_eq!(result.penalty, 4000);
@@ -419,7 +434,7 @@ fn test_fuzz_median_i64_single_element() {
 fn test_boundary_flow_rate_zero() {
     let e = Env::default();
     let config = default_config(&e);
-    let result = compute_finalization(&config, 700, 10, 80, 250, 0, 8, 1, 10, 2, 300);
+    let result = compute_finalization(&config, 700, 10, 80, 250, 0, 8, 1, 10, 2, 300, 3600);
     assert_eq!(result.volumetric_credit, 0);
     assert_eq!(result.n_removed, 0);
     assert_eq!(result.p_removed, 0);
@@ -432,7 +447,7 @@ fn test_boundary_baseline_n_equals_med_n() {
     let e = Env::default();
     let config = default_config(&e);
     // med_n == baseline_n => n_removed should be 0
-    let result = compute_finalization(&config, 700, 10, 80, 250, 500, 10, 1, 10, 2, 300);
+    let result = compute_finalization(&config, 700, 10, 80, 250, 500, 10, 1, 10, 2, 300, 3600);
     assert_eq!(result.n_removed, 0);
     assert!(result.p_removed > 0); // p still below baseline
     assert!(result.total >= 0);
@@ -443,7 +458,7 @@ fn test_boundary_baseline_p_equals_med_p() {
     let e = Env::default();
     let config = default_config(&e);
     // med_p == baseline_p => p_removed 0
-    let result = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 2, 10, 2, 300);
+    let result = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 2, 10, 2, 300, 3600);
     assert_eq!(result.p_removed, 0);
     assert!(result.n_removed > 0);
 }
@@ -452,7 +467,7 @@ fn test_boundary_baseline_p_equals_med_p() {
 fn test_boundary_both_baselines_equal_medians() {
     let e = Env::default();
     let config = default_config(&e);
-    let result = compute_finalization(&config, 700, 10, 80, 250, 500, 10, 2, 10, 2, 300);
+    let result = compute_finalization(&config, 700, 10, 80, 250, 500, 10, 2, 10, 2, 300, 3600);
     assert_eq!(result.n_removed, 0);
     assert_eq!(result.p_removed, 0);
     // Only volumetric credit remains
@@ -467,7 +482,7 @@ fn test_boundary_all_penalties_maximum() {
     let e = Env::default();
     let config = default_config(&e);
     // All 4 conditions breached: ph out, turb high, do low, temp high => 2000+2000+2000+1000=7000
-    let result = compute_finalization(&config, 300, 200, 10, 350, 500, 8, 1, 10, 2, 300);
+    let result = compute_finalization(&config, 300, 200, 10, 350, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(result.penalty, 7000);
     assert!(result.penalty <= 8000);
     assert!(result.total >= 0);
@@ -482,7 +497,7 @@ fn test_boundary_penalty_capped_at_8000() {
     let e = Env::default();
     let config = default_config(&e);
     // All penalties + verify cap
-    let result = compute_finalization(&config, 0, 10000, 0, 10000, 1000, 0, 0, 10, 2, 0);
+    let result = compute_finalization(&config, 0, 10000, 0, 10000, 1000, 0, 0, 10, 2, 0, 3600);
     assert!(result.penalty <= 8000);
     assert!(result.penalty >= 0);
     // With our weights, should be 7000 even for extreme
@@ -494,7 +509,9 @@ fn test_boundary_medians_at_i64_max_safe_range() {
     // Flow at 1_000_000 is safe, but ph at 1400 boundary, nitrogen at 0
     let e = Env::default();
     let config = default_config(&e);
-    let result = compute_finalization(&config, 1400, 0, 1000, 0, 1_000_000, 0, 0, 10, 2, 1000);
+    let result = compute_finalization(
+        &config, 1400, 0, 1000, 0, 1_000_000, 0, 0, 10, 2, 1000, 3600,
+    );
     assert!(result.total >= 0);
     assert!(result.penalty <= 8000);
     // ph 1400 >700 => penalty 2000, but other conditions ok
@@ -518,15 +535,15 @@ fn test_boundary_ph_at_threshold_boundaries() {
     let e = Env::default();
     let config = default_config(&e);
     // ph exactly at lower bound 600 -> no penalty
-    let r1 = compute_finalization(&config, 600, 10, 80, 250, 500, 8, 1, 10, 2, 300);
+    let r1 = compute_finalization(&config, 600, 10, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r1.penalty, 0);
     // ph exactly at upper bound 700 -> no penalty
-    let r2 = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 10, 2, 300);
+    let r2 = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r2.penalty, 0);
     // ph just outside: 599 and 701
-    let r3 = compute_finalization(&config, 599, 10, 80, 250, 500, 8, 1, 10, 2, 300);
+    let r3 = compute_finalization(&config, 599, 10, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r3.penalty, 2000);
-    let r4 = compute_finalization(&config, 701, 10, 80, 250, 500, 8, 1, 10, 2, 300);
+    let r4 = compute_finalization(&config, 701, 10, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r4.penalty, 2000);
 }
 
@@ -536,7 +553,7 @@ fn test_boundary_credit_per_kg_zero() {
     let mut config = default_config(&e);
     config.credit_per_kg_n = 0;
     config.credit_per_kg_p = 0;
-    let result = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 10, 2, 300);
+    let result = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
     // Only volumetric credit remains
     assert_eq!(result.total, result.volumetric_credit);
     assert_eq!(result.total, 50);
@@ -547,12 +564,12 @@ fn test_boundary_baseline_zero() {
     let e = Env::default();
     let config = default_config(&e);
     // baseline 0, med_n 0 => equal => 0 removal
-    let r1 = compute_finalization(&config, 700, 10, 80, 250, 500, 0, 0, 0, 0, 300);
+    let r1 = compute_finalization(&config, 700, 10, 80, 250, 500, 0, 0, 0, 0, 300, 3600);
     assert_eq!(r1.n_removed, 0);
     assert_eq!(r1.p_removed, 0);
     // baseline 0, med_n 0 for N but P below baseline? Actually P median 0 < baseline 2? Wait baseline 0, so not.
     // Let's test baseline 10, med_n 0 => max removal
-    let r2 = compute_finalization(&config, 700, 10, 80, 250, 500, 0, 0, 10, 2, 300);
+    let r2 = compute_finalization(&config, 700, 10, 80, 250, 500, 0, 0, 10, 2, 300, 3600);
     assert_eq!(r2.n_removed, 10 * 500 * 3600 / 1_000_000);
     assert_eq!(r2.p_removed, 2 * 500 * 3600 / 1_000_000);
 }
@@ -562,10 +579,10 @@ fn test_boundary_temperature_at_threshold() {
     let e = Env::default();
     let config = default_config(&e);
     // temp exactly at 300 => no penalty
-    let r1 = compute_finalization(&config, 700, 10, 80, 300, 500, 8, 1, 10, 2, 300);
+    let r1 = compute_finalization(&config, 700, 10, 80, 300, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r1.penalty, 0);
     // temp 301 => penalty +1000
-    let r2 = compute_finalization(&config, 700, 10, 80, 301, 500, 8, 1, 10, 2, 300);
+    let r2 = compute_finalization(&config, 700, 10, 80, 301, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r2.penalty, 1000);
 }
 
@@ -574,15 +591,15 @@ fn test_boundary_turbidity_and_do_at_thresholds() {
     let e = Env::default();
     let config = default_config(&e);
     // turb exactly 50 => no penalty, 51 => penalty
-    let r1 = compute_finalization(&config, 700, 50, 80, 250, 500, 8, 1, 10, 2, 300);
+    let r1 = compute_finalization(&config, 700, 50, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r1.penalty, 0);
-    let r2 = compute_finalization(&config, 700, 51, 80, 250, 500, 8, 1, 10, 2, 300);
+    let r2 = compute_finalization(&config, 700, 51, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r2.penalty, 2000);
 
     // DO exactly 50 => no penalty, 49 => penalty
-    let r3 = compute_finalization(&config, 700, 10, 50, 250, 500, 8, 1, 10, 2, 300);
+    let r3 = compute_finalization(&config, 700, 10, 50, 250, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r3.penalty, 0);
-    let r4 = compute_finalization(&config, 700, 10, 49, 250, 500, 8, 1, 10, 2, 300);
+    let r4 = compute_finalization(&config, 700, 10, 49, 250, 500, 8, 1, 10, 2, 300, 3600);
     assert_eq!(r4.penalty, 2000);
 }
 
@@ -591,7 +608,7 @@ fn test_boundary_flow_rate_max_no_overflow() {
     // Use flow = 1_000_000 (our valid max) which should NOT overflow
     let e = Env::default();
     let config = default_config(&e);
-    let result = compute_finalization(&config, 700, 10, 80, 250, 1_000_000, 8, 1, 10, 2, 300);
+    let result = compute_finalization(&config, 700, 10, 80, 250, 1_000_000, 8, 1, 10, 2, 300, 3600);
     assert!(result.total >= 0);
     // n_removed = (10-8)*1e6*3600/1e6 = 2*3600=7200 kg
     assert_eq!(result.n_removed, 7200);
@@ -619,6 +636,7 @@ fn test_boundary_overflow_expected_panic_extreme_flow_and_baseline() {
         i64::MAX as i128,
         2,
         300,
+        MAX_WINDOW_SECS,
     );
 }
 
@@ -658,6 +676,7 @@ fn test_fuzz_penalty_never_increases_credits_for_nonnegative_gross() {
             case.baseline_n,
             case.baseline_p,
             case.temp_threshold,
+            case.window_secs,
         );
 
         let gross = result.n_removed * case.config.credit_per_kg_n
@@ -702,6 +721,7 @@ fn test_fuzz_baseline_equality_removal_zero_50_cases() {
             case.baseline_n,
             case.baseline_p,
             case.temp_threshold,
+            case.window_secs,
         );
         assert_eq!(result.n_removed, 0);
 
@@ -720,6 +740,7 @@ fn test_fuzz_baseline_equality_removal_zero_50_cases() {
             case.baseline_n,
             case.baseline_p,
             case.temp_threshold,
+            case.window_secs,
         );
         assert_eq!(result2.p_removed, 0);
     }

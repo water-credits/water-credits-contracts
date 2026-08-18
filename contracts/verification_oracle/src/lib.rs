@@ -121,7 +121,24 @@ pub struct OracleConfig {
     /// Ceiling applied to the computed slash amount, so a single missed
     /// reveal can never wipe out an outsized stake in one shot.
     pub max_slash_amount: i128,
+    /// Length of the monitoring window in seconds — the `Δt` in the nutrient
+    /// removal formula `(baseline − med) × med_flow × window_secs / 1e6`
+    /// (doc/MATH.md §3). Previously hardcoded as `3600`, which silently
+    /// double-counted credits for a deployment submitting every 30 minutes
+    /// and under-counted 6× for one submitting every 6 hours.
+    ///
+    /// Defaults to `3600` in `initialize` (one hour, the historical
+    /// assumption). `update_config` constrains it to
+    /// `[MIN_WINDOW_SECS, MAX_WINDOW_SECS]`.
+    pub window_secs: u64,
 }
+
+/// Minimum accepted `OracleConfig::window_secs` (1 minute). Rejects
+/// nonsensically short intervals that no real sensor deployment would use.
+pub const MIN_WINDOW_SECS: u64 = 60;
+/// Maximum accepted `OracleConfig::window_secs` (1 day). Also the value the
+/// nutrient-removal overflow analysis in `compute_finalization` is bounded by.
+pub const MAX_WINDOW_SECS: u64 = 86_400;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -534,10 +551,17 @@ pub struct FinalizationResult {
 /// wrapping in `i128`. `total` is floored at 0 so a maximal quality penalty
 /// can never be misread as a negative credit balance.
 ///
-/// `baseline_n` / `baseline_p` and `temp_threshold` are passed in rather than
-/// read from config/project state here, since the two call sites use
-/// different baseline sources (per-project baselines in the direct-submit
+/// `baseline_n` / `baseline_p`, `temp_threshold` and `window_secs` are passed
+/// in rather than read from config/project state here, since the two call sites
+/// use different baseline sources (per-project baselines in the direct-submit
 /// path vs. the global config in the commit-reveal path — see doc/MATH.md).
+/// Both call sites pass `config.window_secs` for the window length.
+///
+/// `window_secs` is the monitoring interval in seconds — the `Δt` factor in the
+/// nutrient removal formula, formerly hardcoded to `3600`. Callers reading it
+/// from `OracleConfig` get a value `update_config` has constrained to
+/// `[MIN_WINDOW_SECS, MAX_WINDOW_SECS]`; the `checked_mul` below still guards
+/// the product regardless of what a direct caller passes.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_finalization(
     config: &OracleConfig,
@@ -551,7 +575,9 @@ pub fn compute_finalization(
     baseline_n: i128,
     baseline_p: i128,
     temp_threshold: i128,
+    window_secs: u64,
 ) -> FinalizationResult {
+    let window_secs_i128 = window_secs as i128;
     let med_flow_i128 = med_flow as i128;
     let med_n_i128 = med_n as i128;
     let med_p_i128 = med_p as i128;
@@ -560,7 +586,7 @@ pub fn compute_finalization(
         (baseline_n - med_n_i128)
             .checked_mul(med_flow_i128)
             .unwrap_or_else(|| panic!("n removal: flow multiplication overflow"))
-            .checked_mul(3600)
+            .checked_mul(window_secs_i128)
             .unwrap_or_else(|| panic!("n removal: time-window multiplication overflow"))
             / 1_000_000
     } else {
@@ -571,7 +597,7 @@ pub fn compute_finalization(
         (baseline_p - med_p_i128)
             .checked_mul(med_flow_i128)
             .unwrap_or_else(|| panic!("p removal: flow multiplication overflow"))
-            .checked_mul(3600)
+            .checked_mul(window_secs_i128)
             .unwrap_or_else(|| panic!("p removal: time-window multiplication overflow"))
             / 1_000_000
     } else {
@@ -671,6 +697,9 @@ impl VerificationOracle {
             slash_pct_bps: 1000,
             min_slash_amount: 0,
             max_slash_amount: i128::MAX,
+            // One hour — the interval the formula previously hardcoded, so
+            // existing deployments see no change in credit amounts.
+            window_secs: 3600,
         };
         e.storage().instance().set(&DataKey::Config, &config);
 
@@ -1040,6 +1069,7 @@ impl VerificationOracle {
                 baseline_n,
                 baseline_p,
                 baseline_temp,
+                config.window_secs,
             );
 
             let mut result = VerificationResult {
@@ -1257,6 +1287,13 @@ impl VerificationOracle {
         }
         if config.min_slash_amount < 0 || config.max_slash_amount < config.min_slash_amount {
             panic!("invalid slash amount bounds");
+        }
+        // The monitoring window is a direct multiplier on nutrient-removal
+        // credits, so a misconfigured value mis-issues credits at that scale.
+        // Bound it to a physically plausible sensor interval: 1 minute to
+        // 1 day (Issue #93).
+        if !(MIN_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&config.window_secs) {
+            panic!("window_secs out of valid range [60, 86400]");
         }
         e.storage().instance().set(&DataKey::Config, &config);
     }
@@ -2053,6 +2090,7 @@ impl VerificationOracle {
             baseline_n,
             baseline_p,
             temp_threshold,
+            config.window_secs,
         );
 
         let mut result = VerificationResult {
@@ -2333,6 +2371,8 @@ mod tests {
         assert_eq!(config.commit_phase_secs, 300);
         assert_eq!(config.min_reveal_ledgers, 0);
         assert_eq!(config.max_reveal_ledgers, 60);
+        // Backward compatible: the interval the formula used to hardcode.
+        assert_eq!(config.window_secs, 3600);
     }
 
     #[test]
@@ -2601,6 +2641,7 @@ mod tests {
             slash_pct_bps: 1000,
             min_slash_amount: 0,
             max_slash_amount: i128::MAX,
+            window_secs: 1800,
         };
         client.update_config(&admin, &new_config);
 
@@ -2608,6 +2649,7 @@ mod tests {
         assert_eq!(config.min_oracles, 5);
         assert_eq!(config.credit_per_kg_n, 15);
         assert_eq!(config.min_stake, 2000);
+        assert_eq!(config.window_secs, 1800);
     }
 
     #[test]
@@ -4129,6 +4171,66 @@ mod tests {
         config.slash_pct_bps = 5000;
         client.update_config(&admin, &config);
         assert_eq!(client.get_config().slash_pct_bps, 5000);
+    }
+
+    #[test]
+    fn test_update_config_rejects_window_secs_below_min() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.window_secs = MIN_WINDOW_SECS - 1;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_rejects_window_secs_above_max() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.window_secs = MAX_WINDOW_SECS + 1;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_rejects_zero_window_secs() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.window_secs = 0;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_accepts_window_secs_at_bounds() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.window_secs = MIN_WINDOW_SECS;
+        client.update_config(&admin, &config);
+        assert_eq!(client.get_config().window_secs, MIN_WINDOW_SECS);
+
+        config.window_secs = MAX_WINDOW_SECS;
+        client.update_config(&admin, &config);
+        assert_eq!(client.get_config().window_secs, MAX_WINDOW_SECS);
     }
 
     #[test]
