@@ -31,6 +31,16 @@ fn setup_10_oracles(
     let treasury = Address::generate(e);
     client.initialize(&admin, &staking_token, &treasury);
 
+    // Add all 10 oracles first (the default max_oracles = 10 allows this),
+    // then raise min_oracles to 10 — the quorum invariant requires
+    // `min_oracles <= oracle_count`.
+    let mut oracles = Vec::new(e);
+    for _ in 0..10u32 {
+        let o = Address::generate(e);
+        client.add_oracle(&admin, &o);
+        oracles.push_back(o);
+    }
+
     // Disable staking and set min_oracles = 10, max_oracles = 10.
     client.update_config(
         &admin,
@@ -57,13 +67,6 @@ fn setup_10_oracles(
             window_secs: 3600,
         },
     );
-
-    let mut oracles = Vec::new(e);
-    for _ in 0..10u32 {
-        let o = Address::generate(e);
-        client.add_oracle(&admin, &o);
-        oracles.push_back(o);
-    }
 
     (admin, client, project_id, oracles)
 }
@@ -149,31 +152,8 @@ fn test_median_gas_scales_linearly_from_three_to_ten() {
     let st3 = Address::generate(&e3);
     let tr3 = Address::generate(&e3);
     client3.initialize(&admin3, &st3, &tr3);
-    client3.update_config(
-        &admin3,
-        &OracleConfig {
-            min_oracles: 3,
-            max_oracles: 10,
-            quality_threshold_ph: 600,
-            quality_threshold_ph_max: 700,
-            quality_threshold_turbidity: 50,
-            quality_threshold_do: 50,
-            quality_threshold_temp: 300,
-            credit_per_kg_n: 10,
-            credit_per_kg_p: 20,
-            staking_token: st3,
-            treasury: tr3,
-            min_stake: 0,
-            unstake_cooldown_secs: 86400,
-            commit_phase_secs: 300,
-            min_reveal_ledgers: 0,
-            max_reveal_ledgers: 60,
-            slash_pct_bps: 1000,
-            min_slash_amount: 0,
-            max_slash_amount: i128::MAX,
-            window_secs: 3600,
-        },
-    );
+    // min_oracles defaults to 3 (matching the 3-oracle setup) and staking is
+    // disabled by default, so no config update is needed.
     let mut oracles3 = Vec::new(&e3);
     for _ in 0..3u32 {
         let o = Address::generate(&e3);

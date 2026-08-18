@@ -63,11 +63,8 @@ fn setup() -> Fixture {
     // Wire the project to the token + beneficiary.
     oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &10, &2, &300);
 
-    // Disable the min-stake requirement so oracles can be added without funding.
-    let mut config = oracle_client.get_config();
-    config.min_stake = 0;
-    oracle_client.update_config(&admin, &config);
-
+    // Staking is already disabled by default (min_stake = 0), so oracles can
+    // be added without funding.
     let mut oracles = Vec::new(&e);
     for _ in 0..3u32 {
         let o = Address::generate(&e);

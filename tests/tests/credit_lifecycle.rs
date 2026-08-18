@@ -2,7 +2,7 @@ use credit_token::{CreditToken, CreditTokenClient};
 use retirement_registry::{RetirementRegistry, RetirementRegistryClient};
 use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, String};
 use verification_oracle::{
-    sha256_commitment, OracleConfig, RevealParams, VerificationOracle, VerificationOracleClient,
+    sha256_commitment, RevealParams, VerificationOracle, VerificationOracleClient,
 };
 
 fn deploy_oracle(e: &Env, admin: &Address) -> (Address, VerificationOracleClient<'static>) {
@@ -11,33 +11,9 @@ fn deploy_oracle(e: &Env, admin: &Address) -> (Address, VerificationOracleClient
     let staking_token = Address::generate(e);
     let treasury = Address::generate(e);
     client.initialize(admin, &staking_token, &treasury);
-    // Disable staking for integration tests — staking requires a live token contract.
-    // Keep min_oracles at 3 to match the test's 3-oracle commit-reveal flow.
-    client.update_config(
-        admin,
-        &OracleConfig {
-            min_oracles: 3,
-            max_oracles: 10,
-            quality_threshold_ph: 600,
-            quality_threshold_ph_max: 700,
-            quality_threshold_turbidity: 50,
-            quality_threshold_do: 50,
-            quality_threshold_temp: 300,
-            credit_per_kg_n: 10,
-            credit_per_kg_p: 20,
-            staking_token,
-            treasury,
-            min_stake: 0,
-            unstake_cooldown_secs: 86400,
-            commit_phase_secs: 300,
-            min_reveal_ledgers: 0,
-            max_reveal_ledgers: 60,
-            slash_pct_bps: 1000,
-            min_slash_amount: 0,
-            max_slash_amount: i128::MAX,
-            window_secs: 3600,
-        },
-    );
+    // Staking is already disabled by default (min_stake = 0) and min_oracles
+    // defaults to 3, matching the test's 3-oracle commit-reveal flow — no
+    // config update is needed.
     (contract_id, client)
 }
 

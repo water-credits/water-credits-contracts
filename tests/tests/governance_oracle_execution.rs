@@ -33,6 +33,12 @@ fn test_proposal_updates_oracle_config_via_cross_contract_execution() {
     let oracle_client = VerificationOracleClient::new(&e, &oracle_id);
     oracle_client.initialize(&admin, &staking_token, &treasury);
 
+    // Register 3 oracles so the governance-proposed config keeps
+    // `min_oracles = 3` within the quorum invariant (`min_oracles <= oracle_count`).
+    oracle_client.add_oracle(&admin, &Address::generate(&e));
+    oracle_client.add_oracle(&admin, &Address::generate(&e));
+    oracle_client.add_oracle(&admin, &Address::generate(&e));
+
     let gov_id = e.register_contract(None, Governance);
     let gov_client = GovernanceClient::new(&e, &gov_id);
     gov_client.initialize(

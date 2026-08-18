@@ -1295,6 +1295,19 @@ impl VerificationOracle {
         if !(MIN_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&config.window_secs) {
             panic!("window_secs out of valid range [60, 86400]");
         }
+        // Preserve the quorum invariant: configuration cannot require more
+        // oracles than are currently registered. Without this, governance
+        // could raise `min_oracles` above `OracleCount`, leaving the protocol
+        // under-quorum — windows would collect submissions but never reach the
+        // threshold required to finalize (Issue #104).
+        let oracle_count: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleCount)
+            .unwrap_or(0);
+        if config.min_oracles > oracle_count {
+            panic!("min_oracles exceeds current oracle count");
+        }
         e.storage().instance().set(&DataKey::Config, &config);
     }
 
@@ -2621,6 +2634,12 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
+        // Register 5 oracles first so `min_oracles = 5` satisfies the quorum
+        // invariant (`min_oracles <= oracle_count`) enforced by update_config.
+        for _ in 0..5u32 {
+            client.add_oracle(&admin, &Address::generate(&e));
+        }
+
         let new_config = OracleConfig {
             min_oracles: 5,
             max_oracles: 10,
@@ -2753,11 +2772,10 @@ mod tests {
 
         // A single oracle finalizing per round requires min_oracles=1 so each
         // round completes and a fresh window can be opened for the next nonce.
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 1, 1500);
         let mut config = client.get_config();
         config.min_oracles = 1;
         client.update_config(&admin, &config);
-
-        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 1, 1500);
         let salt = BytesN::from_array(&e, &[0x60u8; 32]);
 
         let p1 = BytesN::from_array(&e, &[50u8; 32]);
@@ -2823,11 +2841,6 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        // Lower min_oracles so we can remove oracles
-        let mut config = client.get_config();
-        config.min_oracles = 1;
-        client.update_config(&admin, &config);
-
         assert_eq!(client.oracle_count(), 0);
 
         let o1 = Address::generate(&e);
@@ -2840,6 +2853,11 @@ mod tests {
         client.add_oracle(&admin, &o3);
         assert_eq!(client.oracle_count(), 3);
 
+        // Lower min_oracles (must stay <= current count) so removal is allowed.
+        let mut config = client.get_config();
+        config.min_oracles = 1;
+        client.update_config(&admin, &config);
+
         client.remove_oracle(&admin, &o2);
         assert_eq!(client.oracle_count(), 2);
     }
@@ -2848,11 +2866,6 @@ mod tests {
     fn test_get_oracles_returns_active_list() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
-
-        // Lower min_oracles so we can remove oracles
-        let mut config = client.get_config();
-        config.min_oracles = 1;
-        client.update_config(&admin, &config);
 
         let oracles = client.get_oracles();
         assert_eq!(oracles.len(), 0);
@@ -2869,6 +2882,11 @@ mod tests {
         assert!(oracles.contains(&o1));
         assert!(oracles.contains(&o2));
         assert!(oracles.contains(&o3));
+
+        // Lower min_oracles (must stay <= current count) so removal is allowed.
+        let mut config = client.get_config();
+        config.min_oracles = 1;
+        client.update_config(&admin, &config);
 
         client.remove_oracle(&admin, &o2);
         let oracles = client.get_oracles();
@@ -3071,11 +3089,10 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 2, 1500);
         let mut config = client.get_config();
         config.min_oracles = 2;
         client.update_config(&admin, &config);
-
-        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 2, 1500);
         let project_id = BytesN::from_array(&e, &[44u8; 32]);
         let salt = BytesN::from_array(&e, &[0x44u8; 32]);
         let readings = [
@@ -3167,13 +3184,15 @@ mod tests {
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
-        // Set min_stake to 1000 so the constraint is active
-        let mut config = client.get_config();
-        config.min_stake = 1000;
-        client.update_config(&admin, &config);
-
         client.stake(&oracle, &1500);
         client.add_oracle(&admin, &oracle);
+
+        // Set min_stake to 1000 (and min_oracles to the single registered
+        // oracle, satisfying the quorum invariant) so the constraint is active.
+        let mut config = client.get_config();
+        config.min_stake = 1000;
+        config.min_oracles = 1;
+        client.update_config(&admin, &config);
 
         // min_stake is 1000, staking 1500, trying to unstake 600 would leave 900 < 1000
         let result = e.try_invoke_contract::<Val, InvokeError>(
@@ -3305,10 +3324,13 @@ mod tests {
         e.mock_all_auths();
         let oracle = Address::generate(&e);
 
-        // Set min_stake to 1000 so the oracle with 0 stake is rejected
+        // Set min_stake to 1000 so the oracle with 0 stake is rejected.
+        // `min_oracles = 0` keeps the config valid while no oracles are
+        // registered yet (the quorum invariant is `min_oracles <= oracle_count`).
         client.update_config(
             &admin,
             &OracleConfig {
+                min_oracles: 0,
                 min_stake: 1000,
                 ..client.get_config()
             },
@@ -3645,11 +3667,11 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+
         let mut config = client.get_config();
         config.min_reveal_ledgers = 5;
         client.update_config(&admin, &config);
-
-        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
         let project_id = BytesN::from_array(&e, &[104u8; 32]);
         client.open_window(&admin, &project_id);
 
@@ -4046,9 +4068,11 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        // Add oracle with no stake (min_stake=0 first)
+        // Add oracle with no stake (min_stake=0 first). `min_oracles = 0`
+        // keeps the config valid while no oracles are registered yet.
         let mut config = client.get_config();
         config.min_stake = 0;
+        config.min_oracles = 0;
         client.update_config(&admin, &config);
 
         let oracle = Address::generate(&e);
@@ -4057,7 +4081,8 @@ mod tests {
         let project_id = BytesN::from_array(&e, &[115u8; 32]);
         client.open_window(&admin, &project_id);
 
-        // Re-enable min_stake
+        // Re-enable min_stake (min_oracles stays 0, which is <= the single
+        // registered oracle, so the quorum invariant holds).
         config.min_stake = 5000;
         client.update_config(&admin, &config);
 
@@ -4081,12 +4106,13 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        // Set min_stake > 0 so penalize_non_revealers actually creates slash records
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 4, 1500);
+
+        // Set min_stake > 0 so penalize_non_revealers actually creates slash
+        // records (min_oracles stays 3 <= 4 registered oracles).
         let mut config = client.get_config();
         config.min_stake = 1000;
         client.update_config(&admin, &config);
-
-        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 4, 1500);
 
         let project_id = BytesN::from_array(&e, &[116u8; 32]);
         client.open_window(&admin, &project_id);
@@ -4168,6 +4194,7 @@ mod tests {
         e.mock_all_auths();
 
         let mut config = client.get_config();
+        config.min_oracles = 0; // neutralise the quorum check for this test
         config.slash_pct_bps = 5000;
         client.update_config(&admin, &config);
         assert_eq!(client.get_config().slash_pct_bps, 5000);
@@ -4224,6 +4251,7 @@ mod tests {
         e.mock_all_auths();
 
         let mut config = client.get_config();
+        config.min_oracles = 0; // neutralise the quorum check for this test
         config.window_secs = MIN_WINDOW_SECS;
         client.update_config(&admin, &config);
         assert_eq!(client.get_config().window_secs, MIN_WINDOW_SECS);
@@ -4249,20 +4277,140 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Quorum invariant: min_oracles <= oracle_count (Issue #104) ──
+
+    /// `update_config` must reject a config whose `min_oracles` exceeds the
+    /// number of currently registered oracles, with an explicit panic message.
+    #[test]
+    #[should_panic(expected = "min_oracles exceeds current oracle count")]
+    fn test_update_config_rejects_min_oracles_above_oracle_count() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        // Only two oracles are registered...
+        client.add_oracle(&admin, &Address::generate(&e));
+        client.add_oracle(&admin, &Address::generate(&e));
+
+        // ...but the proposed config demands three, which would leave the
+        // protocol under-quorum (windows could never reach finalization).
+        let mut config = client.get_config();
+        config.min_oracles = 3;
+        client.update_config(&admin, &config);
+    }
+
+    /// `oracle_count == min_oracles` is the exact valid boundary.
+    #[test]
+    fn test_update_config_accepts_min_oracles_equal_to_oracle_count() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        for _ in 0..3u32 {
+            client.add_oracle(&admin, &Address::generate(&e));
+        }
+
+        let mut config = client.get_config();
+        config.min_oracles = 3;
+        client.update_config(&admin, &config);
+
+        assert_eq!(client.get_config().min_oracles, 3);
+    }
+
+    /// Boundary regression: `oracle_count == min_oracles - 1` is rejected.
+    /// Asserted through `try_invoke_contract` (rather than `#[should_panic]`)
+    /// so the rejection is observed as an error without aborting the test.
+    #[test]
+    fn test_update_config_rejects_min_oracles_one_above_oracle_count() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        client.add_oracle(&admin, &Address::generate(&e));
+        client.add_oracle(&admin, &Address::generate(&e));
+
+        let mut config = client.get_config();
+        config.min_oracles = 3;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    /// A rejected update must not partially overwrite the stored configuration:
+    /// the previous valid config stays intact after the invalid attempt.
+    #[test]
+    fn test_rejected_min_oracles_update_does_not_change_config() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        for _ in 0..3u32 {
+            client.add_oracle(&admin, &Address::generate(&e));
+        }
+
+        // Establish a known-good config (min_oracles == oracle_count == 3).
+        let mut valid = client.get_config();
+        valid.min_oracles = 3;
+        valid.credit_per_kg_n = 15;
+        client.update_config(&admin, &valid);
+
+        // Attempt an invalid update that would also change another field.
+        let mut invalid = client.get_config();
+        invalid.min_oracles = 4; // > oracle_count (3)
+        invalid.credit_per_kg_n = 99;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), invalid.into_val(&e)],
+        );
+        assert!(result.is_err());
+
+        // The stored config is unchanged.
+        let stored = client.get_config();
+        assert_eq!(stored.min_oracles, 3);
+        assert_eq!(stored.credit_per_kg_n, 15);
+    }
+
+    /// `remove_oracle` already enforces `count > min_oracles`, so at
+    /// `count == min_oracles` removal is prohibited (the resulting count would
+    /// be `min_oracles - 1`). Inspected for Issue #104 — this is the correct
+    /// behavior and is left unchanged; the test pins the boundary.
+    #[test]
+    fn test_remove_oracle_at_minimum_oracles_panics() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let o1 = Address::generate(&e);
+        let o2 = Address::generate(&e);
+        let o3 = Address::generate(&e);
+        client.add_oracle(&admin, &o1);
+        client.add_oracle(&admin, &o2);
+        client.add_oracle(&admin, &o3);
+        assert_eq!(client.oracle_count(), 3); // == default min_oracles (3)
+
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "remove_oracle"),
+            vec![&e, admin.to_val(), o1.to_val()],
+        );
+        assert!(result.is_err());
+        assert!(client.is_oracle_active(&o1));
+    }
+
     #[test]
     fn test_penalize_non_revealers_slashes_proportionally_to_stake() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
+        let oracle = Address::generate(&e);
+        client.stake(&oracle, &10_000);
+        client.add_oracle(&admin, &oracle);
+
         let mut config = client.get_config();
         config.slash_pct_bps = 1000; // 10%
         config.min_slash_amount = 0;
         config.max_slash_amount = i128::MAX;
+        config.min_oracles = 1; // single registered oracle
         client.update_config(&admin, &config);
-
-        let oracle = Address::generate(&e);
-        client.stake(&oracle, &10_000);
-        client.add_oracle(&admin, &oracle);
 
         let project_id = BytesN::from_array(&e, &[201u8; 32]);
         trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
@@ -4276,15 +4424,16 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
+        let oracle = Address::generate(&e);
+        client.stake(&oracle, &5_000);
+        client.add_oracle(&admin, &oracle);
+
         let mut config = client.get_config();
         config.slash_pct_bps = 1000; // 10%
         config.min_slash_amount = 0;
         config.max_slash_amount = i128::MAX;
+        config.min_oracles = 1; // single registered oracle
         client.update_config(&admin, &config);
-
-        let oracle = Address::generate(&e);
-        client.stake(&oracle, &5_000);
-        client.add_oracle(&admin, &oracle);
 
         let project_id = BytesN::from_array(&e, &[202u8; 32]);
         trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
@@ -4298,15 +4447,16 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
+        let oracle = Address::generate(&e);
+        client.stake(&oracle, &5_000);
+        client.add_oracle(&admin, &oracle);
+
         let mut config = client.get_config();
         config.slash_pct_bps = 100; // 1% — would be 50 on a 5,000 stake
         config.min_slash_amount = 800;
         config.max_slash_amount = i128::MAX;
+        config.min_oracles = 1; // single registered oracle
         client.update_config(&admin, &config);
-
-        let oracle = Address::generate(&e);
-        client.stake(&oracle, &5_000);
-        client.add_oracle(&admin, &oracle);
 
         let project_id = BytesN::from_array(&e, &[203u8; 32]);
         trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
@@ -4320,15 +4470,16 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
+        let oracle = Address::generate(&e);
+        client.stake(&oracle, &100_000);
+        client.add_oracle(&admin, &oracle);
+
         let mut config = client.get_config();
         config.slash_pct_bps = 5000; // 50% — would be 50,000 on a 100,000 stake
         config.min_slash_amount = 0;
         config.max_slash_amount = 2_000;
+        config.min_oracles = 1; // single registered oracle
         client.update_config(&admin, &config);
-
-        let oracle = Address::generate(&e);
-        client.stake(&oracle, &100_000);
-        client.add_oracle(&admin, &oracle);
 
         let project_id = BytesN::from_array(&e, &[204u8; 32]);
         trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
@@ -4342,16 +4493,17 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let mut config = client.get_config();
-        config.slash_pct_bps = 100; // 1%
-        config.min_slash_amount = 500;
-        config.max_slash_amount = i128::MAX;
-        client.update_config(&admin, &config);
-
         // Oracle only has 100 staked — below the 500 floor.
         let oracle = Address::generate(&e);
         client.stake(&oracle, &100);
         client.add_oracle(&admin, &oracle);
+
+        let mut config = client.get_config();
+        config.slash_pct_bps = 100; // 1%
+        config.min_slash_amount = 500;
+        config.max_slash_amount = i128::MAX;
+        config.min_oracles = 1; // single registered oracle
+        client.update_config(&admin, &config);
 
         let project_id = BytesN::from_array(&e, &[205u8; 32]);
         trigger_missed_reveal_penalty(&e, &admin, &client, &project_id, &oracle);
@@ -4528,9 +4680,6 @@ mod tests {
         let o2 = Address::generate(&e);
         let o3 = Address::generate(&e);
         let o4 = Address::generate(&e);
-        let mut config = client.get_config();
-        config.min_stake = 0;
-        client.update_config(&admin, &config);
         client.add_oracle(&admin, &o1);
         client.add_oracle(&admin, &o2);
         client.add_oracle(&admin, &o3);
@@ -4569,9 +4718,6 @@ mod tests {
         let o2 = Address::generate(&e);
         let o3 = Address::generate(&e);
         let o4 = Address::generate(&e);
-        let mut config = client.get_config();
-        config.min_stake = 0;
-        client.update_config(&admin, &config);
         client.add_oracle(&admin, &o1);
         client.add_oracle(&admin, &o2);
         client.add_oracle(&admin, &o3);
@@ -4607,9 +4753,6 @@ mod tests {
         let o2 = Address::generate(&e);
         let o3 = Address::generate(&e);
         let o4 = Address::generate(&e);
-        let mut config = client.get_config();
-        config.min_stake = 0;
-        client.update_config(&admin, &config);
         client.add_oracle(&admin, &o1);
         client.add_oracle(&admin, &o2);
         client.add_oracle(&admin, &o3);
@@ -4649,9 +4792,6 @@ mod tests {
         let o2 = Address::generate(&e);
         let o3 = Address::generate(&e);
         let o4 = Address::generate(&e);
-        let mut config = client.get_config();
-        config.min_stake = 0;
-        client.update_config(&admin, &config);
         client.add_oracle(&admin, &o1);
         client.add_oracle(&admin, &o2);
         client.add_oracle(&admin, &o3);
@@ -4705,9 +4845,6 @@ mod tests {
         let o2 = Address::generate(&e);
         let o3 = Address::generate(&e);
         let o4 = Address::generate(&e);
-        let mut config = client.get_config();
-        config.min_stake = 0;
-        client.update_config(&admin, &config);
         client.add_oracle(&admin, &o1);
         client.add_oracle(&admin, &o2);
         client.add_oracle(&admin, &o3);
@@ -4738,9 +4875,6 @@ mod tests {
         let o2 = Address::generate(&e);
         let o3 = Address::generate(&e);
         let o4 = Address::generate(&e);
-        let mut config = client.get_config();
-        config.min_stake = 0;
-        client.update_config(&admin, &config);
         client.add_oracle(&admin, &o1);
         client.add_oracle(&admin, &o2);
         client.add_oracle(&admin, &o3);
@@ -4776,9 +4910,6 @@ mod tests {
         let o2 = Address::generate(&e);
         let o3 = Address::generate(&e);
         let o4 = Address::generate(&e);
-        let mut config = client.get_config();
-        config.min_stake = 0;
-        client.update_config(&admin, &config);
         client.add_oracle(&admin, &o1);
         client.add_oracle(&admin, &o2);
         client.add_oracle(&admin, &o3);

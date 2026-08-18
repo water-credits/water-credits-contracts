@@ -334,10 +334,8 @@ fn setup() -> Fixture {
     let treasury = Address::generate(&e);
     client.initialize(&admin, &staking_token, &treasury);
 
-    let mut config = client.get_config();
-    config.min_stake = 0;
-    client.update_config(&admin, &config);
-
+    // Staking is already disabled by default (min_stake = 0), so oracles can
+    // be added without funding.
     let mut oracles = Vec::new(&e);
     for _ in 0..3u32 {
         let o = Address::generate(&e);
