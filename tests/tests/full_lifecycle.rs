@@ -36,9 +36,8 @@
 //! `project_registry` and `credit_factory` are independent contracts — the
 //! factory does not write into `project_registry`, so a deployment must
 //! register the project in both places. Both derive IDs with
-//! `shared::generate_project_id(count, timestamp)`, so mirrored
-//! registrations made in the same ledger with the same ordinal produce the
-//! same project ID, which this test asserts.
+//! `shared::generate_project_id(count, ...)`, so mirrored registrations made
+//! with the same ordinal produce the same project ID, which this test asserts.
 
 use credit_factory::{CreditFactory, CreditFactoryClient};
 use credit_token::{CreditTokenClient, RetirementCertificate};
@@ -215,8 +214,8 @@ fn test_full_six_contract_lifecycle() {
     // Mirror the registration in project_registry. The two contracts are
     // NOT integrated (the factory does not call the registry) — see the
     // module docs; this is the documented follow-up gap. Both use
-    // shared::generate_project_id(count, timestamp), so the mirrored entry
-    // gets the same canonical ID.
+    // shared::generate_project_id(count, ...), so the mirrored entry gets the
+    // same canonical ID.
     let registry_project_id = project_registry.register(
         &admin,
         &name,

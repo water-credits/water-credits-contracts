@@ -297,6 +297,61 @@ pub fn project_count(env: Env) -> u64;
 pub fn admin(env: Env) -> Address;
 ```
 
+#### Project ID Derivation
+
+`register_project` derives the project ID with `shared::generate_project_id`,
+the same helper `project_registry` uses, so a project mirrored into both
+contracts at the same ordinal gets the same ID.
+
+```
+project_id = SHA-256(
+    count            : u64  big-endian, 8 bytes
+  | len(name)        : u32  big-endian, 4 bytes
+  | name             : UTF-8 bytes
+  | len(methodology) : u32  big-endian, 4 bytes
+  | methodology      : UTF-8 bytes
+  | latitude         : i64  big-endian, 8 bytes   (×10^6, WGS84)
+  | longitude        : i64  big-endian, 8 bytes   (×10^6, WGS84)
+  | area_hectares    : u64  big-endian, 8 bytes
+)
+```
+
+`count` is the value `project_count()` returns *before* the registration (`0`
+for the first project). `name` and `methodology` are length-prefixed so
+different field splits cannot collide, and both are rejected above 128 bytes.
+
+The **ledger timestamp is not part of the hash**. It used to be, which made the
+ID depend on which ledger the registration transaction landed in — a one-ledger
+delay from a fee bump or congestion produced a different ID. Because the
+derivation now depends only on values the caller already knows, an off-chain
+service can compute the ID *before* submitting the transaction:
+
+```ts
+import { createHash } from "node:crypto";
+
+function projectId(
+  count: bigint, name: string, methodology: string,
+  latitude: bigint, longitude: bigint, areaHectares: bigint,
+): Buffer {
+  const u64 = (v: bigint) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(v); return b; };
+  const i64 = (v: bigint) => { const b = Buffer.alloc(8); b.writeBigInt64BE(v); return b; };
+  const u32 = (v: number) => { const b = Buffer.alloc(4); b.writeUInt32BE(v); return b; };
+  const nameBytes = Buffer.from(name, "utf8");
+  const methBytes = Buffer.from(methodology, "utf8");
+
+  return createHash("sha256").update(Buffer.concat([
+    u64(count),
+    u32(nameBytes.length), nameBytes,
+    u32(methBytes.length), methBytes,
+    i64(latitude), i64(longitude), u64(areaHectares),
+  ])).digest();
+}
+```
+
+The registration timestamp is still recorded on-chain as
+`ProjectInfo.registration_date` (and `ProjectEntry.registered_at` in
+`project_registry`) — it is display metadata, not an ID input.
+
 ---
 
 ### 3. Verification Oracle

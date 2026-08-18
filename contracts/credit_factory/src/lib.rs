@@ -122,7 +122,6 @@ impl CreditFactory {
         let project_id: BytesN<32> = generate_project_id(
             &e,
             count,
-            timestamp,
             &name,
             &methodology,
             latitude,

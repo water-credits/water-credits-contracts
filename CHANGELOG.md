@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contributions to finalized windows, so resetting a pending window cannot
   inflate an oracle's reputation counters
 - `verification_oracle`: `validate_sensor_reading` now rejects out-of-range `turbidity` and `temperature` readings, closing a gap that let a malicious or malfunctioning oracle submit negative values to disable the turbidity/temperature quality penalties
+- `shared::generate_project_id` no longer folds the ledger timestamp into the SHA-256 preimage, so a project ID no longer depends on which ledger the registration transaction lands in. Off-chain systems can now pre-compute the ID before submitting; previously a one-ledger delay (fee bump, congestion) silently changed it
 
 ### Changed
 
@@ -57,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded spec documentation with oracle window lifecycle
 - `penalize_non_revealers` now slashes a percentage of an oracle's stake (`stake * slash_pct_bps / 10_000`, clamped to `[min_slash_amount, max_slash_amount]`) instead of a flat `min(stake, min_stake)` amount, so oracles with larger stakes face proportionally larger penalties for missed reveals
 - `update_config` now validates `slash_pct_bps <= 5000` (50% max) and `min_slash_amount <= max_slash_amount`
+- **Breaking:** `shared::generate_project_id` dropped its `timestamp` parameter; the derivation is now `SHA-256(count || len(name) || name || len(methodology) || methodology || latitude || longitude || area_hectares)`. Already-registered projects keep their stored IDs; only IDs derived from this point on change. The registration timestamp is still recorded as `ProjectInfo.registration_date` / `ProjectEntry.registered_at`
 
 ### Testing
 

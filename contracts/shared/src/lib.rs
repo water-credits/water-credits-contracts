@@ -70,10 +70,10 @@ pub fn is_valid_status(e: &Env, status: &String) -> bool {
 
 /// Canonical project ID generation across all contracts.
 ///
-/// Produces a deterministic 32-byte ID from registration inputs.
+/// Produces a deterministic 32-byte ID from registration inputs only.
 ///
 /// Format: SHA-256(
-///   count_be8 | timestamp_be8 |
+///   count_be8 |
 ///   name_len_be4 | name_bytes |
 ///   methodology_len_be4 | methodology_bytes |
 ///   latitude_be8 | longitude_be8 | area_hectares_be8
@@ -81,11 +81,22 @@ pub fn is_valid_status(e: &Env, status: &String) -> bool {
 ///
 /// Length-prefixed string fields prevent prefix collisions between different
 /// field combinations.
+///
+/// The ledger timestamp is deliberately **not** part of the preimage (Issue
+/// #96). Hashing it made the ID depend on which ledger the registration
+/// transaction happened to land in, so an off-chain system could not
+/// pre-compute the ID before submitting: a one-ledger delay (fee bump,
+/// congestion) silently changed the result. `count` — the registering
+/// contract's monotonically increasing project counter — supplies the
+/// uniqueness the timestamp used to provide, including for re-registrations
+/// of otherwise identical project details. Callers still record the
+/// registration timestamp in their own project state (`ProjectInfo`
+/// `registration_date` / `ProjectEntry` `registered_at`); it is display
+/// metadata, not an ID input.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_project_id(
     e: &Env,
     count: u64,
-    timestamp: u64,
     name: &String,
     methodology: &String,
     latitude: i64,
@@ -103,9 +114,6 @@ pub fn generate_project_id(
 
     let count_bytes = count.to_be_bytes();
     preimage.append(&Bytes::from_array(e, &count_bytes));
-
-    let ts_bytes = timestamp.to_be_bytes();
-    preimage.append(&Bytes::from_array(e, &ts_bytes));
 
     let name_len = name.len();
     preimage.append(&Bytes::from_array(e, &name_len.to_be_bytes()));
@@ -301,13 +309,18 @@ mod tests {
 
     // ── Existing generate_project_id tests ──
 
+    /// The ID is a pure function of its arguments — the ledger clock is not
+    /// one of them (Issue #96). Varying the ledger timestamp requires the
+    /// `testutils` `Ledger` trait, which this crate does not depend on, so
+    /// that half of the property is asserted through the real contract entry
+    /// points in `tests/tests/project_id_determinism.rs`.
     #[test]
     fn test_deterministic() {
         let e = Env::default();
         let name = String::from_str(&e, "A");
         let methodology = String::from_str(&e, "B");
-        let id1 = generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
-        let id2 = generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
+        let id1 = generate_project_id(&e, 0, &name, &methodology, 1, 2, 3);
+        let id2 = generate_project_id(&e, 0, &name, &methodology, 1, 2, 3);
         assert_eq!(id1, id2);
     }
 
@@ -316,45 +329,17 @@ mod tests {
         let e = Env::default();
         let name = String::from_str(&e, "A");
         let methodology = String::from_str(&e, "B");
-        let id1 = generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
-        let id2 = generate_project_id(&e, 1, 1000, &name, &methodology, 1, 2, 3);
+        let id1 = generate_project_id(&e, 0, &name, &methodology, 1, 2, 3);
+        let id2 = generate_project_id(&e, 1, &name, &methodology, 1, 2, 3);
         assert_ne!(id1, id2);
     }
 
     #[test]
-    fn test_different_timestamp_different_id() {
-        let e = Env::default();
-        let name = String::from_str(&e, "A");
-        let methodology = String::from_str(&e, "B");
-        let id1 = generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
-        let id2 = generate_project_id(&e, 0, 1001, &name, &methodology, 1, 2, 3);
-        assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn test_different_name_different_id_same_count_and_timestamp() {
+    fn test_different_name_different_id_same_count() {
         let e = Env::default();
         let methodology = String::from_str(&e, "B");
-        let id1 = generate_project_id(
-            &e,
-            0,
-            1000,
-            &String::from_str(&e, "A"),
-            &methodology,
-            1,
-            2,
-            3,
-        );
-        let id2 = generate_project_id(
-            &e,
-            0,
-            1000,
-            &String::from_str(&e, "C"),
-            &methodology,
-            1,
-            2,
-            3,
-        );
+        let id1 = generate_project_id(&e, 0, &String::from_str(&e, "A"), &methodology, 1, 2, 3);
+        let id2 = generate_project_id(&e, 0, &String::from_str(&e, "C"), &methodology, 1, 2, 3);
         assert_ne!(id1, id2);
     }
 
@@ -363,11 +348,11 @@ mod tests {
         let e = Env::default();
         let name1 = String::from_str(&e, "AB");
         let meth1 = String::from_str(&e, "C");
-        let id1 = generate_project_id(&e, 0, 1000, &name1, &meth1, 1, 2, 3);
+        let id1 = generate_project_id(&e, 0, &name1, &meth1, 1, 2, 3);
 
         let name2 = String::from_str(&e, "A");
         let meth2 = String::from_str(&e, "BC");
-        let id2 = generate_project_id(&e, 0, 1000, &name2, &meth2, 1, 2, 3);
+        let id2 = generate_project_id(&e, 0, &name2, &meth2, 1, 2, 3);
 
         assert_ne!(id1, id2);
     }
@@ -377,7 +362,7 @@ mod tests {
         let e = Env::default();
         let name = String::from_str(&e, "A");
         let methodology = String::from_str(&e, "B");
-        let id = generate_project_id(&e, 42, 9999, &name, &methodology, 1, 2, 3);
+        let id = generate_project_id(&e, 42, &name, &methodology, 1, 2, 3);
         assert_eq!(id.len(), 32);
     }
 
@@ -389,7 +374,7 @@ mod tests {
         name_bytes.fill(b'A');
         let name = String::from_str(&e, core::str::from_utf8(&name_bytes).unwrap());
         let methodology = String::from_str(&e, "B");
-        generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
+        generate_project_id(&e, 0, &name, &methodology, 1, 2, 3);
     }
 
     #[test]
@@ -400,7 +385,7 @@ mod tests {
         let mut meth_bytes = [0u8; 129];
         meth_bytes.fill(b'B');
         let methodology = String::from_str(&e, core::str::from_utf8(&meth_bytes).unwrap());
-        generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
+        generate_project_id(&e, 0, &name, &methodology, 1, 2, 3);
     }
 
     #[test]
@@ -412,7 +397,7 @@ mod tests {
         let mut meth_bytes = [0u8; 128];
         meth_bytes.fill(b'B');
         let methodology = String::from_str(&e, core::str::from_utf8(&meth_bytes).unwrap());
-        let id = generate_project_id(&e, 0, 1000, &name, &methodology, 1, 2, 3);
+        let id = generate_project_id(&e, 0, &name, &methodology, 1, 2, 3);
         assert_eq!(id.len(), 32);
     }
 }

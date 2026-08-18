@@ -14,8 +14,8 @@ fn test_shared_helper_deterministic_across_envs() {
     let name = String::from_str(&e, "Project Alpha");
     let meth = String::from_str(&e, "Methodology 1");
 
-    let id1 = generate_project_id(&e, 0, 1_700_000_000, &name, &meth, 100, 200, 50);
-    let id2 = generate_project_id(&e, 0, 1_700_000_000, &name, &meth, 100, 200, 50);
+    let id1 = generate_project_id(&e, 0, &name, &meth, 100, 200, 50);
+    let id2 = generate_project_id(&e, 0, &name, &meth, 100, 200, 50);
 
     assert_eq!(
         id1, id2,
@@ -32,8 +32,7 @@ fn test_first_five_project_ids_match() {
     let meth = String::from_str(&e, "Methodology 1");
 
     for count in 0u64..5 {
-        let timestamp = 1_700_000_000 + count * 3600;
-        let id = generate_project_id(&e, count, timestamp, &name, &meth, 100, 200, 50);
+        let id = generate_project_id(&e, count, &name, &meth, 100, 200, 50);
 
         // Verify the ID is a valid 32-byte hash (not raw byte-packing with trailing zeros)
         assert_eq!(id.len(), 32);
@@ -48,17 +47,19 @@ fn test_first_five_project_ids_match() {
     }
 }
 
-/// Verify uniqueness across different counts with the same timestamp.
+/// Verify uniqueness across different counts. `count` is the only
+/// uniqueness-bearing field once the ledger timestamp is out of the preimage
+/// (Issue #96), so this is what keeps re-registrations of identical project
+/// details distinct.
 #[test]
-fn test_uniqueness_same_timestamp() {
+fn test_uniqueness_across_counts() {
     let e = Env::default();
-    let timestamp = 1_700_000_000;
     let name = String::from_str(&e, "Project Alpha");
     let meth = String::from_str(&e, "Methodology 1");
 
     let mut seen = soroban_sdk::Vec::<BytesN<32>>::new(&e);
     for count in 0u64..10 {
-        let id = generate_project_id(&e, count, timestamp, &name, &meth, 100, 200, 50);
+        let id = generate_project_id(&e, count, &name, &meth, 100, 200, 50);
         // Ensure no duplicates
         for i in 0..seen.len() {
             assert_ne!(seen.get(i).unwrap(), id, "duplicate ID at count={}", count);
@@ -80,7 +81,7 @@ fn test_documents_breaking_change() {
     let meth = String::from_str(&e, "Methodology 1");
 
     // New canonical ID (SHA-256 based)
-    let new_id = generate_project_id(&e, count, timestamp, &name, &meth, 100, 200, 50);
+    let new_id = generate_project_id(&e, count, &name, &meth, 100, 200, 50);
 
     // Old byte-packing scheme (what project_registry used to do)
     let count_bytes = count.to_be_bytes();

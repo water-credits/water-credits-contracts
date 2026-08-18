@@ -115,7 +115,6 @@ impl ProjectRegistry {
         let project_id = generate_project_id(
             &e,
             count,
-            timestamp,
             &name,
             &methodology,
             latitude,

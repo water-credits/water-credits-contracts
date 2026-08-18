@@ -364,6 +364,9 @@ queried or listed by any caller.
 |---|---|---|
 | `update_owner(caller, project_id, new_owner)` | admin or current owner | Transfer project ownership |
 
+Project IDs are derived with the same canonical scheme the factory uses — see
+[§2.5 Project ID derivation](#project-id-derivation).
+
 ---
 
 ### 2.5 credit_factory
@@ -375,6 +378,42 @@ Deploys new `credit_token` instances and maintains a project index.
 | Function | Auth | Description |
 |---|---|---|
 | `update_project_owner(caller, project_id, new_owner)` | admin or current owner | Transfer project ownership in factory index |
+
+#### Project ID derivation
+
+`credit_factory` and `project_registry` both derive the project ID through
+`shared::generate_project_id`, so a project mirrored into both contracts at the
+same ordinal gets the same 32-byte ID.
+
+```
+project_id = SHA-256(
+    count               : u64  big-endian, 8 bytes
+  | len(name)           : u32  big-endian, 4 bytes
+  | name                : UTF-8 bytes, len(name) bytes
+  | len(methodology)    : u32  big-endian, 4 bytes
+  | methodology         : UTF-8 bytes, len(methodology) bytes
+  | latitude            : i64  big-endian, 8 bytes (×10⁶, WGS84)
+  | longitude           : i64  big-endian, 8 bytes (×10⁶, WGS84)
+  | area_hectares       : u64  big-endian, 8 bytes
+)
+```
+
+- `count` is the registering contract's project counter *before* the
+  registration (`0` for the first project). It is the only uniqueness-bearing
+  field when two registrations share identical details.
+- `name` and `methodology` are length-prefixed so that different field splits
+  cannot collide (e.g. `name="AB", methodology="C"` vs `name="A",
+  methodology="BC"`). Both are rejected above 128 bytes.
+- The **ledger timestamp is not an input** (Issue #96). Hashing it made the ID
+  depend on which ledger the registration transaction landed in, so a
+  one-ledger delay from a fee bump or congestion changed the ID and broke any
+  off-chain system pre-computing it. The registration timestamp is still stored
+  — `ProjectInfo.registration_date` in the factory, `ProjectEntry.registered_at`
+  in the registry — purely as display metadata.
+
+Because the derivation is a pure function of values the caller already knows, an
+off-chain system can compute the ID before submitting the transaction: read
+`project_count()`, hash the preimage above, and the returned ID will match.
 
 ---
 
