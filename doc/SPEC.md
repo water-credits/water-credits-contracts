@@ -456,7 +456,8 @@ changes after a timelock. Voting is majority-based with a configurable
 approval threshold.
 
 **Proposal execution.** Each `Proposal` carries a list of `GovernanceAction`
-entries (`target: Address`, `function: Symbol`, `args: Vec<Val>`). On
+entries (`target: Address`, `function: Symbol`, `args: Vec<Val>`) and a
+boolean `allow_partial_execution` flag chosen at creation time. On
 `execute()`, once the timelock has elapsed, `governance` dispatches each
 action in order:
 
@@ -464,12 +465,33 @@ action in order:
   built-in protocol actions (pause/unpause every token in `RegisteredTokens`);
   `target` is ignored for these.
 - Any other `function` is invoked generically via `e.invoke_contract(target,
-  function, args)`.
+  function, args)` (atomic mode) or `e.try_invoke_contract(target, function,
+  args)` (best-effort mode).
 
-If any action panics, the whole `execute()` call reverts (standard Soroban
-transaction semantics) and the proposal remains `Approved` for retry. The
-proposal is only marked `Executed` after every action in the list succeeds —
-the status write happens after the dispatch loop, not before it.
+**Execution mode.**
+
+- *Atomic* (`allow_partial_execution == false`, the default). If any action
+  panics, the whole `execute()` call reverts (standard Soroban transaction
+  semantics) and the proposal remains `Approved` for retry. The proposal is
+  only marked `Executed` after every action in the list succeeds — the status
+  write happens after the dispatch loop, not before it. A failed atomic
+  execution is deliberately **not** marked `FailedExecution`; it stays
+  `Approved` so members can retry it without a new voting cycle.
+- *Best-effort* (`allow_partial_execution == true`). Each action is dispatched
+  via `e.try_invoke_contract` and a failure is recorded without reverting the
+  surrounding call. This is intended for emergency-control proposals where
+  partial execution (pause 4 of 5 tokens) is strictly better than none. The
+  per-action outcome is stored in `Proposal.action_results` (`Vec<bool>`,
+  `actions[i]` → `action_results[i]`) and published in the `exec_partial`
+  event as `(proposal_id, action_results)`. The proposal transitions to
+  `Executed` once the dispatch loop completes, even if some actions failed.
+
+**Cancellation.** `cancel_proposal(admin, proposal_id)` transitions an
+`Approved` or `Active` proposal to the terminal `Cancelled` state and removes
+it from `ActiveProposals`, freeing its slot. It is admin-only, so a member
+cannot use it to block a proposal they dislike. It is the recovery path for a
+proposal whose actions can no longer succeed (e.g. a target contract was
+upgraded and its function signature changed).
 
 **Authorization: how governance acts as admin of other contracts.** A
 generic action such as `verification_oracle::update_config(admin, config)`
@@ -603,6 +625,8 @@ The following properties must hold at all times:
 | `orc_slsh` | `verification_oracle` | `(oracle, amount, reason)` | Oracle stake slashed |
 | `prop_crt` | `governance` | `(proposal_id, proposer)` | Proposal created |
 | `vote_cst` | `governance` | `(proposal_id, voter, approve)` | Vote cast |
-| `prop_exe` | `governance` | `(proposal_id,)` | Proposal executed |
+| `prop_exe` | `governance` | `(proposal_id,)` | Proposal executed (atomic mode) |
+| `exec_partial` | `governance` | `(proposal_id, action_results)` | Proposal executed in best-effort mode; `action_results` is a `Vec<bool>` mirroring the proposal's actions |
+| `prop_cancel` | `governance` | `(proposal_id,)` | Proposal cancelled by admin |
 | `memb_add` | `governance` | `(member,)` | Member added |
 | `memb_rmv` | `governance` | `(member,)` | Member removed |

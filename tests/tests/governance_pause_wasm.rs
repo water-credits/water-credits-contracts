@@ -33,6 +33,7 @@ fn execute_protocol_action(
         &String::from_str(e, function),
         &String::from_str(e, "Exercise the governance emergency control"),
         &Vec::from_array(e, [action]),
+        &false,
     );
     governance.vote(member, &proposal_id, &true);
 

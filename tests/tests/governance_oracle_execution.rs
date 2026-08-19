@@ -71,6 +71,7 @@ fn test_proposal_updates_oracle_config_via_cross_contract_execution() {
         &String::from_str(&e, "Raise nitrogen credit rate"),
         &String::from_str(&e, "Update oracle credit_per_kg_n from 10 to 25"),
         &actions,
+        &false,
     );
 
     gov_client.vote(&member1, &proposal_id, &true);

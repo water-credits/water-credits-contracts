@@ -135,6 +135,7 @@ fn test_supermajority_proposal_emergency_pause() {
             "Oracle 0xABCD has been flagged as compromised. Pause all tokens while we investigate.",
         ),
         &actions,
+        &false,
     );
 
     // All three members vote for (100 % ≥ 60 % threshold) → Approved.
@@ -198,6 +199,7 @@ fn test_supermajority_proposal_emergency_unpause() {
             "The oracle compromise was a false positive. Resume operations.",
         ),
         &actions,
+        &false,
     );
 
     gov_client.vote(&member1, &proposal_id, &true);

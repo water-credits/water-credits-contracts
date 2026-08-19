@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, String, Symbol, Val, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, InvokeError, String,
+    Symbol, Val, Vec,
 };
 
 #[cfg(test)]
@@ -23,7 +24,7 @@ pub enum ProposalStatus {
     Active,
     Approved,
     Executed,
-    FailedExecution,
+    Cancelled,
     Rejected,
     Expired,
 }
@@ -53,6 +54,14 @@ pub struct Proposal {
     pub title: String,
     pub description: String,
     pub actions: Vec<GovernanceAction>,
+    /// When true, `execute()` dispatches each action in best-effort mode and
+    /// records per-action success/failure in `action_results` instead of
+    /// reverting the whole call. Defaults to false (atomic execution).
+    pub allow_partial_execution: bool,
+    /// Populated by `execute()` when `allow_partial_execution` is true. Each
+    /// entry mirrors `actions[i]`: true if the action succeeded, false if it
+    /// failed. Stays empty for atomic proposals.
+    pub action_results: Vec<bool>,
     /// Number of "yes" votes. Stored as a count (not a voter list) for bounded
     /// storage and O(1) updates. Per-voter dedup is enforced via
     /// `DataKey::HasVoted`.
@@ -222,6 +231,11 @@ impl Governance {
     }
 
     /// Create a new proposal. Only governance members can propose.
+    ///
+    /// `allow_partial_execution` opts the proposal into best-effort execution:
+    /// when true, `execute()` records per-action success/failure in
+    /// `Proposal.action_results` instead of reverting the whole call on the
+    /// first failure. Defaults to false (atomic, all-or-nothing execution).
     /// Returns the auto-incremented proposal ID.
     pub fn propose(
         e: Env,
@@ -229,6 +243,7 @@ impl Governance {
         title: String,
         description: String,
         actions: Vec<GovernanceAction>,
+        allow_partial_execution: bool,
     ) -> u64 {
         proposer.require_auth();
 
@@ -261,6 +276,8 @@ impl Governance {
             title,
             description,
             actions,
+            allow_partial_execution,
+            action_results: Vec::new(&e),
             votes_for: 0,
             votes_against: 0,
             eligible_voters: member_count(&e),
@@ -443,22 +460,11 @@ impl Governance {
             panic!("timelock not elapsed");
         }
 
-        // Remove from active list
-        let active: Vec<u64> = e
-            .storage()
-            .instance()
-            .get(&DataKey::ActiveProposals)
-            .unwrap();
-        let mut new_active: Vec<u64> = Vec::new(&e);
-        for i in 0..active.len() {
-            let id = active.get(i).unwrap();
-            if id != proposal_id {
-                new_active.push_back(id);
-            }
-        }
-        e.storage()
-            .instance()
-            .set(&DataKey::ActiveProposals, &new_active);
+        // Remove from the active list before dispatch. In atomic mode a
+        // failing action reverts the whole transaction, which rolls this
+        // removal back; in best-effort mode the removal persists so a
+        // partially-executed proposal can never re-block the active slot.
+        Self::remove_from_active(&e, proposal_id);
 
         // Dispatch proposal actions.
         //
@@ -470,22 +476,85 @@ impl Governance {
         // via `e.invoke_contract()`, using the target address, function symbol,
         // and arguments stored in the GovernanceAction.
         //
-        // Error policy — REVERT: if any cross-contract invocation fails the
-        // entire `execute()` call is reverted.  The proposal retains its
-        // `Approved` status and can be retried or superseded by a new proposal.
+        // Error policy:
+        //   * Atomic (allow_partial_execution == false) — REVERT: if any
+        //     cross-contract invocation fails the entire `execute()` call is
+        //     reverted and the proposal retains its `Approved` status for retry.
+        //   * Best-effort (allow_partial_execution == true) — each action is
+        //     dispatched via `try_invoke_contract`; failures are recorded in
+        //     `action_results` without reverting the surrounding call.
+        let best_effort = proposal.allow_partial_execution;
+        let mut action_results: Vec<bool> = Vec::new(&e);
+
         for i in 0..proposal.actions.len() {
             let action = proposal.actions.get(i).unwrap();
-            if action.function == soroban_sdk::Symbol::new(&e, "emergency_pause") {
-                Self::do_pause(&e);
-            } else if action.function == soroban_sdk::Symbol::new(&e, "emergency_unpause") {
-                Self::do_unpause(&e);
-            } else {
-                e.invoke_contract::<()>(&action.target, &action.function, action.args.clone());
+            let ok = Self::dispatch_action(&e, &action, best_effort);
+            if best_effort {
+                action_results.push_back(ok);
             }
         }
 
-        // Mark executed only after all actions succeed (revert-safe ordering).
         proposal.status = ProposalStatus::Executed;
+        if best_effort {
+            proposal.action_results = action_results;
+            e.storage().persistent().set(&proposal_key, &proposal);
+            e.storage().persistent().extend_ttl(
+                &proposal_key,
+                PROPOSAL_TTL_THRESHOLD,
+                PROPOSAL_TTL_BUMP,
+            );
+            // `exec_partial` is longer than the 9-char `symbol_short!` limit,
+            // so the topic is built at runtime.
+            e.events().publish(
+                (Symbol::new(&e, "exec_partial"),),
+                (proposal_id, proposal.action_results.clone()),
+            );
+        } else {
+            // Mark executed only after all actions succeed (revert-safe ordering).
+            e.storage().persistent().set(&proposal_key, &proposal);
+            e.storage().persistent().extend_ttl(
+                &proposal_key,
+                PROPOSAL_TTL_THRESHOLD,
+                PROPOSAL_TTL_BUMP,
+            );
+            e.events()
+                .publish((EVENT_PROPOSAL_EXECUTED,), (proposal_id,));
+        }
+    }
+
+    /// Cancel an approved or active proposal. Admin only.
+    ///
+    /// This is the on-chain recovery path for a proposal whose actions can no
+    /// longer succeed (for example a target contract was upgraded and its
+    /// function signature changed, leaving an `Approved` proposal permanently
+    /// un-executable). It transitions the proposal to the terminal `Cancelled`
+    /// state and frees its active-proposals slot without requiring a full new
+    /// voting cycle.
+    ///
+    /// Restricted to the admin so a member cannot use it to block a proposal
+    /// they dislike. Already-resolved proposals (Executed/Rejected/Expired) are
+    /// not cancellable.
+    pub fn cancel_proposal(e: Env, admin: Address, proposal_id: u64) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+
+        let proposal_key = DataKey::Proposal(proposal_id);
+        let mut proposal: Proposal = e
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic!("proposal not found"));
+
+        if !matches!(proposal.status, ProposalStatus::Approved)
+            && !matches!(proposal.status, ProposalStatus::Active)
+        {
+            panic!("proposal not cancellable");
+        }
+
+        proposal.status = ProposalStatus::Cancelled;
         e.storage().persistent().set(&proposal_key, &proposal);
         e.storage().persistent().extend_ttl(
             &proposal_key,
@@ -493,8 +562,12 @@ impl Governance {
             PROPOSAL_TTL_BUMP,
         );
 
+        Self::remove_from_active(&e, proposal_id);
+
+        // `prop_cancel` is longer than the 9-char `symbol_short!` limit, so
+        // the topic is built at runtime.
         e.events()
-            .publish((EVENT_PROPOSAL_EXECUTED,), (proposal_id,));
+            .publish((Symbol::new(&e, "prop_cancel"),), (proposal_id,));
     }
 
     /// Update the governance configuration parameters. Admin only.
@@ -685,7 +758,60 @@ impl Governance {
 
     // ── Internal helpers ──
 
-    fn do_pause(e: &Env) {
+    /// Remove `proposal_id` from `ActiveProposals` if present. Used by both
+    /// `execute` (before dispatch) and `cancel_proposal` so a resolved or
+    /// cancelled proposal always frees its slot.
+    fn remove_from_active(e: &Env, proposal_id: u64) {
+        let active: Vec<u64> = e
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveProposals)
+            .unwrap_or_else(|| Vec::new(e));
+        let mut new_active: Vec<u64> = Vec::new(e);
+        for i in 0..active.len() {
+            let id = active.get(i).unwrap();
+            if id != proposal_id {
+                new_active.push_back(id);
+            }
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::ActiveProposals, &new_active);
+    }
+
+    /// Dispatch a single proposal action.
+    ///
+    /// In atomic mode (`best_effort == false`) a failing action panics and
+    /// aborts the whole `execute()` call. In best-effort mode the outcome is
+    /// reported as a boolean so `execute()` can record per-action results.
+    fn dispatch_action(e: &Env, action: &GovernanceAction, best_effort: bool) -> bool {
+        if action.function == soroban_sdk::Symbol::new(e, "emergency_pause") {
+            return Self::pause_all(e, best_effort);
+        }
+        if action.function == soroban_sdk::Symbol::new(e, "emergency_unpause") {
+            return Self::unpause_all(e, best_effort);
+        }
+
+        // Generic cross-contract invocation.
+        if best_effort {
+            e.try_invoke_contract::<Val, InvokeError>(
+                &action.target,
+                &action.function,
+                action.args.clone(),
+            )
+            .is_ok()
+        } else {
+            e.invoke_contract::<()>(&action.target, &action.function, action.args.clone());
+            true
+        }
+    }
+
+    /// Pause every registered token contract.
+    ///
+    /// In best-effort mode a failing token is skipped and the overall result is
+    /// reported via the returned boolean; in atomic mode the first failure
+    /// panics. Returns true when every token paused successfully.
+    fn pause_all(e: &Env, best_effort: bool) -> bool {
         let tokens: Vec<Address> = e
             .storage()
             .instance()
@@ -693,32 +819,80 @@ impl Governance {
             .unwrap_or_else(|| Vec::new(e));
 
         let gov_addr = e.current_contract_address();
+        let mut all_ok = true;
         for i in 0..tokens.len() {
             let token = tokens.get(i).unwrap();
             let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
-            e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "pause"), args);
+            let ok = if best_effort {
+                e.try_invoke_contract::<Val, InvokeError>(
+                    &token,
+                    &soroban_sdk::Symbol::new(e, "pause"),
+                    args,
+                )
+                .is_ok()
+            } else {
+                e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "pause"), args);
+                true
+            };
+            if !ok {
+                all_ok = false;
+            }
         }
 
-        e.storage().instance().set(&DataKey::ProtocolPaused, &true);
-        e.events().publish((EVENT_EMERGENCY_PAUSE,), ());
+        // Only record a clean protocol-wide pause when every token paused;
+        // otherwise the protocol is left partially paused and remediation is
+        // observable via `Proposal.action_results` / the `exec_partial` event.
+        if all_ok {
+            e.storage().instance().set(&DataKey::ProtocolPaused, &true);
+            e.events().publish((EVENT_EMERGENCY_PAUSE,), ());
+        }
+        all_ok
+    }
+
+    /// Unpause every registered token contract. Mirrors `pause_all`.
+    fn unpause_all(e: &Env, best_effort: bool) -> bool {
+        let tokens: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredTokens)
+            .unwrap_or_else(|| Vec::new(e));
+
+        let gov_addr = e.current_contract_address();
+        let mut all_ok = true;
+        for i in 0..tokens.len() {
+            let token = tokens.get(i).unwrap();
+            let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
+            let ok = if best_effort {
+                e.try_invoke_contract::<Val, InvokeError>(
+                    &token,
+                    &soroban_sdk::Symbol::new(e, "unpause"),
+                    args,
+                )
+                .is_ok()
+            } else {
+                e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "unpause"), args);
+                true
+            };
+            if !ok {
+                all_ok = false;
+            }
+        }
+
+        if all_ok {
+            e.storage().instance().set(&DataKey::ProtocolPaused, &false);
+            e.events().publish((EVENT_EMERGENCY_UNPAUSE,), ());
+        }
+        all_ok
+    }
+
+    fn do_pause(e: &Env) {
+        // Atomic by default: a failing token aborts the whole batch.
+        let _ = Self::pause_all(e, false);
     }
 
     fn do_unpause(e: &Env) {
-        let tokens: Vec<Address> = e
-            .storage()
-            .instance()
-            .get(&DataKey::RegisteredTokens)
-            .unwrap_or_else(|| Vec::new(e));
-
-        let gov_addr = e.current_contract_address();
-        for i in 0..tokens.len() {
-            let token = tokens.get(i).unwrap();
-            let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
-            e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "unpause"), args);
-        }
-
-        e.storage().instance().set(&DataKey::ProtocolPaused, &false);
-        e.events().publish((EVENT_EMERGENCY_UNPAUSE,), ());
+        // Atomic by default: a failing token aborts the whole batch.
+        let _ = Self::unpause_all(e, false);
     }
 }
 
@@ -794,6 +968,7 @@ mod tests {
             &String::from_str(&e, "Test Proposal"),
             &String::from_str(&e, "A test proposal"),
             &actions,
+            &false,
         );
         assert_eq!(id, 1);
 
@@ -825,6 +1000,7 @@ mod tests {
             &String::from_str(&e, "Vote Test"),
             &String::from_str(&e, "desc"),
             &actions,
+            &false,
         );
 
         client.vote(&member1, &id, &true);
@@ -848,6 +1024,7 @@ mod tests {
             &String::from_str(&e, "Reject Test"),
             &String::from_str(&e, "desc"),
             &actions,
+            &false,
         );
 
         client.vote(&member1, &id, &false);
@@ -868,6 +1045,7 @@ mod tests {
             &String::from_str(&e, "Vote Tracking"),
             &String::from_str(&e, "desc"),
             &actions,
+            &false,
         );
 
         client.vote(&member1, &id, &true);
@@ -891,6 +1069,7 @@ mod tests {
             &String::from_str(&e, "Add Member Test"),
             &String::from_str(&e, "desc"),
             &actions,
+            &false,
         );
 
         let proposal = client.get_proposal(&id).unwrap();
@@ -929,6 +1108,7 @@ mod tests {
             &String::from_str(&e, "Quorum Test"),
             &String::from_str(&e, "desc"),
             &actions,
+            &false,
         );
 
         let proposal = client.get_proposal(&id).unwrap();
@@ -962,6 +1142,7 @@ mod tests {
             &String::from_str(&e, "Remove Member Test"),
             &String::from_str(&e, "desc"),
             &actions,
+            &false,
         );
 
         // Two members vote yes; the third is then removed.
@@ -999,6 +1180,7 @@ mod tests {
             &String::from_str(&e, "Exec Test"),
             &String::from_str(&e, "desc"),
             &actions,
+            &false,
         );
 
         client.vote(&member1, &id, &true);
@@ -1032,6 +1214,7 @@ mod tests {
             &String::from_str(&e, "Timelock Test"),
             &String::from_str(&e, "desc"),
             &actions,
+            &false,
         );
 
         client.vote(&member1, &id, &true);
@@ -1144,6 +1327,7 @@ mod tests {
             &String::from_str(&e, "Expired"),
             &String::from_str(&e, "desc"),
             &actions,
+            &false,
         );
 
         // Jump past voting deadline
@@ -1241,6 +1425,7 @@ mod tests {
             &String::from_str(&e, "Set Mock Value"),
             &String::from_str(&e, "Sets the mock value to 42"),
             &actions,
+            &false,
         );
 
         gov_client.vote(&member, &proposal_id, &true);
@@ -1291,6 +1476,7 @@ mod tests {
             &String::from_str(&e, "Set Values"),
             &String::from_str(&e, "Sets the mock value twice"),
             &actions,
+            &false,
         );
 
         gov_client.vote(&member, &proposal_id, &true);
@@ -1332,6 +1518,7 @@ mod tests {
             &String::from_str(&e, "Fail Proposal"),
             &String::from_str(&e, "This will fail"),
             &actions,
+            &false,
         );
 
         gov_client.vote(&member, &proposal_id, &true);
@@ -1345,6 +1532,176 @@ mod tests {
         assert!(result.is_err(), "execute must revert when an action fails");
 
         let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+    }
+
+    #[test]
+    fn test_execute_partial_execution_records_action_results() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let member = Address::generate(&e);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+        let mock_client = mock_target::MockTargetClient::new(&e, &mock_id);
+
+        let gov_id = e.register_contract(None, Governance);
+        let gov_client = GovernanceClient::new(&e, &gov_id);
+        gov_client.initialize(&admin, &Vec::from_array(&e, [member.clone()]));
+
+        // Three actions: set_value(1), always_fail, set_value(3). In best-effort
+        // mode the middle failure must not abort the batch.
+        let action1 = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "set_value"),
+            args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&1i128, &e)]),
+        };
+        let action2 = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+        };
+        let action3 = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "set_value"),
+            args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&3i128, &e)]),
+        };
+        let actions = Vec::from_array(&e, [action1, action2, action3]);
+
+        let proposal_id = gov_client.propose(
+            &member,
+            &String::from_str(&e, "Best-effort set values"),
+            &String::from_str(&e, "action 2 fails; 1 and 3 must still run"),
+            &actions,
+            &true,
+        );
+
+        gov_client.vote(&member, &proposal_id, &true);
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        gov_client.execute(&member, &proposal_id);
+
+        // The two successful actions must have run; the final value reflects
+        // the last success (action 3).
+        assert_eq!(mock_client.get_value(), 3);
+
+        let proposal = gov_client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Executed));
+        assert_eq!(proposal.action_results.len(), 3);
+        assert!(proposal.action_results.get(0).unwrap());
+        assert!(!proposal.action_results.get(1).unwrap());
+        assert!(proposal.action_results.get(2).unwrap());
+
+        // The exec_partial event must be emitted as the final event, carrying
+        // (proposal_id, action_results).
+        let events = e.events().all();
+        let (_contract, topics, data) = &events.get(events.len() - 1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, Symbol::new(&e, "exec_partial"));
+
+        let (ev_id, ev_results) = <(u64, Vec<bool>)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_id, proposal_id);
+        assert_eq!(ev_results.len(), 3);
+        assert!(ev_results.get(0).unwrap());
+        assert!(!ev_results.get(1).unwrap());
+        assert!(ev_results.get(2).unwrap());
+    }
+
+    #[test]
+    fn test_cancel_proposal_by_admin_frees_slot() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        // Reduce the active-proposal limit to 1 so that freeing the slot is
+        // observable: a second proposal is rejected while the first is active
+        // and accepted after it is cancelled.
+        let mut config = client.get_config();
+        config.max_active_proposals = 1;
+        client.update_config(&admin, &config);
+
+        let member2 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Cancel Me"),
+            &String::from_str(&e, "first proposal"),
+            &actions,
+            &false,
+        );
+
+        // Slot is full.
+        let second = client.try_propose(
+            &member1,
+            &String::from_str(&e, "Blocked"),
+            &String::from_str(&e, "must be rejected"),
+            &actions,
+            &false,
+        );
+        assert!(second.is_err());
+
+        // Approve, then cancel.
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+        client.cancel_proposal(&admin, &id);
+
+        // The prop_cancel event must be emitted as the final event so far.
+        let events = e.events().all();
+        let (_contract, topics, _data) = &events.get(events.len() - 1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, Symbol::new(&e, "prop_cancel"));
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Cancelled));
+
+        // A cancelled proposal can no longer be executed.
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+        assert!(client.try_execute(&member1, &id).is_err());
+
+        // The freed slot allows a new proposal.
+        let id2 = client.propose(
+            &member1,
+            &String::from_str(&e, "Second Chance"),
+            &String::from_str(&e, "succeeds after cancellation"),
+            &actions,
+            &false,
+        );
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_cancel_proposal_by_non_admin_panics() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Keep Me"),
+            &String::from_str(&e, "must not be cancellable by a member"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        // A non-admin member must not be able to cancel.
+        assert!(client.try_cancel_proposal(&member1, &id).is_err());
+
+        let proposal = client.get_proposal(&id).unwrap();
         assert!(matches!(proposal.status, ProposalStatus::Approved));
     }
 
@@ -1380,6 +1737,7 @@ mod tests {
             &String::from_str(&e, "Auth Test"),
             &String::from_str(&e, "Verifies auth model is preserved"),
             &actions,
+            &false,
         );
 
         gov_client.vote(&member1, &proposal_id, &true);
@@ -1418,6 +1776,7 @@ mod tests {
             &String::from_str(&e, "Pause"),
             &String::from_str(&e, "pause the protocol"),
             &actions,
+            &false,
         );
 
         client.vote(&member1, &proposal_id, &true);
