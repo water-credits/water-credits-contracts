@@ -81,6 +81,10 @@ impl CreditFactory {
     }
 
     /// Register a new water restoration project. Deploys a new credit_token contract and returns a SHA-256 project ID.
+    ///
+    /// When `minter` is `Some(addr)`, the factory immediately calls `set_minter`
+    /// on the freshly-deployed token so the oracle (or other designated address)
+    /// can mint credits without a separate manual setup step.
     pub fn register_project(
         e: Env,
         admin: Address,
@@ -91,6 +95,7 @@ impl CreditFactory {
         owner: Address,
         area_hectares: u64,
         credit_token_wasm_hash: BytesN<32>,
+        minter: Option<Address>,
     ) -> BytesN<32> {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -154,6 +159,15 @@ impl CreditFactory {
             methodology.clone().to_val(),
         ];
         e.invoke_contract::<()>(&token_address, &Symbol::new(&e, "initialize"), init_args);
+
+        if let Some(minter_addr) = minter {
+            let set_minter_args: Vec<Val> = vec![&e, admin.clone().to_val(), minter_addr.to_val()];
+            e.invoke_contract::<()>(
+                &token_address,
+                &Symbol::new(&e, "set_minter"),
+                set_minter_args,
+            );
+        }
 
         let project = ProjectInfo {
             id: project_id.clone(),
@@ -337,6 +351,7 @@ mod tests {
             &owner,
             &500,
             &wasm_hash,
+            &None,
         );
 
         let project = client.get_project(&project_id).unwrap();
@@ -368,6 +383,7 @@ mod tests {
             &owner,
             &500,
             &wasm_hash,
+            &None,
         );
         assert_eq!(client.project_count(), 1);
 
@@ -380,6 +396,7 @@ mod tests {
             &owner,
             &300,
             &wasm_hash,
+            &None,
         );
         assert_eq!(client.project_count(), 2);
     }
@@ -401,6 +418,7 @@ mod tests {
             &owner,
             &500,
             &wasm_hash,
+            &None,
         );
         let id2 = client.register_project(
             &admin,
@@ -411,6 +429,7 @@ mod tests {
             &owner,
             &500,
             &wasm_hash,
+            &None,
         );
 
         assert_ne!(id1, id2);
@@ -432,6 +451,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
 
         let events = e.events().all();
@@ -467,6 +487,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
 
         let new_status = String::from_str(&e, "active");
@@ -492,6 +513,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
 
         for status in [
@@ -519,6 +541,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
         assert_eq!(
@@ -540,6 +563,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
         client.update_project_status(&admin, &pid, &String::from_str(&e, "completed"));
@@ -562,6 +586,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
         client.update_project_status(&admin, &pid, &String::from_str(&e, "suspended"));
@@ -584,6 +609,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
         client.update_project_status(&admin, &pid, &String::from_str(&e, "completed"));
@@ -607,6 +633,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
         client.update_project_status(&admin, &pid, &String::from_str(&e, "suspended"));
@@ -632,6 +659,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         // Should not panic — no-op
         client.update_project_status(&admin, &pid, &String::from_str(&e, "registered"));
@@ -654,6 +682,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
         // Should not panic — no-op
@@ -680,6 +709,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
         client.update_project_status(&admin, &pid, &String::from_str(&e, "completed"));
@@ -701,6 +731,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         // This should panic — registered → completed is not allowed
         client.update_project_status(&admin, &pid, &String::from_str(&e, "completed"));
@@ -720,6 +751,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
         client.update_project_status(&admin, &pid, &String::from_str(&e, "suspended"));
@@ -743,6 +775,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
 
         let new_owner = Address::generate(&e);
@@ -767,6 +800,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
 
         let new_owner = Address::generate(&e);
@@ -792,6 +826,7 @@ mod tests {
             &owner,
             &500,
             &wasm_hash,
+            &None,
         );
 
         let id2 = client.register_project(
@@ -803,6 +838,7 @@ mod tests {
             &owner,
             &500,
             &wasm_hash,
+            &None,
         );
 
         assert_ne!(id1, id2);
@@ -827,6 +863,7 @@ mod tests {
             &owner,
             &500,
             &wasm_hash,
+            &None,
         );
         let id2 = client.register_project(
             &admin,
@@ -837,6 +874,7 @@ mod tests {
             &owner,
             &500,
             &wasm_hash,
+            &None,
         );
 
         assert_ne!(id1, id2);
@@ -874,6 +912,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
 
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
@@ -906,6 +945,7 @@ mod tests {
             &owner,
             &100,
             &wasm_hash,
+            &None,
         );
 
         let new_owner = Address::generate(&e);

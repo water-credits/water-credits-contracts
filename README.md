@@ -266,6 +266,8 @@ pub fn initialize(env: Env, admin: Address);
 
 /// Register a new restoration project.
 /// Deploys a new credit_token contract instance.
+/// When `minter` is `Some(addr)`, calls `set_minter` on the token immediately
+/// so the oracle can mint credits without a separate manual setup step.
 /// Returns the project ID (SHA-256 hash).
 pub fn register_project(
     env: Env,
@@ -277,6 +279,7 @@ pub fn register_project(
     owner: Address,             // Project developer wallet
     area_hectares: u64,
     credit_token_wasm_hash: BytesN<32>,  // Hash of compiled token contract
+    minter: Option<Address>,    // Oracle address; None = admin-only minting
 ) -> BytesN<32>;
 
 /// Get project info by ID.
@@ -928,7 +931,7 @@ soroban contract invoke \
   --arg oracle:$ORACLE_ADDR \
   --network local
 
-# Register a project
+# Register a project (pass oracle address as minter so it can auto-mint)
 PROJ_ID=$(soroban contract invoke \
   --id $FACT_ID \
   --fn register_project \
@@ -940,6 +943,7 @@ PROJ_ID=$(soroban contract invoke \
   --arg owner:$PROJECT_OWNER \
   --arg area_hectares:500 \
   --arg credit_token_wasm_hash:$TOKEN_HASH \
+  --arg minter:$ORAC_ID \
   --network local)
 echo "Project ID: $PROJ_ID"
 ```

@@ -161,6 +161,7 @@ fn test_full_six_contract_lifecycle() {
         &project_owner,
         &area_hectares,
         &token_wasm_hash,
+        &Some(oracle_id.clone()),
     );
 
     // Event: proj_reg(project_id) from the factory.
@@ -211,12 +212,11 @@ fn test_full_six_contract_lifecycle() {
     assert_eq!(entry.status, String::from_str(&e, "registered"));
 
     // ─────────────────────────────────────────────────────────────────────
-    // Phase 3 — wire the authorization chain (post-deployment, since the
-    // token address is only known after register_project)
+    // Phase 3 — wire the remaining authorization chain (post-deployment,
+    // since the token address is only known after register_project).
+    // The oracle minter was already set during register_project.
     // ─────────────────────────────────────────────────────────────────────
 
-    // Oracle is the only minter of the project token.
-    token.set_minter(&admin, &oracle_id);
     // Retirements cross-call the retirement registry…
     token.set_retirement_registry(&admin, &retirement_registry_id);
     // …which must whitelist the token contract as a caller.

@@ -102,6 +102,7 @@ fn register_via_factory(f: &Fixture) -> ([u8; 32], u64) {
         &f.owner,
         &AREA_HECTARES,
         &token_wasm_hash,
+        &None,
     );
 
     let project = factory.get_project(&project_id).unwrap();
