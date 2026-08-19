@@ -32,6 +32,7 @@ the factory. Credits are transferable and retirable.
 | `mint_to(minter, to, amount)` | minter or admin | Mint credits, respects MaxSupply cap |
 | `batch_mint_to(minter, recipients, amounts)` | minter or admin | Mint to multiple addresses atomically |
 | `burn(admin, from, amount)` | admin | Destroy credits without retirement record |
+| `burn_with_reason(admin, from, amount, reason)` | admin | Destroy credits with a documented reason code |
 | `transfer(from, to, amount)` | from | Move credits between wallets |
 | `transfer_from(spender, from, to, amount)` | spender | Move credits via allowance |
 | `approve(from, spender, amount, expiration_ledger)` | from | Grant allowance |
@@ -56,8 +57,9 @@ the factory. Credits are transferable and retirable.
 #### Pause semantics
 
 While paused, `mint_to`, `batch_mint_to`, `transfer`, `transfer_from`, and
-`retire` all panic with `"contract is paused"`. Read-only queries remain
-available. The pause does not persist across upgrades — re-initialization would
+`retire` all panic with `"contract is paused"`. `burn` and `burn_with_reason`
+are explicitly allowed while paused to support emergency administrative recalls.
+Read-only queries remain available. The pause does not persist across upgrades — re-initialization would
 clear it.
 
 #### Supply cap semantics
@@ -590,7 +592,7 @@ The following properties must hold at all times:
 | `minted` | `credit_token` | `(to, amount)` | Per mint (including batch) |
 | `xfer` | `credit_token` | `(from, to, amount)` | Transfer |
 | `retired` | `credit_token` | `(holder, amount, certificate)` | Retire |
-| `burned` | `credit_token` | `(from, amount, total_burned)` | Admin burn; `total_burned` is the running accumulator after this operation |
+| `burned` | `credit_token` | `(from, amount, total_burned)` OR `(from, amount, total_burned, reason)` | Admin burn; `total_burned` is the running accumulator after this operation. Includes reason if called via `burn_with_reason`. |
 | `proj_reg` | `credit_factory` | `(project_id,)` | Project registered |
 | `rdng_vrfy` | `verification_oracle` | `(project_id, result)` | Window finalized |
 | `orc_stk` | `verification_oracle` | `(oracle, amount)` | Oracle stakes tokens |

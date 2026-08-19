@@ -400,6 +400,7 @@ impl CreditToken {
     }
 
     /// Burn credits from a holder. Admin only.
+    /// Note: burn is explicitly allowed while the contract is paused (e.g. for emergency recalls).
     pub fn burn(e: Env, admin: Address, from: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
@@ -423,6 +424,33 @@ impl CreditToken {
 
         e.events()
             .publish((EVENT_BURNED,), (from, amount, new_total_burned));
+    }
+
+    /// Burn credits from a holder with a reason code. Admin only.
+    /// Note: burn_with_reason is explicitly allowed while the contract is paused (e.g. for emergency recalls).
+    pub fn burn_with_reason(e: Env, admin: Address, from: Address, amount: i128, reason: String) {
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+
+        let balance = read_balance(&e, &from);
+        let total = read_total_supply(&e);
+        if balance < amount {
+            panic!("insufficient balance");
+        }
+        save_balance(&e, &from, balance - amount);
+        save_total_supply(&e, total - amount);
+
+        let new_total_burned = read_total_burned(&e).checked_add(amount).expect("overflow");
+        save_total_burned(&e, new_total_burned);
+
+        e.events()
+            .publish((EVENT_BURNED,), (from, amount, new_total_burned, reason));
     }
 
     /// Transfer credits between wallets.
@@ -820,6 +848,47 @@ mod tests {
         let (_contract, topics2, _data2) = &events.get(3).unwrap();
         let topic2: Symbol = Symbol::try_from_val(&e, &topics2.get(0).unwrap()).unwrap();
         assert_eq!(topic2, symbol_short!("burned"));
+    }
+
+    #[test]
+    fn test_burn_with_reason_emits_event() {
+        let (e, admin, user, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &user, &1000);
+        let reason = String::from_str(&e, "project_invalidated");
+        
+        client.burn_with_reason(&admin, &user, &300, &reason);
+
+        let events = e.events().all();
+        // initialize(1) + mint_to(1) + burn_with_reason(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("burned"));
+    }
+
+    #[test]
+    fn test_burn_existing_event_format_unchanged() {
+        let (e, admin, user, _, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        client.mint_to(&admin, &user, &1000);
+        
+        client.burn(&admin, &user, &300);
+
+        let events = e.events().all();
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, data) = &events.get(2).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, symbol_short!("burned"));
+        
+        // Ensure payload is a 3-element tuple (from, amount, total_burned) 
+        // without panicking on downcast, confirming existing burn event is backward compatible.
+        let (ev_from, ev_amount, ev_total_burned) = <(Address, i128, i128)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_from, user);
+        assert_eq!(ev_amount, 300);
+        assert_eq!(ev_total_burned, 300);
     }
 
     #[test]
