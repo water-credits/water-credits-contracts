@@ -857,7 +857,7 @@ mod tests {
 
         client.mint_to(&admin, &user, &1000);
         let reason = String::from_str(&e, "project_invalidated");
-        
+
         client.burn_with_reason(&admin, &user, &300, &reason);
 
         let events = e.events().all();
@@ -874,7 +874,7 @@ mod tests {
         e.mock_all_auths();
 
         client.mint_to(&admin, &user, &1000);
-        
+
         client.burn(&admin, &user, &300);
 
         let events = e.events().all();
@@ -882,10 +882,11 @@ mod tests {
         let (_contract, topics, data) = &events.get(2).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("burned"));
-        
-        // Ensure payload is a 3-element tuple (from, amount, total_burned) 
+
+        // Ensure payload is a 3-element tuple (from, amount, total_burned)
         // without panicking on downcast, confirming existing burn event is backward compatible.
-        let (ev_from, ev_amount, ev_total_burned) = <(Address, i128, i128)>::try_from_val(&e, data).unwrap();
+        let (ev_from, ev_amount, ev_total_burned) =
+            <(Address, i128, i128)>::try_from_val(&e, data).unwrap();
         assert_eq!(ev_from, user);
         assert_eq!(ev_amount, 300);
         assert_eq!(ev_total_burned, 300);
