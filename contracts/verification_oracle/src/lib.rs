@@ -1295,6 +1295,18 @@ impl VerificationOracle {
         if !(MIN_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&config.window_secs) {
             panic!("window_secs out of valid range [60, 86400]");
         }
+        // `median_i64` uses a fixed ten-element buffer, and finalization
+        // requires at least one oracle. Reject internally inconsistent bounds
+        // before comparing the requested quorum with the live oracle count.
+        if config.min_oracles == 0 {
+            panic!("min_oracles must be at least 1");
+        }
+        if config.min_oracles > config.max_oracles {
+            panic!("min_oracles exceeds max_oracles");
+        }
+        if config.max_oracles > 10 {
+            panic!("max_oracles exceeds hard limit (10)");
+        }
         // Preserve the quorum invariant: configuration cannot require more
         // oracles than are currently registered. Without this, governance
         // could raise `min_oracles` above `OracleCount`, leaving the protocol
@@ -3322,15 +3334,16 @@ mod tests {
     fn test_add_oracle_requires_min_stake() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
+        let bootstrap_oracle = Address::generate(&e);
         let oracle = Address::generate(&e);
 
-        // Set min_stake to 1000 so the oracle with 0 stake is rejected.
-        // `min_oracles = 0` keeps the config valid while no oracles are
-        // registered yet (the quorum invariant is `min_oracles <= oracle_count`).
+        // Register an oracle under the default zero-stake requirement so the
+        // updated quorum remains valid, then require stake for new oracles.
+        client.add_oracle(&admin, &bootstrap_oracle);
         client.update_config(
             &admin,
             &OracleConfig {
-                min_oracles: 0,
+                min_oracles: 1,
                 min_stake: 1000,
                 ..client.get_config()
             },
@@ -4068,21 +4081,16 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        // Add oracle with no stake (min_stake=0 first). `min_oracles = 0`
-        // keeps the config valid while no oracles are registered yet.
-        let mut config = client.get_config();
-        config.min_stake = 0;
-        config.min_oracles = 0;
-        client.update_config(&admin, &config);
-
+        // Add an oracle under the default zero-stake requirement.
         let oracle = Address::generate(&e);
         client.add_oracle(&admin, &oracle);
 
         let project_id = BytesN::from_array(&e, &[115u8; 32]);
         client.open_window(&admin, &project_id);
 
-        // Re-enable min_stake (min_oracles stays 0, which is <= the single
-        // registered oracle, so the quorum invariant holds).
+        // Re-enable min_stake while retaining a valid one-oracle quorum.
+        let mut config = client.get_config();
+        config.min_oracles = 1;
         config.min_stake = 5000;
         client.update_config(&admin, &config);
 
@@ -4192,9 +4200,11 @@ mod tests {
     fn test_update_config_accepts_slash_pct_bps_at_max() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
+        let oracle = Address::generate(&e);
+        client.add_oracle(&admin, &oracle);
 
         let mut config = client.get_config();
-        config.min_oracles = 0; // neutralise the quorum check for this test
+        config.min_oracles = 1;
         config.slash_pct_bps = 5000;
         client.update_config(&admin, &config);
         assert_eq!(client.get_config().slash_pct_bps, 5000);
@@ -4249,9 +4259,11 @@ mod tests {
     fn test_update_config_accepts_window_secs_at_bounds() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
+        let oracle = Address::generate(&e);
+        client.add_oracle(&admin, &oracle);
 
         let mut config = client.get_config();
-        config.min_oracles = 0; // neutralise the quorum check for this test
+        config.min_oracles = 1;
         config.window_secs = MIN_WINDOW_SECS;
         client.update_config(&admin, &config);
         assert_eq!(client.get_config().window_secs, MIN_WINDOW_SECS);
@@ -4275,6 +4287,66 @@ mod tests {
             vec![&e, admin.to_val(), config.into_val(&e)],
         );
         assert!(result.is_err());
+    }
+
+    // ── Oracle config bounds (Issue #110) ──
+
+    #[test]
+    #[should_panic(expected = "min_oracles must be at least 1")]
+    fn test_update_config_rejects_zero_min_oracles() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.min_oracles = 0;
+        client.update_config(&admin, &config);
+    }
+
+    #[test]
+    #[should_panic(expected = "min_oracles exceeds max_oracles")]
+    fn test_update_config_rejects_min_oracles_above_max_oracles() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        for _ in 0..4u32 {
+            client.add_oracle(&admin, &Address::generate(&e));
+        }
+
+        let mut config = client.get_config();
+        config.min_oracles = 4;
+        config.max_oracles = 3;
+        client.update_config(&admin, &config);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_oracles exceeds hard limit (10)")]
+    fn test_update_config_rejects_max_oracles_above_ten() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        client.add_oracle(&admin, &Address::generate(&e));
+
+        let mut config = client.get_config();
+        config.min_oracles = 1;
+        config.max_oracles = 11;
+        client.update_config(&admin, &config);
+    }
+
+    #[test]
+    fn test_update_config_accepts_max_oracles_at_ten() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        client.add_oracle(&admin, &Address::generate(&e));
+
+        let mut config = client.get_config();
+        config.min_oracles = 1;
+        config.max_oracles = 10;
+        client.update_config(&admin, &config);
+
+        let stored = client.get_config();
+        assert_eq!(stored.min_oracles, 1);
+        assert_eq!(stored.max_oracles, 10);
     }
 
     // ── Quorum invariant: min_oracles <= oracle_count (Issue #104) ──
