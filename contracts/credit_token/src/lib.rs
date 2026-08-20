@@ -616,6 +616,9 @@ impl CreditToken {
         if amount < 0 {
             panic!("amount must be non-negative");
         }
+        if expiration_ledger > 0 && expiration_ledger < e.ledger().sequence() {
+            panic!("expiration already passed");
+        }
         from.require_auth();
         save_allowance(&e, &from, &spender, amount);
         let exp_key = DataKey::AllowanceExpiration(from.clone(), spender.clone());
@@ -1033,6 +1036,23 @@ mod tests {
         let (_contract, topics, _data) = &events.get(3).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("xfer"));
+    }
+
+    #[test]
+    fn test_approve_rejects_already_expired_expiration() {
+        let (e, _admin, owner, spender, _project_id, client) = setup();
+        e.mock_all_auths();
+
+        // Advance ledger far beyond the requested expiration
+        let mut info = e.ledger().get();
+        info.sequence_number = 1000;
+        e.ledger().set(info);
+
+        let result = client.try_approve(&owner, &spender, &500, &1);
+        assert!(
+            result.is_err(),
+            "approve must panic when expiration_ledger has already passed"
+        );
     }
 
     #[test]
