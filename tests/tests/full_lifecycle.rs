@@ -415,6 +415,7 @@ fn test_full_six_contract_lifecycle() {
     assert_eq!(record.id, 1);
     assert_eq!(record.retiree, buyer);
     assert_eq!(record.project_id, project_id);
+    assert_eq!(record.credit_token, token_id);
     assert_eq!(record.amount, retire_amount);
     assert_eq!(record.purpose, purpose);
     assert_eq!(record.metadata_uri, uri);
