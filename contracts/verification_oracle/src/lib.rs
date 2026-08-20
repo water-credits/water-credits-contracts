@@ -1516,6 +1516,17 @@ impl VerificationOracle {
         let config: OracleConfig = read_config(&e);
         let unstaked_amount = stake_info.amount;
 
+        e.storage().persistent().set(
+            &stake_key,
+            &StakeInfo {
+                amount: 0,
+                unstake_request: None,
+            },
+        );
+        e.storage()
+            .persistent()
+            .extend_ttl(&stake_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+
         let transfer_args: Vec<Val> = vec![
             &e,
             e.current_contract_address().to_val(),
@@ -1527,17 +1538,6 @@ impl VerificationOracle {
             &Symbol::new(&e, "transfer"),
             transfer_args,
         );
-
-        e.storage().persistent().set(
-            &stake_key,
-            &StakeInfo {
-                amount: 0,
-                unstake_request: None,
-            },
-        );
-        e.storage()
-            .persistent()
-            .extend_ttl(&stake_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
     }
 
     /// Slash an oracle's stake. Callable by admin or governance.
@@ -2273,6 +2273,39 @@ mod tests {
         let admin = Address::generate(&e);
         let treasury = Address::generate(&e);
         let staking_token = e.register_contract(None, MockToken);
+        let contract_id = e.register_contract(None, VerificationOracle);
+        let client = VerificationOracleClient::new(&e, &contract_id);
+        client.initialize(&admin, &staking_token, &treasury);
+        (e, admin, client)
+    }
+
+    // Mock token whose `transfer` always panics, used to verify that
+    // claim_unstake() writes the zeroed StakeInfo before invoking the
+    // external transfer (checks-effects-interactions), so a reverted
+    // transfer leaves the pre-claim stake state intact.
+    #[contract]
+    pub struct PanicTransferToken;
+
+    #[contractimpl]
+    impl PanicTransferToken {
+        pub fn initialize(_e: Env, _admin: Address) {}
+
+        pub fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) {
+            panic!("transfer always fails");
+        }
+
+        pub fn transfer_from(_e: Env, _from: Address, _to: Address, _amount: i128) {}
+
+        pub fn balance(_e: Env, _addr: Address) -> i128 {
+            1_000_000
+        }
+    }
+
+    fn setup_with_panicking_token() -> (Env, Address, VerificationOracleClient<'static>) {
+        let e = Env::default();
+        let admin = Address::generate(&e);
+        let treasury = Address::generate(&e);
+        let staking_token = e.register_contract(None, PanicTransferToken);
         let contract_id = e.register_contract(None, VerificationOracle);
         let client = VerificationOracleClient::new(&e, &contract_id);
         client.initialize(&admin, &staking_token, &treasury);
@@ -3484,6 +3517,31 @@ mod tests {
             vec![&e, oracle.to_val()],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_claim_unstake_failed_transfer_preserves_stake_record() {
+        let (e, _admin, client) = setup_with_panicking_token();
+        e.mock_all_auths();
+        let oracle = Address::generate(&e);
+
+        client.stake(&oracle, &5000);
+        client.unstake(&oracle, &2000);
+
+        set_ledger_timestamp(&e, client.get_unstake_cooldown() + 1);
+
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "claim_unstake"),
+            vec![&e, oracle.to_val()],
+        );
+        assert!(result.is_err());
+
+        // The failing transfer must roll back the whole invocation, so the
+        // stake record should be exactly as it was before the claim attempt.
+        let info = client.get_stake(&oracle);
+        assert_eq!(info.amount, 3000);
+        assert_eq!(info.unstake_request, Some(client.get_unstake_cooldown()));
     }
 
     #[test]
