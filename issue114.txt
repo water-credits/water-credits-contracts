@@ -1,0 +1,29 @@
+fix: `governance.vote()` writes `HasVoted` before checking proposal status, permanently blocking a member from voting on a retry if the vote was cast against an already-resolved proposal
+
+Description
+Why this matters now
+Once emergency controls are wired to governance (v1.1), quick resolution of emergency proposals is critical. A member who votes a millisecond after quorum resolves the proposal has their HasVoted key written (auth accepted, fee charged) but the vote has no effect and no event is emitted. If the proposal is retried (same ID scenario) or if the member expected to vote on a subsequent proposal that reuses state, the HasVoted write creates a silent permanent record. The call succeeds with no feedback that the vote was discarded.
+
+Problem / What
+contracts/governance/src/lib.rs, vote():
+
+// HasVoted is written here (line ~220)
+e.storage().persistent().set(&voted_key, &true);
+// ...
+// Status guard — returns silently if not Active (line ~240)
+if !matches!(proposal.status, ProposalStatus::Active) {
+    return;   // ← HasVoted already written, no event emitted
+}
+Key Challenges
+Move the HasVoted write to after the Active status check. The reordering is safe because the already voted guard (if e.storage().persistent().has(&voted_key) { panic! }) must also move down, but the logic is equivalent.
+
+Acceptance Criteria
+vote() panics "proposal already resolved" when called on a non-Active, non-Pending proposal, before writing HasVoted.
+A test verifies the panic and that HasVoted is not set after the failed vote.
+Existing quorum/approval tests unchanged.
+Relevant files/functions
+contracts/governance/src/lib.rs — vote(), DataKey::HasVoted
+
+Labels
+type: bug, difficulty: intermediate, area: governance
+

@@ -332,11 +332,6 @@ impl Governance {
             panic!("not a governance member");
         }
 
-        let voted_key = DataKey::HasVoted(proposal_id, voter.clone());
-        if e.storage().persistent().has(&voted_key) {
-            panic!("already voted");
-        }
-
         let proposal_key = DataKey::Proposal(proposal_id);
         let mut proposal: Proposal = e
             .storage()
@@ -346,18 +341,17 @@ impl Governance {
 
         let timestamp = e.ledger().timestamp();
 
-        // Auto-activate if past pending
         if matches!(proposal.status, ProposalStatus::Pending) {
             proposal.status = ProposalStatus::Active;
         }
 
-        // If the proposal has already been resolved (Approved/Rejected) or
-        // executed, a late vote is a harmless no-op: the outcome is final and
-        // cannot be changed by further votes. This also prevents a panic when a
-        // member votes after the quorum was already reached (the proposal may
-        // have resolved before every member cast their vote).
         if !matches!(proposal.status, ProposalStatus::Active) {
-            return;
+            panic!("proposal already resolved");
+        }
+
+        let voted_key = DataKey::HasVoted(proposal_id, voter.clone());
+        if e.storage().persistent().has(&voted_key) {
+            panic!("already voted");
         }
 
         if timestamp > proposal.voting_ends_at {
@@ -990,9 +984,10 @@ mod tests {
         let (e, admin, member1, client) = setup();
         e.mock_all_auths();
 
-        // Add a second member so we have 2 total
         let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
         client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
 
         let actions: Vec<GovernanceAction> = Vec::new(&e);
         let id = client.propose(
@@ -1016,7 +1011,9 @@ mod tests {
         e.mock_all_auths();
 
         let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
         client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
 
         let actions: Vec<GovernanceAction> = Vec::new(&e);
         let id = client.propose(
@@ -1084,7 +1081,6 @@ mod tests {
         // this could never reach `total_votes >= total_members`, leaving the
         // proposal stuck. The snapshot-based quorum must still resolve it.
         client.vote(&member1, &id, &true);
-        client.vote(&member2, &id, &true);
 
         let proposal = client.get_proposal(&id).unwrap();
         assert_eq!(proposal.eligible_voters, 2);
@@ -1162,16 +1158,87 @@ mod tests {
     }
 
     #[test]
+    fn test_vote_on_resolved_proposal_panics_no_hasvoted_set() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let member1 = Address::generate(&e);
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+
+        let gov_id = e.register_contract(None, Governance);
+        let client = GovernanceClient::new(&e, &gov_id);
+        client.initialize(
+            &admin,
+            &Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]),
+        );
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Resolved Proposal"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        let result = client.try_vote(&member3, &id, &true);
+        assert!(result.is_err());
+
+        let voted_key = DataKey::HasVoted(id, member3.clone());
+        let has_voted_set = e.as_contract(&gov_id, || e.storage().persistent().has(&voted_key));
+        assert!(
+            !has_voted_set,
+            "HasVoted must not be set after a failed vote on a resolved proposal"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "proposal already resolved")]
+    fn test_vote_on_approved_proposal_panics_message() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Panic Message Test"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        client.vote(&member3, &id, &true);
+    }
+
+    #[test]
     fn test_execute_after_timelock() {
         let e = Env::default();
         e.mock_all_auths();
         let admin = Address::generate(&e);
         let member1 = Address::generate(&e);
         let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
         let contract_id = e.register_contract(None, Governance);
         let client = GovernanceClient::new(&e, &contract_id);
 
-        let members: Vec<Address> = Vec::from_array(&e, [member1.clone(), member2.clone()]);
+        let members: Vec<Address> =
+            Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]);
         client.initialize(&admin, &members);
 
         let actions: Vec<GovernanceAction> = Vec::new(&e);
@@ -1206,7 +1273,9 @@ mod tests {
         e.mock_all_auths();
 
         let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
         client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
 
         let actions: Vec<GovernanceAction> = Vec::new(&e);
         let id = client.propose(
@@ -1626,7 +1695,9 @@ mod tests {
         client.update_config(&admin, &config);
 
         let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
         client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
 
         let actions: Vec<GovernanceAction> = Vec::new(&e);
         let id = client.propose(
@@ -1684,7 +1755,9 @@ mod tests {
         e.mock_all_auths();
 
         let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
         client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
 
         let actions: Vec<GovernanceAction> = Vec::new(&e);
         let id = client.propose(
@@ -1714,6 +1787,8 @@ mod tests {
         let member1 = Address::generate(&e);
         let member2 = Address::generate(&e);
         let member3 = Address::generate(&e);
+        let member4 = Address::generate(&e);
+        let member5 = Address::generate(&e);
 
         let mock_id = e.register_contract(None, mock_target::MockTarget);
         let mock_client = mock_target::MockTargetClient::new(&e, &mock_id);
@@ -1722,7 +1797,16 @@ mod tests {
         let gov_client = GovernanceClient::new(&e, &gov_id);
         gov_client.initialize(
             &admin,
-            &Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]),
+            &Vec::from_array(
+                &e,
+                [
+                    member1.clone(),
+                    member2.clone(),
+                    member3.clone(),
+                    member4.clone(),
+                    member5.clone(),
+                ],
+            ),
         );
 
         let action = GovernanceAction {
@@ -1762,7 +1846,9 @@ mod tests {
         e.mock_all_auths();
 
         let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
         client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
 
         let pause_action = GovernanceAction {
             target: admin.clone(), // target is ignored for built-in actions

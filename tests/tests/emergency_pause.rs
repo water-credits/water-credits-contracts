@@ -103,13 +103,24 @@ fn test_supermajority_proposal_emergency_pause() {
     let member1 = Address::generate(&e);
     let member2 = Address::generate(&e);
     let member3 = Address::generate(&e);
+    let member4 = Address::generate(&e);
+    let member5 = Address::generate(&e);
     let project_id = BytesN::from_array(&e, &[20u8; 32]);
 
     let (token_id, token_client) = deploy_token(&e, &admin, &project_id);
     let (gov_id, gov_client) = deploy_governance(
         &e,
         &admin,
-        Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]),
+        Vec::from_array(
+            &e,
+            [
+                member1.clone(),
+                member2.clone(),
+                member3.clone(),
+                member4.clone(),
+                member5.clone(),
+            ],
+        ),
     );
 
     wire_pause_guardian(&token_client, &admin, &gov_id);
@@ -167,13 +178,14 @@ fn test_supermajority_proposal_emergency_unpause() {
     let admin = Address::generate(&e);
     let member1 = Address::generate(&e);
     let member2 = Address::generate(&e);
+    let member3 = Address::generate(&e);
     let project_id = BytesN::from_array(&e, &[30u8; 32]);
 
     let (token_id, token_client) = deploy_token(&e, &admin, &project_id);
     let (gov_id, gov_client) = deploy_governance(
         &e,
         &admin,
-        Vec::from_array(&e, [member1.clone(), member2.clone()]),
+        Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]),
     );
 
     wire_pause_guardian(&token_client, &admin, &gov_id);

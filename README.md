@@ -446,12 +446,12 @@ pub fn initialize(env: Env, admin: Address);
 
 /// Record a new retirement.
 /// Called by authorized contracts (credit_token.retire → cross-contract call).
+/// `caller` is the credit_token contract address (passed via current_contract_address).
 pub fn record_retirement(
     env: Env,
-    admin: Address,
+    caller: Address,
     retiree: Address,
     project_id: BytesN<32>,
-    credit_token: Address,
     amount: i128,
     purpose: String,
     metadata_uri: String,
@@ -575,6 +575,21 @@ pub struct RetirementCertificate {
     pub purpose: String,               // "compliance" | "voluntary" | "community"
     pub timestamp: u64,                // When the retirement occurred
     pub metadata_uri: String,          // IPFS link to certificate JSON/PDF
+}
+
+// ── Retirement Registry ──
+
+#[derive(Clone, Debug, PartialEq)]
+#[soroban_sdk::contracttype]
+pub struct RetirementRecord {
+    pub id: u64,                       // Unique record ID (1-based)
+    pub retiree: Address,              // Who retired the credits
+    pub project_id: BytesN<32>,        // Which project they came from
+    pub credit_token: Address,         // Token contract that recorded this retirement
+    pub amount: i128,                  // Number of credits retired
+    pub purpose: String,               // "compliance" | "voluntary" | "community"
+    pub metadata_uri: String,          // IPFS link to certificate JSON/PDF
+    pub timestamp: u64,                // When the retirement occurred
 }
 
 // ── Credit Factory ──

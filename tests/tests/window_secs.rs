@@ -404,6 +404,7 @@ fn bounds_config(e: &Env) -> OracleConfig {
         min_slash_amount: 0,
         max_slash_amount: i128::MAX,
         window_secs: 3600,
+        max_open_windows: 20,
     }
 }
 

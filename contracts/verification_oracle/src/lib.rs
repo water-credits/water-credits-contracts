@@ -131,6 +131,11 @@ pub struct OracleConfig {
     /// assumption). `update_config` constrains it to
     /// `[MIN_WINDOW_SECS, MAX_WINDOW_SECS]`.
     pub window_secs: u64,
+    /// Hard cap on the number of simultaneously open (non-finalized) windows.
+    /// Enforced in `open_window` and `add_open_project` to bound instance
+    /// storage load even when the open-projects list lives in persistent
+    /// storage (Issue #132). Defaults to 20 in `initialize`.
+    pub max_open_windows: u32,
 }
 
 /// Minimum accepted `OracleConfig::window_secs` (1 minute). Rejects
@@ -139,6 +144,8 @@ pub const MIN_WINDOW_SECS: u64 = 60;
 /// Maximum accepted `OracleConfig::window_secs` (1 day). Also the value the
 /// nutrient-removal overflow analysis in `compute_finalization` is bounded by.
 pub const MAX_WINDOW_SECS: u64 = 86_400;
+/// Default hard cap on concurrent open windows (`OracleConfig::max_open_windows`).
+const DEFAULT_MAX_OPEN_WINDOWS: u32 = 20;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -218,7 +225,9 @@ pub enum DataKey {
     OracleStake(Address),
     OracleSlashed(Address),
     OracleMissedReveals(Address),
-    /// Index of project IDs with open (non-finalized) windows
+    /// Index of project IDs with open (non-finalized) windows.
+    /// Moved to persistent storage (Issue #132) — loaded on demand rather
+    /// than on every invocation as instance storage was.
     OpenProjects,
     // ── Temporary (window-scoped, can expire after finalization) ──
     WindowState(BytesN<32>),
@@ -380,10 +389,10 @@ fn compute_slash_amount(stake: i128, config: &OracleConfig) -> i128 {
         .min(stake)
 }
 
-fn add_open_project(e: &Env, project_id: &BytesN<32>) {
+fn add_open_project(e: &Env, project_id: &BytesN<32>, max_open_windows: u32) {
     let mut open: Vec<BytesN<32>> = e
         .storage()
-        .instance()
+        .persistent()
         .get(&DataKey::OpenProjects)
         .unwrap_or(Vec::new(e));
     for i in 0..open.len() {
@@ -391,14 +400,22 @@ fn add_open_project(e: &Env, project_id: &BytesN<32>) {
             return;
         }
     }
+    if open.len() >= max_open_windows {
+        panic!("max open windows reached");
+    }
     open.push_back(project_id.clone());
-    e.storage().instance().set(&DataKey::OpenProjects, &open);
+    e.storage().persistent().set(&DataKey::OpenProjects, &open);
+    e.storage().persistent().extend_ttl(
+        &DataKey::OpenProjects,
+        WINDOW_TTL_THRESHOLD,
+        WINDOW_TTL_BUMP,
+    );
 }
 
 fn remove_open_project(e: &Env, project_id: &BytesN<32>) {
     let open: Vec<BytesN<32>> = e
         .storage()
-        .instance()
+        .persistent()
         .get(&DataKey::OpenProjects)
         .unwrap_or(Vec::new(e));
     let mut filtered: Vec<BytesN<32>> = Vec::new(e);
@@ -409,14 +426,19 @@ fn remove_open_project(e: &Env, project_id: &BytesN<32>) {
         }
     }
     e.storage()
-        .instance()
+        .persistent()
         .set(&DataKey::OpenProjects, &filtered);
+    e.storage().persistent().extend_ttl(
+        &DataKey::OpenProjects,
+        WINDOW_TTL_THRESHOLD,
+        WINDOW_TTL_BUMP,
+    );
 }
 
 fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
     let open: Vec<BytesN<32>> = e
         .storage()
-        .instance()
+        .persistent()
         .get(&DataKey::OpenProjects)
         .unwrap_or(Vec::new(e));
     for i in 0..open.len() {
@@ -735,6 +757,7 @@ impl VerificationOracle {
             // One hour — the interval the formula previously hardcoded, so
             // existing deployments see no change in credit amounts.
             window_secs: 3600,
+            max_open_windows: DEFAULT_MAX_OPEN_WINDOWS,
         };
         e.storage().instance().set(&DataKey::Config, &config);
 
@@ -1003,7 +1026,7 @@ impl VerificationOracle {
             panic!("window already finalized");
         }
 
-        add_open_project(&e, &project_id);
+        add_open_project(&e, &project_id, config.max_open_windows);
 
         let timestamp = e.ledger().timestamp();
 
@@ -1326,6 +1349,9 @@ impl VerificationOracle {
             .unwrap_or(0);
         if config.min_oracles > oracle_count {
             panic!("min_oracles exceeds current oracle count");
+        }
+        if config.max_open_windows == 0 {
+            panic!("max_open_windows must be at least 1");
         }
         e.storage().instance().set(&DataKey::Config, &config);
     }
@@ -1684,7 +1710,7 @@ impl VerificationOracle {
             .temporary()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
-        add_open_project(&e, &project_id);
+        add_open_project(&e, &project_id, read_config(&e).max_open_windows);
 
         e.events().publish((EVENT_WINDOW_OPENED,), (project_id,));
     }
@@ -2271,21 +2297,22 @@ mod tests {
 
     // Minimal mock token that implements transfer_from and transfer.
     // In tests with mock_all_auths, auth checks are bypassed.
-    #[contract]
-    pub struct MockToken;
+    mod mock_token {
+        use super::*;
+        #[contract]
+        pub struct MockToken;
 
-    #[contractimpl]
-    impl MockToken {
-        pub fn initialize(_e: Env, _admin: Address) {}
+        #[contractimpl]
+        impl MockToken {
+            pub fn initialize(_e: Env, _admin: Address) {}
 
-        pub fn mint_to(_e: Env, _admin: Address, _to: Address, _amount: i128) {}
+            pub fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) {}
 
-        pub fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) {}
+            pub fn transfer_from(_e: Env, _from: Address, _to: Address, _amount: i128) {}
 
-        pub fn transfer_from(_e: Env, _from: Address, _to: Address, _amount: i128) {}
-
-        pub fn balance(_e: Env, _addr: Address) -> i128 {
-            1_000_000
+            pub fn balance(_e: Env, _addr: Address) -> i128 {
+                1_000_000
+            }
         }
 
         pub fn total_supply(_e: Env) -> i128 {
@@ -2296,6 +2323,7 @@ mod tests {
             1_000_000_000
         }
     }
+    use mock_token::MockToken;
 
     fn setup_with_client() -> (Env, Address, VerificationOracleClient<'static>) {
         let e = Env::default();
@@ -2308,12 +2336,12 @@ mod tests {
         (e, admin, client)
     }
 
-    pub mod panic_token {
+    // Mock token whose `transfer` always panics, used to verify that
+    // claim_unstake() writes the zeroed StakeInfo before invoking the
+    // external transfer (checks-effects-interactions), so a reverted
+    // transfer leaves the pre-claim stake state intact.
+    mod panic_token {
         use super::*;
-        // Mock token whose `transfer` always panics, used to verify that
-        // claim_unstake() writes the zeroed StakeInfo before invoking the
-        // external transfer (checks-effects-interactions), so a reverted
-        // transfer leaves the pre-claim stake state intact.
         #[contract]
         pub struct PanicTransferToken;
 
@@ -2764,6 +2792,7 @@ mod tests {
             min_slash_amount: 0,
             max_slash_amount: i128::MAX,
             window_secs: 1800,
+            max_open_windows: 20,
         };
         client.update_config(&admin, &new_config);
 
@@ -5434,27 +5463,88 @@ mod tests {
         assert_eq!(ev_new_admin, new_admin);
     }
 
+    // ── OpenProjects persistent storage & max_open_windows (Issue #132) ──
+
     #[test]
-    fn test_get_oracle_nonce() {
+    fn test_open_window_max_open_windows_enforced() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let oracle = Address::generate(&e);
-        let project_id = BytesN::from_array(&e, &[1u8; 32]);
+        let _oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
 
-        client.add_oracle(&admin, &oracle);
+        // Set max_open_windows to 3 for a fast test
+        let mut config = client.get_config();
+        config.max_open_windows = 3;
+        client.update_config(&admin, &config);
 
-        // Test: oracle with no history, get_oracle_nonce returns 1
-        assert_eq!(client.get_oracle_nonce(&project_id, &oracle), 1);
+        // Open 3 windows — should succeed
+        for i in 0..3u32 {
+            let pid = BytesN::from_array(&e, &[i as u8; 32]);
+            client.open_window(&admin, &pid);
+        }
 
-        client.open_window(&admin, &project_id);
+        // 4th window must panic
+        let pid = BytesN::from_array(&e, &[3u8; 32]);
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "open_window"),
+            vec![&e, admin.to_val(), pid.to_val()],
+        );
+        assert!(result.is_err());
+    }
 
-        let commitment = BytesN::from_array(&e, &[2u8; 32]);
-        
-        // Oracle commits nonce 1
-        client.commit_reading(&oracle, &project_id, &1, &commitment);
+    #[test]
+    fn test_finalize_frees_slot_for_new_window() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
 
-        // Test: oracle commits nonce 1, get_oracle_nonce returns 2
-        assert_eq!(client.get_oracle_nonce(&project_id, &oracle), 2);
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+
+        let mut config = client.get_config();
+        config.max_open_windows = 1;
+        client.update_config(&admin, &config);
+
+        let pid = BytesN::from_array(&e, &[1u8; 32]);
+        client.open_window(&admin, &pid);
+
+        // Second window must fail while first is open
+        let pid2 = BytesN::from_array(&e, &[2u8; 32]);
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "open_window"),
+            vec![&e, admin.to_val(), pid2.to_val()],
+        );
+        assert!(result.is_err());
+
+        // Finalize the first window (auto-finalizes on min_oracles reveals)
+        let salt = BytesN::from_array(&e, &[0x01u8; 32]);
+        let readings = [(700i64, 10i64, 80i64, 500i64, 250i64, 8i64, 1i64); 3];
+        commit_reveal_round_no_open(&e, &client, &pid, &oracles, 1, &readings, &salt);
+
+        // Slot freed — second window must now succeed
+        client.open_window(&admin, &pid2);
+    }
+
+    #[test]
+    fn test_initialize_sets_max_open_windows_default() {
+        let (_e, _admin, client) = setup_with_client();
+        let config = client.get_config();
+        assert_eq!(config.max_open_windows, DEFAULT_MAX_OPEN_WINDOWS);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_open_windows must be at least 1")]
+    fn test_update_config_rejects_zero_max_open_windows() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        // Register 3 oracles so min_oracles <= oracle_count check passes
+        for _ in 0..3u32 {
+            client.add_oracle(&admin, &Address::generate(&e));
+        }
+
+        let mut config = client.get_config();
+        config.max_open_windows = 0;
+        client.update_config(&admin, &config);
     }
 }

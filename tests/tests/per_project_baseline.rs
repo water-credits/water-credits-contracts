@@ -285,6 +285,135 @@ fn test_reading_above_baseline_zero_removal() {
     assert_eq!(res.p_removal_kg, 0);
 }
 
+/// Commit-reveal round with both a custom-baseline project and a default-baseline
+/// project in the same window cycle.  Proves finalize_reveals reads ProjectConfig
+/// per-project: the custom project uses (50, 10, 200) while the default project
+/// falls back to protocol defaults (10, 2, 300).
+#[test]
+fn test_commit_reveal_per_project_and_default_baseline_same_cycle() {
+    let f = setup();
+
+    // Project A: explicitly set non-zero baselines (n=50, p=10, temp=200).
+    let proj_custom = configure_project(&f, 50, 10, 200);
+    // Project B: no ProjectConfig set at all → defaults (10, 2, 300).
+    let mut seed_default = [0u8; 32];
+    seed_default[0] = 0xAA;
+    let proj_default = BytesN::from_array(&f._e, &seed_default);
+
+    let (ph, turb, do_, flow, temp, _, _) = READING;
+    let salt_a = BytesN::from_array(&f._e, &[0xFEu8; 32]);
+    let salt_b = BytesN::from_array(&f._e, &[0xFDu8; 32]);
+    let nonce: u64 = 1;
+
+    // --- Window for custom-baseline project ---
+    f.oracle_client.open_window(&f.admin, &proj_custom);
+
+    let commitment_a = sha256_commitment(&f._e, nonce, ph, turb, do_, flow, temp, 8, 1, &salt_a);
+    for i in 0..3u32 {
+        let o = f.oracles.get(i).unwrap();
+        f.oracle_client
+            .commit_reading(&o, &proj_custom, &nonce, &commitment_a);
+    }
+
+    let mut info = f._e.ledger().get();
+    info.timestamp += 301;
+    f._e.ledger().set(info);
+
+    f.oracle_client.begin_reveal_phase(&proj_custom);
+
+    let mut result_custom = None;
+    for i in 0..3u32 {
+        let o = f.oracles.get(i).unwrap();
+        let params = verification_oracle::RevealParams {
+            nonce,
+            ph,
+            turbidity: turb,
+            dissolved_oxygen: do_,
+            flow_rate: flow,
+            temperature: temp,
+            total_nitrogen: 8,
+            total_phosphorus: 1,
+            salt: salt_a.clone(),
+        };
+        result_custom = f.oracle_client.reveal_reading(&o, &proj_custom, &params);
+    }
+
+    let res_custom = result_custom.expect("custom project must finalize");
+
+    // --- Window for default-baseline project (no ProjectConfig) ---
+    f.oracle_client.open_window(&f.admin, &proj_default);
+
+    let commitment_b = sha256_commitment(&f._e, nonce, ph, turb, do_, flow, temp, 8, 1, &salt_b);
+    for i in 0..3u32 {
+        let o = f.oracles.get(i).unwrap();
+        f.oracle_client
+            .commit_reading(&o, &proj_default, &nonce, &commitment_b);
+    }
+
+    let mut info = f._e.ledger().get();
+    info.timestamp += 301;
+    f._e.ledger().set(info);
+
+    f.oracle_client.begin_reveal_phase(&proj_default);
+
+    let mut result_default = None;
+    for i in 0..3u32 {
+        let o = f.oracles.get(i).unwrap();
+        let params = verification_oracle::RevealParams {
+            nonce,
+            ph,
+            turbidity: turb,
+            dissolved_oxygen: do_,
+            flow_rate: flow,
+            temperature: temp,
+            total_nitrogen: 8,
+            total_phosphorus: 1,
+            salt: salt_b.clone(),
+        };
+        result_default = f.oracle_client.reveal_reading(&o, &proj_default, &params);
+    }
+
+    let res_default = result_default.expect("default project must finalize");
+
+    // --- Custom baseline assertions ---
+    // baseline_n=50, med_n=8 → n_removed = (50-8)*500*3600/1_000_000 = 75
+    assert_eq!(
+        res_custom.n_removal_kg,
+        (50 - 8) as i128 * 500 * 3600 / 1_000_000,
+        "custom project must use baseline_n=50"
+    );
+    // baseline_p=10, med_p=1 → p_removed = (10-1)*500*3600/1_000_000
+    assert_eq!(
+        res_custom.p_removal_kg,
+        (10 - 1) as i128 * 500 * 3600 / 1_000_000,
+        "custom project must use baseline_p=10"
+    );
+    assert!(res_custom.total_credits > 0);
+
+    // --- Default baseline assertions ---
+    // default baseline_n=10, med_n=8 → n_removed = (10-8)*500*3600/1_000_000
+    assert_eq!(
+        res_default.n_removal_kg,
+        (10 - 8) as i128 * 500 * 3600 / 1_000_000,
+        "default project must fall back to baseline_n=10"
+    );
+    // default baseline_p=2, med_p=1 → p_removed = (2-1)*500*3600/1_000_000
+    assert_eq!(
+        res_default.p_removal_kg,
+        (2 - 1) as i128 * 500 * 3600 / 1_000_000,
+        "default project must fall back to baseline_p=2"
+    );
+    assert!(res_default.total_credits > 0);
+
+    // Custom project (larger baselines) must produce strictly more credits.
+    assert!(
+        res_custom.total_credits > res_default.total_credits,
+        "custom baseline project should yield more credits: custom={} default={}",
+        res_custom.total_credits,
+        res_default.total_credits
+    );
+}
+
 /// Commit-reveal round with per-project baseline_n=50: finalize_reveals must use
 /// the configured baseline, not the hardcoded default of 10.
 #[test]

@@ -460,10 +460,9 @@ impl CreditToken {
             let balance = read_balance(&e, &to);
             save_balance(&e, &to, balance.checked_add(amount).expect("overflow"));
             total = total.checked_add(amount).expect("overflow");
+            save_total_supply(&e, total);
             e.events().publish((EVENT_MINTED,), (to, amount));
         }
-
-        save_total_supply(&e, total);
     }
 
     /// Burn credits from a holder. Admin only.
@@ -1366,6 +1365,47 @@ mod tests {
         client.batch_mint_to(&admin, &recipients, &amounts);
         assert_eq!(client.balance(&user), 400);
         assert_eq!(client.total_supply(), 400);
+    }
+
+    #[test]
+    fn test_batch_mint_to_reverts_all_on_mid_loop_panic() {
+        let (e, admin, user1, user2, _, client) = setup();
+        let user3 = Address::generate(&e);
+        e.mock_all_auths();
+
+        let recipients = Vec::from_array(&e, [user1.clone(), user2.clone(), user3.clone()]);
+        let amounts: Vec<i128> = Vec::from_array(&e, [100i128, -50i128, 300i128]);
+
+        let result = client.try_batch_mint_to(&admin, &recipients, &amounts);
+        assert!(
+            result.is_err(),
+            "batch_mint_to must panic on negative amount"
+        );
+
+        // All state must be reverted — no partial balance or supply writes.
+        assert_eq!(client.balance(&user1), 0);
+        assert_eq!(client.balance(&user2), 0);
+        assert_eq!(client.balance(&user3), 0);
+        assert_eq!(client.total_supply(), 0);
+    }
+
+    #[test]
+    fn test_batch_mint_to_reverts_on_max_supply_exceeded_mid_batch() {
+        let (e, admin, user1, user2, _, client) = setup();
+        e.mock_all_auths();
+
+        client.set_max_supply(&admin, &250);
+
+        let recipients = Vec::from_array(&e, [user1.clone(), user2.clone()]);
+        let amounts: Vec<i128> = Vec::from_array(&e, [200i128, 100i128]);
+
+        let result = client.try_batch_mint_to(&admin, &recipients, &amounts);
+        assert!(result.is_err(), "must panic when second amount exceeds cap");
+
+        // First recipient's balance and total_supply must be reverted too.
+        assert_eq!(client.balance(&user1), 0);
+        assert_eq!(client.balance(&user2), 0);
+        assert_eq!(client.total_supply(), 0);
     }
 
     #[test]

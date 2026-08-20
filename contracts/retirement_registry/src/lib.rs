@@ -28,6 +28,7 @@ pub struct RetirementRecord {
     pub id: u64,
     pub retiree: Address,
     pub project_id: BytesN<32>,
+    pub credit_token: Address,
     pub amount: i128,
     pub purpose: String,
     pub metadata_uri: String,
@@ -125,6 +126,7 @@ impl RetirementRegistry {
             id: record_id,
             retiree: retiree.clone(),
             project_id: project_id.clone(),
+            credit_token: caller.clone(),
             amount,
             purpose: purpose.clone(),
             metadata_uri: metadata_uri.clone(),
@@ -360,6 +362,7 @@ mod tests {
 
         let record = client.get_record(&id).unwrap();
         assert_eq!(record.retiree, retiree);
+        assert_eq!(record.credit_token, admin);
         assert_eq!(record.amount, 500);
         assert_eq!(record.purpose, purpose);
         assert_eq!(record.metadata_uri, uri);
