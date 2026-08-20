@@ -1126,6 +1126,21 @@ impl VerificationOracle {
             e.storage().temporary().set(&window_key, &window);
             // no extend needed — finalized windows can expire
 
+            let oracles: Vec<Address> = e
+                .storage()
+                .instance()
+                .get(&DataKey::OracleList)
+                .unwrap_or_else(|| Vec::new(&e));
+            for i in 0..oracles.len() {
+                let oracle = oracles.get(i).unwrap();
+                e.storage()
+                    .temporary()
+                    .remove(&DataKey::OracleSubmitted((
+                        project_id.clone(),
+                        oracle.clone(),
+                    )));
+            }
+
             remove_open_project(&e, &project_id);
 
             e.events()
@@ -2197,7 +2212,7 @@ impl VerificationOracle {
 
         remove_open_project(&e, &project_id);
 
-        // Clean up commit/reveal markers for all oracles in this window
+        // Clean up commit/reveal/submit markers for all oracles in this window
         let oracles: Vec<Address> = e
             .storage()
             .instance()
@@ -2209,6 +2224,10 @@ impl VerificationOracle {
                 .temporary()
                 .remove(&DataKey::Commitment((project_id.clone(), oracle.clone())));
             e.storage().temporary().remove(&DataKey::OracleRevealed((
+                project_id.clone(),
+                oracle.clone(),
+            )));
+            e.storage().temporary().remove(&DataKey::OracleSubmitted((
                 project_id.clone(),
                 oracle.clone(),
             )));
