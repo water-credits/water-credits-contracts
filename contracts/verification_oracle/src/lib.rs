@@ -1780,6 +1780,31 @@ impl VerificationOracle {
             panic!("commit phase not ended");
         }
 
+        // Guard: at least one oracle must have committed before transitioning
+        // to Reveal.  Without this, anyone could lock a zero-commit window
+        // into Reveal, leaving it permanently stuck (no reveals possible, no
+        // finalization producing a result).  Iteration is bounded by
+        // max_oracles (≤ 10) — same pattern used by penalize_non_revealers.
+        let oracles: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleList)
+            .unwrap_or_else(|| Vec::new(&e));
+        let mut has_commit = false;
+        for i in 0..oracles.len() {
+            let oracle = oracles.get(i).unwrap();
+            if e.storage()
+                .temporary()
+                .has(&DataKey::Commitment((project_id.clone(), oracle)))
+            {
+                has_commit = true;
+                break;
+            }
+        }
+        if !has_commit {
+            panic!("no commits in window");
+        }
+
         let mut window = window;
         window.phase = WindowPhase::Reveal;
         window.reveal_opened_ledger = e.ledger().sequence();
@@ -3853,21 +3878,13 @@ mod tests {
         let project_id = BytesN::from_array(&e, &[108u8; 32]);
         client.open_window(&admin, &project_id);
 
-        // Skip commit phase
+        // Skip commit phase — but begin_reveal_phase itself must now reject
+        // zero-commit windows (Issue #113).
         set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
-        client.begin_reveal_phase(&project_id);
-
-        let salt = BytesN::from_array(&e, &[0x22u8; 32]);
-        let params = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
         let result = e.try_invoke_contract::<Val, InvokeError>(
             &client.address,
-            &Symbol::new(&e, "reveal_reading"),
-            vec![
-                &e,
-                oracles.get(0).unwrap().to_val(),
-                project_id.to_val(),
-                params.into_val(&e),
-            ],
+            &Symbol::new(&e, "begin_reveal_phase"),
+            vec![&e, project_id.to_val()],
         );
         assert!(result.is_err());
     }
@@ -3887,6 +3904,51 @@ mod tests {
             vec![&e, project_id.to_val()],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_begin_reveal_phase_no_commits_panics() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let _oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let project_id = BytesN::from_array(&e, &[120u8; 32]);
+        client.open_window(&admin, &project_id);
+
+        // Advance past commit phase without any oracle committing
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+
+        // begin_reveal_phase must panic — zero commits would leave the
+        // window permanently stuck (no reveals possible, no result).
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "begin_reveal_phase"),
+            vec![&e, project_id.to_val()],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_begin_reveal_phase_one_commit_succeeds() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let project_id = BytesN::from_array(&e, &[121u8; 32]);
+        client.open_window(&admin, &project_id);
+
+        // Only one oracle commits
+        let salt = BytesN::from_array(&e, &[0xF0u8; 32]);
+        let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracles.get(0).unwrap(), &project_id, &1, &commitment);
+
+        // Advance past commit phase
+        set_ledger_timestamp(&e, e.ledger().timestamp() + 301);
+
+        // begin_reveal_phase must succeed — at least one commit exists
+        client.begin_reveal_phase(&project_id);
+        let phase = client.get_window_phase(&project_id);
+        assert_eq!(phase.unwrap(), WindowPhase::Reveal);
     }
 
     #[test]
