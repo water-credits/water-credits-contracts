@@ -11,8 +11,10 @@
 //! per-project temperature baseline drives the temperature quality penalty.
 
 use credit_token::{CreditToken, CreditTokenClient};
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String, Vec};
-use verification_oracle::{VerificationOracle, VerificationOracleClient};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, String, Vec,
+};
+use verification_oracle::{sha256_commitment, VerificationOracle, VerificationOracleClient};
 
 /// Identical sensor readings for both projects. Encodings per doc/MATH.md §1:
 /// ph=700 (7.00), turb=10, do=80, flow=500 L/s, temp=250 (25.0°C),
@@ -281,4 +283,77 @@ fn test_reading_above_baseline_zero_removal() {
     let res = f.oracle_client.get_last_result(&proj).unwrap();
     assert_eq!(res.n_removal_kg, 0);
     assert_eq!(res.p_removal_kg, 0);
+}
+
+/// Commit-reveal round with per-project baseline_n=50: finalize_reveals must use
+/// the configured baseline, not the hardcoded default of 10.
+#[test]
+fn test_commit_reveal_uses_per_project_baseline_n_50() {
+    let f = setup();
+
+    let proj = configure_project(&f, 50, 2, 300);
+
+    let (ph, turb, do_, flow, temp, _, _) = READING;
+    let salt = BytesN::from_array(&f._e, &[0xFEu8; 32]);
+    let nonce: u64 = 1;
+
+    let project_id = proj.clone();
+
+    // Open a commit-reveal window.
+    f.oracle_client.open_window(&f.admin, &project_id);
+
+    // All 3 oracles commit the same reading.
+    let commitment = sha256_commitment(&f._e, nonce, ph, turb, do_, flow, temp, 8, 1, &salt);
+    for i in 0..3u32 {
+        let o = f.oracles.get(i).unwrap();
+        f.oracle_client
+            .commit_reading(&o, &project_id, &nonce, &commitment);
+    }
+
+    // Advance past the commit phase.
+    let mut info = f._e.ledger().get();
+    info.timestamp += 301;
+    f._e.ledger().set(info);
+
+    f.oracle_client.begin_reveal_phase(&project_id);
+
+    // All 3 oracles reveal.
+    let mut last_result = None;
+    for i in 0..3u32 {
+        let o = f.oracles.get(i).unwrap();
+        let params = verification_oracle::RevealParams {
+            nonce,
+            ph,
+            turbidity: turb,
+            dissolved_oxygen: do_,
+            flow_rate: flow,
+            temperature: temp,
+            total_nitrogen: 8,
+            total_phosphorus: 1,
+            salt: salt.clone(),
+        };
+        last_result = f.oracle_client.reveal_reading(&o, &project_id, &params);
+    }
+
+    assert!(
+        last_result.is_some(),
+        "window must finalize after 3 oracles reveal"
+    );
+    let res = last_result.unwrap();
+
+    // With baseline_n=50 and med_n=8:
+    //   n_removed = (50 - 8) * 500 * 3600 / 1_000_000 = 42 * 500 * 3600 / 1_000_000 = 75
+    assert_eq!(
+        res.n_removal_kg,
+        (50 - 8) as i128 * 500 * 3600 / 1_000_000,
+        "finalize_reveals must use per-project baseline_n=50, not hardcoded 10"
+    );
+    // With baseline_p=2 and med_p=1:
+    //   p_removed = (2 - 1) * 500 * 3600 / 1_000_000 = 1 * 500 * 3600 / 1_000_000 = 1
+    assert_eq!(
+        res.p_removal_kg,
+        (2 - 1) as i128 * 500 * 3600 / 1_000_000,
+        "finalize_reveals must use per-project baseline_p=2"
+    );
+    assert!(res.total_credits > 0);
 }

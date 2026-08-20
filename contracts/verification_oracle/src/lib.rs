@@ -534,6 +534,41 @@ pub fn validate_sensor_reading(
     }
 }
 
+/// Read a project's `ProjectConfig` and resolve the three nutrient/temperature
+/// baselines, falling back to protocol defaults when unset.
+///
+/// Returns `(baseline_n, baseline_p, baseline_temp)`.
+///
+/// A `ProjectConfig` field value of `0` means "unset" (the zero-sentinel
+/// design): the corresponding default is used. This preserves backward
+/// compatibility with contracts that predate per-project baselines.
+///
+/// `pub` so the integration-test crate can unit-test the resolution logic
+/// directly without going through the full contract dispatch.
+pub fn resolve_baselines(e: &Env, project_id: &BytesN<32>) -> (i128, i128, i128) {
+    let default_n: i128 = 10;
+    let default_p: i128 = 2;
+    let default_temp: i128 = 300;
+
+    let key = DataKey::ProjectConfig(project_id.clone());
+    let proj_cfg: Option<ProjectConfig> = e.storage().persistent().get(&key);
+
+    let baseline_n = match proj_cfg {
+        Some(ref pc) if pc.baseline_n != 0 => pc.baseline_n as i128,
+        _ => default_n,
+    };
+    let baseline_p = match proj_cfg {
+        Some(ref pc) if pc.baseline_p != 0 => pc.baseline_p as i128,
+        _ => default_p,
+    };
+    let baseline_temp = match proj_cfg {
+        Some(ref pc) if pc.baseline_temp != 0 => pc.baseline_temp as i128,
+        _ => default_temp,
+    };
+
+    (baseline_n, baseline_p, baseline_temp)
+}
+
 /// Result of the credit finalization formula (nutrient removal, quality penalty,
 /// volumetric credit, and the penalty-adjusted total).
 pub struct FinalizationResult {
@@ -1026,36 +1061,8 @@ impl VerificationOracle {
             let med_n = median_i64(&n_vals);
             let med_p = median_i64(&p_vals);
 
-            // Per-project baselines (doc/MATH.md §1: N/P raw mg/L, temp ×10 °C).
-            //
-            // Scale note (Issue #26): `total_nitrogen` and `total_phosphorus` are
-            // raw integers in mg/L (no ×100 scaling — see doc/MATH.md §1 table).
-            // `temperature` is ×10 °C. The previous hardcoded `baseline_n = 10`
-            // and `baseline_p = 2` were already in the same raw mg/L encoding,
-            // so there is no scale mismatch. `baseline_temp = 300` matches the
-            // ×10 °C encoding (30.0 °C).
-            //
-            // Fall back to the global defaults when a project has not set its
-            // own baselines (ProjectConfig.baseline_* == 0). This preserves
-            // backward compatibility: existing projects with old ProjectConfig
-            // structs that predate these fields will deserialise with all-zero
-            // baselines and behave identically to the old hardcoded constants.
-            let proj_cfg = Self::get_project_config(e.clone(), project_id.clone());
-            let default_baseline_n: i128 = 10;
-            let default_baseline_p: i128 = 2;
-            let default_baseline_temp: i128 = 300;
-            let baseline_n: i128 = match proj_cfg {
-                Some(ref pc) if pc.baseline_n != 0 => pc.baseline_n as i128,
-                _ => default_baseline_n,
-            };
-            let baseline_p: i128 = match proj_cfg {
-                Some(ref pc) if pc.baseline_p != 0 => pc.baseline_p as i128,
-                _ => default_baseline_p,
-            };
-            let baseline_temp: i128 = match proj_cfg {
-                Some(ref pc) if pc.baseline_temp != 0 => pc.baseline_temp as i128,
-                _ => default_baseline_temp,
-            };
+            // Per-project baselines via shared helper (doc/MATH.md §1).
+            let (baseline_n, baseline_p, baseline_temp) = resolve_baselines(&e, &project_id);
 
             let fin = compute_finalization(
                 &config,
@@ -2124,9 +2131,7 @@ impl VerificationOracle {
         let med_n = median_i64(&n_vals);
         let med_p = median_i64(&p_vals);
 
-        let baseline_n: i128 = 10;
-        let baseline_p: i128 = 2;
-        let temp_threshold: i128 = config.quality_threshold_temp as i128;
+        let (baseline_n, baseline_p, baseline_temp) = resolve_baselines(&e, &project_id);
 
         let fin = compute_finalization(
             &config,
@@ -2139,7 +2144,7 @@ impl VerificationOracle {
             med_p,
             baseline_n,
             baseline_p,
-            temp_threshold,
+            baseline_temp,
             config.window_secs,
         );
 
@@ -5228,6 +5233,138 @@ mod tests {
     }
 
     // ── Event tests ──
+
+    // ── resolve_baselines unit tests ──
+
+    /// No ProjectConfig set → returns protocol defaults (10, 2, 300).
+    #[test]
+    fn test_resolve_baselines_no_config_returns_defaults() {
+        let e = Env::default();
+        let project_id = BytesN::from_array(&e, &[0xABu8; 32]);
+        let (n, p, temp) = resolve_baselines(&e, &project_id);
+        assert_eq!(n, 10);
+        assert_eq!(p, 2);
+        assert_eq!(temp, 300);
+    }
+
+    /// ProjectConfig with non-zero baselines → returns them.
+    #[test]
+    fn test_resolve_baselines_custom_values() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, VerificationOracle);
+        let client = VerificationOracleClient::new(&e, &contract_id);
+        let admin = Address::generate(&e);
+        let staking_token = e.register_contract(None, MockToken);
+        let treasury = Address::generate(&e);
+        client.initialize(&admin, &staking_token, &treasury);
+
+        let project_id = BytesN::from_array(&e, &[0xACu8; 32]);
+        let token = Address::generate(&e);
+        let beneficiary = Address::generate(&e);
+        client.set_project_config(&admin, &project_id, &token, &beneficiary, &50, &10, &250);
+
+        let (n, p, temp) = resolve_baselines(&e, &project_id);
+        assert_eq!(n, 50);
+        assert_eq!(p, 10);
+        assert_eq!(temp, 250);
+    }
+
+    /// ProjectConfig with zero baselines (zero-sentinel) → returns defaults.
+    #[test]
+    fn test_resolve_baselines_zero_sentinel_returns_defaults() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, VerificationOracle);
+        let client = VerificationOracleClient::new(&e, &contract_id);
+        let admin = Address::generate(&e);
+        let staking_token = e.register_contract(None, MockToken);
+        let treasury = Address::generate(&e);
+        client.initialize(&admin, &staking_token, &treasury);
+
+        let project_id = BytesN::from_array(&e, &[0xADu8; 32]);
+        let token = Address::generate(&e);
+        let beneficiary = Address::generate(&e);
+        // All zero baselines → zero-sentinel → defaults.
+        client.set_project_config(&admin, &project_id, &token, &beneficiary, &0, &0, &0);
+
+        let (n, p, temp) = resolve_baselines(&e, &project_id);
+        assert_eq!(n, 10);
+        assert_eq!(p, 2);
+        assert_eq!(temp, 300);
+    }
+
+    /// Partial override: only baseline_n is set; baseline_p and baseline_temp
+    /// fall back to defaults.
+    #[test]
+    fn test_resolve_baselines_partial_override() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, VerificationOracle);
+        let client = VerificationOracleClient::new(&e, &contract_id);
+        let admin = Address::generate(&e);
+        let staking_token = e.register_contract(None, MockToken);
+        let treasury = Address::generate(&e);
+        client.initialize(&admin, &staking_token, &treasury);
+
+        let project_id = BytesN::from_array(&e, &[0xAEu8; 32]);
+        let token = Address::generate(&e);
+        let beneficiary = Address::generate(&e);
+        // Only baseline_n is set; others are zero → defaults for those.
+        client.set_project_config(&admin, &project_id, &token, &beneficiary, &50, &0, &0);
+
+        let (n, p, temp) = resolve_baselines(&e, &project_id);
+        assert_eq!(n, 50);
+        assert_eq!(p, 2);
+        assert_eq!(temp, 300);
+    }
+
+    /// finalize_reveals uses per-project baselines (not hardcoded defaults)
+    /// through the commit-reveal path.
+    #[test]
+    fn test_finalize_reveals_uses_per_project_baselines() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+
+        let project_id = BytesN::from_array(&e, &[0xAFu8; 32]);
+        // Set a non-default nitrogen baseline: 50 mg/L
+        client.set_project_config(
+            &admin,
+            &project_id,
+            &Address::generate(&e),
+            &Address::generate(&e),
+            &50,
+            &10,
+            &300,
+        );
+
+        let salt = BytesN::from_array(&e, &[0xAFu8; 32]);
+        // Reading: n=8 mg/L. With baseline_n=50, n_removed = (50-8) * flow * 3600 / 1e6
+        // = 42 * 500 * 3600 / 1_000_000 = 75
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
+
+        let res = result.unwrap();
+        assert_eq!(
+            res.n_removal_kg,
+            (50 - 8) as i128 * 500 * 3600 / 1_000_000,
+            "finalize_reveals must use per-project baseline_n=50, not hardcoded 10"
+        );
+        assert!(res.total_credits > 0);
+    }
 
     #[test]
     fn test_initialize_emits_event() {
