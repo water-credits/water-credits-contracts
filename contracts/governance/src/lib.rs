@@ -1193,9 +1193,7 @@ mod tests {
         assert!(result.is_err());
 
         let voted_key = DataKey::HasVoted(id, member3.clone());
-        let has_voted_set = e.as_contract(&gov_id, || {
-            e.storage().persistent().has(&voted_key)
-        });
+        let has_voted_set = e.as_contract(&gov_id, || e.storage().persistent().has(&voted_key));
         assert!(
             !has_voted_set,
             "HasVoted must not be set after a failed vote on a resolved proposal"
@@ -1239,7 +1237,8 @@ mod tests {
         let contract_id = e.register_contract(None, Governance);
         let client = GovernanceClient::new(&e, &contract_id);
 
-        let members: Vec<Address> = Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]);
+        let members: Vec<Address> =
+            Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]);
         client.initialize(&admin, &members);
 
         let actions: Vec<GovernanceAction> = Vec::new(&e);
@@ -1798,7 +1797,16 @@ mod tests {
         let gov_client = GovernanceClient::new(&e, &gov_id);
         gov_client.initialize(
             &admin,
-            &Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone(), member4.clone(), member5.clone()]),
+            &Vec::from_array(
+                &e,
+                [
+                    member1.clone(),
+                    member2.clone(),
+                    member3.clone(),
+                    member4.clone(),
+                    member5.clone(),
+                ],
+            ),
         );
 
         let action = GovernanceAction {

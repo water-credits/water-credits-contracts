@@ -26,6 +26,7 @@ fn test_proposal_updates_oracle_config_via_cross_contract_execution() {
     let admin = Address::generate(&e);
     let member1 = Address::generate(&e);
     let member2 = Address::generate(&e);
+    let member3 = Address::generate(&e);
     let staking_token = Address::generate(&e);
     let treasury = Address::generate(&e);
 
@@ -43,7 +44,7 @@ fn test_proposal_updates_oracle_config_via_cross_contract_execution() {
     let gov_client = GovernanceClient::new(&e, &gov_id);
     gov_client.initialize(
         &admin,
-        &Vec::from_array(&e, [member1.clone(), member2.clone()]),
+        &Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]),
     );
 
     // Delegate oracle admin authority to the governance contract.
