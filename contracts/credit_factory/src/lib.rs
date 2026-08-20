@@ -2,8 +2,8 @@
 #![allow(clippy::too_many_arguments)]
 use shared::{generate_project_id, is_valid_status, is_valid_status_transition};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, String, Symbol,
-    Val, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, IntoVal, String,
+    Symbol, Val, Vec,
 };
 
 #[cfg(test)]
@@ -14,6 +14,7 @@ const EVENT_PROJ_REG: Symbol = symbol_short!("proj_reg");
 const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_STATUS_CHANGED: Symbol = symbol_short!("stat_chg");
 const EVENT_OWNER_CHANGED: Symbol = symbol_short!("ownr_chg");
+const EVENT_REGISTRY_SET: Symbol = symbol_short!("reg_set");
 
 // ── Data Types ──
 
@@ -41,6 +42,7 @@ pub enum DataKey {
     // ── Instance ──
     Admin,
     ProjectCount,
+    ProjectRegistry,
     // ── Persistent ──
     Project(BytesN<32>),
 }
@@ -78,6 +80,36 @@ impl CreditFactory {
     /// Return the current admin address.
     pub fn admin(e: Env) -> Address {
         read_admin(&e)
+    }
+
+    /// Set the project_registry contract address. Admin only.
+    ///
+    /// When set, `register_project` will cross-call
+    /// `project_registry.register()` after deploying the credit token.
+    /// If the cross-contract call fails the entire transaction reverts,
+    /// preventing ghost projects.
+    ///
+    /// Pass `None` to clear the configuration (backward-compatible mode).
+    pub fn set_project_registry(e: Env, admin: Address, registry: Option<Address>) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        match registry {
+            Some(addr) => {
+                e.storage().instance().set(&DataKey::ProjectRegistry, &addr);
+                e.events().publish((EVENT_REGISTRY_SET,), (addr,));
+            }
+            None => {
+                e.storage().instance().remove(&DataKey::ProjectRegistry);
+            }
+        }
+    }
+
+    /// Return the configured project_registry address, if any.
+    pub fn project_registry(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::ProjectRegistry)
     }
 
     /// Register a new water restoration project. Deploys a new credit_token contract and returns a SHA-256 project ID.
@@ -166,6 +198,31 @@ impl CreditFactory {
                 &token_address,
                 &Symbol::new(&e, "set_minter"),
                 set_minter_args,
+            );
+        }
+
+        // When a project_registry is configured, register there too.
+        // A failed cross-contract call reverts the entire transaction,
+        // preventing ghost projects (token deployed but no registry entry).
+        if let Some(registry_address) = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ProjectRegistry)
+        {
+            let register_args: Vec<Val> = vec![
+                &e,
+                e.current_contract_address().to_val(),
+                name.clone().to_val(),
+                latitude.into_val(&e),
+                longitude.into_val(&e),
+                methodology.clone().to_val(),
+                owner.clone().to_val(),
+                area_hectares.into_val(&e),
+            ];
+            e.invoke_contract::<BytesN<32>>(
+                &registry_address,
+                &Symbol::new(&e, "register"),
+                register_args,
             );
         }
 

@@ -13,6 +13,12 @@
 //! `set_authorized_caller`, `set_project_config`) is wired the same way a
 //! real deployment would be.
 //!
+//! The factory is wired to the project_registry via `set_project_registry`
+//! and `set_authorized_caller`, so a single `register_project()` call
+//! produces consistent entries in both contracts with the same project ID.
+//! If the cross-contract register call fails the entire transaction reverts,
+//! preventing ghost projects.
+//!
 //! The token minted by the factory is a *real* `credit_token.wasm` blob
 //! (compiled by tests/build.rs and deployed through the Soroban deployer),
 //! so this test also exercises the WASM upload/deploy path that
@@ -31,13 +37,6 @@
 //! accounting — see SPEC §5 and `test_supply_conservation_invariant_*` in
 //! credit_lifecycle.rs — `retire()` *reduces* `total_supply`, so the
 //! conserved quantity is `ever_minted`, tracked locally by the test.)
-//!
-//! Known integration gap (documented as a follow-up in issue #40):
-//! `project_registry` and `credit_factory` are independent contracts — the
-//! factory does not write into `project_registry`, so a deployment must
-//! register the project in both places. Both derive IDs with
-//! `shared::generate_project_id(count, ...)`, so mirrored registrations made
-//! with the same ordinal produce the same project ID, which this test asserts.
 
 use credit_factory::{CreditFactory, CreditFactoryClient};
 use credit_token::{CreditTokenClient, RetirementCertificate};
@@ -142,6 +141,12 @@ fn test_full_six_contract_lifecycle() {
     let retirement_registry = RetirementRegistryClient::new(&e, &retirement_registry_id);
     retirement_registry.initialize(&admin);
 
+    // ── Wire factory ↔ project_registry ──────────────────────────────────
+    // Whitelist the factory as an authorized caller so its cross-contract
+    // register() calls are accepted, and point the factory at the registry.
+    project_registry.set_authorized_caller(&admin, &factory_id, &true);
+    factory.set_project_registry(&admin, &Some(project_registry_id.clone()));
+
     // ─────────────────────────────────────────────────────────────────────
     // Phase 2 — register the project via the factory (deploys the token)
     // ─────────────────────────────────────────────────────────────────────
@@ -188,28 +193,20 @@ fn test_full_six_contract_lifecycle() {
     assert_eq!(token.metadata().methodology, methodology);
     assert_eq!(token.total_supply(), 0);
 
-    // Mirror the registration in project_registry. The two contracts are
-    // NOT integrated (the factory does not call the registry) — see the
-    // module docs; this is the documented follow-up gap. Both use
-    // shared::generate_project_id(count, ...), so the mirrored entry gets the
-    // same canonical ID.
-    let registry_project_id = project_registry.register(
-        &admin,
-        &name,
-        &latitude,
-        &longitude,
-        &methodology,
-        &project_owner,
-        &area_hectares,
-    );
-    assert_eq!(
-        registry_project_id, project_id,
-        "canonical ID scheme must agree across factory and project_registry"
-    );
+    // The factory's register_project() cross-called project_registry.register()
+    // in the same transaction. Both contracts must agree on the project ID and
+    // metadata.
     assert_eq!(project_registry.count(), 1);
-    let entry = project_registry.get(&registry_project_id).unwrap();
+    let entry = project_registry.get(&project_id).unwrap();
+    assert_eq!(entry.id, project_id);
+    assert_eq!(entry.name, name);
     assert_eq!(entry.owner, project_owner);
+    assert_eq!(entry.latitude, latitude);
+    assert_eq!(entry.longitude, longitude);
+    assert_eq!(entry.methodology, methodology);
+    assert_eq!(entry.area_hectares, area_hectares);
     assert_eq!(entry.status, String::from_str(&e, "registered"));
+    assert_eq!(factory.project_count(), 1);
 
     // ─────────────────────────────────────────────────────────────────────
     // Phase 3 — wire the remaining authorization chain (post-deployment,

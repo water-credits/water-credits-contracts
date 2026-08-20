@@ -13,6 +13,7 @@ const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_PROJECT_REGISTERED: Symbol = symbol_short!("proj_reg");
 const EVENT_STATUS_CHANGED: Symbol = symbol_short!("stat_chg");
 const EVENT_OWNER_CHANGED: Symbol = symbol_short!("ownr_chg");
+const EVENT_AUTH_CALLER_SET: Symbol = symbol_short!("auth_set");
 
 // ── TTL constants ──
 /// Projects are permanent registrations: 10 years.
@@ -21,6 +22,9 @@ const PROJECT_TTL_BUMP: u32 = 63_072_000;
 /// Index entries match project lifetime.
 const INDEX_TTL_THRESHOLD: u32 = 63_072_000;
 const INDEX_TTL_BUMP: u32 = 63_072_000;
+/// AuthorizedCaller entries: 1 year.
+const AUTH_TTL_THRESHOLD: u32 = 6_307_200;
+const AUTH_TTL_BUMP: u32 = 6_307_200;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -52,6 +56,7 @@ pub enum DataKey {
     // ── Persistent ──
     Project(BytesN<32>),
     ProjectIdAt(u64),
+    AuthorizedCaller(Address),
 }
 
 fn has_admin(e: &Env) -> bool {
@@ -79,7 +84,11 @@ impl ProjectRegistry {
         e.events().publish((EVENT_INITIALIZED,), (admin,));
     }
 
-    /// Register a new project. Admin only. Returns the unique project ID.
+    /// Register a new project. Admin or authorized caller only. Returns the unique project ID.
+    ///
+    /// Authorized callers (e.g. the credit_factory) are whitelisted via
+    /// `set_authorized_caller`. When called by an authorized caller the
+    /// caller must still authorize the transaction (`require_auth`).
     pub fn register(
         e: Env,
         caller: Address,
@@ -92,7 +101,9 @@ impl ProjectRegistry {
     ) -> BytesN<32> {
         caller.require_auth();
         let stored: Address = read_admin(&e);
-        if caller != stored {
+        let auth_key = DataKey::AuthorizedCaller(caller.clone());
+        let authorized: bool = e.storage().persistent().get(&auth_key).unwrap_or(false);
+        if caller != stored && !authorized {
             panic!("unauthorized");
         }
 
@@ -220,6 +231,23 @@ impl ProjectRegistry {
     /// Get the total number of registered projects.
     pub fn count(e: Env) -> u64 {
         e.storage().instance().get(&DataKey::ProjectCount).unwrap()
+    }
+
+    /// Authorize or revoke a contract address to register projects. Admin only.
+    pub fn set_authorized_caller(e: Env, admin: Address, caller: Address, authorized: bool) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let key = DataKey::AuthorizedCaller(caller.clone());
+        e.storage().persistent().set(&key, &authorized);
+        e.storage()
+            .persistent()
+            .extend_ttl(&key, AUTH_TTL_THRESHOLD, AUTH_TTL_BUMP);
+
+        e.events()
+            .publish((EVENT_AUTH_CALLER_SET,), (caller, authorized));
     }
 
     /// List registered projects with pagination.
