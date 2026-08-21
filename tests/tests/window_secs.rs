@@ -18,8 +18,8 @@
 
 use credit_token::{CreditToken, CreditTokenClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+    testutils::{Address as _, Ledger, Events},
+    Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec, TryFromVal,
 };
 use verification_oracle::{
     compute_finalization, sha256_commitment, OracleConfig, RevealParams, VerificationOracle,
@@ -107,7 +107,11 @@ const DIRECT_BASELINE_TEMP: i64 = 300; // med_temp = 250 → no penalty
 
 /// Register a project and drive three real `submit_reading` calls, returning
 /// the on-chain result the third submission finalizes.
-fn last_event_data(e: &soroban_sdk::Env, contract: &soroban_sdk::Address, topic: soroban_sdk::Symbol) -> soroban_sdk::Val {
+fn last_event_data(
+    e: &soroban_sdk::Env,
+    contract: &soroban_sdk::Address,
+    topic: soroban_sdk::Symbol,
+) -> soroban_sdk::Val {
     let events = e.events().all();
     let mut found: Option<soroban_sdk::Val> = None;
     for i in 0..events.len() {
@@ -154,13 +158,21 @@ fn finalize_via_submit_reading(
         );
     }
 
-    let result = f.oracle_client
+    let result = f
+        .oracle_client
         .get_last_result(&project_id)
         .expect("window must have finalized after three submissions");
 
-    let vrfy_data = last_event_data(&f.e, &f.oracle_client.address, soroban_sdk::Symbol::new(&f.e, "rdng_vrfy_ds"));
-    let (evt_proj, evt_result) =
-        <(soroban_sdk::BytesN<32>, verification_oracle::VerificationResult)>::try_from_val(&f.e, &vrfy_data).unwrap();
+    let vrfy_data = last_event_data(
+        &f.e,
+        &f.oracle_client.address,
+        soroban_sdk::Symbol::new(&f.e, "rdng_vrfy_ds"),
+    );
+    let (evt_proj, evt_result) = <(
+        soroban_sdk::BytesN<32>,
+        verification_oracle::VerificationResult,
+    )>::try_from_val(&f.e, &vrfy_data)
+    .unwrap();
     assert_eq!(evt_proj, project_id);
     assert_eq!(evt_result, result);
 

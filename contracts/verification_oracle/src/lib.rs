@@ -1157,8 +1157,10 @@ impl VerificationOracle {
 
             remove_open_project(&e, &project_id);
 
-            e.events()
-                .publish((Symbol::new(&e, "rdng_vrfy_ds"),), (project_id, result.clone()));
+            e.events().publish(
+                (Symbol::new(&e, "rdng_vrfy_ds"),),
+                (project_id, result.clone()),
+            );
 
             Some(result)
         } else {
@@ -2244,8 +2246,10 @@ impl VerificationOracle {
             )));
         }
 
-        e.events()
-            .publish((Symbol::new(&e, "rdng_vrfy_cr"),), (project_id, result.clone()));
+        e.events().publish(
+            (Symbol::new(&e, "rdng_vrfy_cr"),),
+            (project_id, result.clone()),
+        );
 
         Some(result)
     }
