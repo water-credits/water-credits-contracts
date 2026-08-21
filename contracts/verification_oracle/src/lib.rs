@@ -607,7 +607,7 @@ pub struct FinalizationResult {
 /// wrapping in `i128`. `total` is floored at 0 so a maximal quality penalty
 /// can never be misread as a negative credit balance.
 ///
-/// `baseline_n` / `baseline_p`, `temp_threshold` and `window_secs` are passed
+/// `baseline_n` / `baseline_p` and `window_secs` are passed
 /// in rather than read from config/project state here, since the two call sites
 /// use different baseline sources (per-project baselines in the direct-submit
 /// path vs. the global config in the commit-reveal path — see doc/MATH.md).
@@ -630,7 +630,6 @@ pub fn compute_finalization(
     med_p: i64,
     baseline_n: i128,
     baseline_p: i128,
-    temp_threshold: i128,
     window_secs: u64,
 ) -> FinalizationResult {
     let window_secs_i128 = window_secs as i128;
@@ -671,7 +670,7 @@ pub fn compute_finalization(
     if med_do < config.quality_threshold_do {
         penalty += 2000;
     }
-    if (med_temp as i128) > temp_threshold {
+    if med_temp > config.quality_threshold_temp {
         penalty += 1000;
     }
     if penalty > 8000 {
@@ -1063,7 +1062,7 @@ impl VerificationOracle {
             let med_p = median_i64(&p_vals);
 
             // Per-project baselines via shared helper (doc/MATH.md §1).
-            let (baseline_n, baseline_p, baseline_temp) = resolve_baselines(&e, &project_id);
+            let (baseline_n, baseline_p, _baseline_temp) = resolve_baselines(&e, &project_id);
 
             let fin = compute_finalization(
                 &config,
@@ -1076,7 +1075,6 @@ impl VerificationOracle {
                 med_p,
                 baseline_n,
                 baseline_p,
-                baseline_temp,
                 config.window_secs,
             );
 
@@ -2086,7 +2084,7 @@ impl VerificationOracle {
         let med_n = median_i64(&n_vals);
         let med_p = median_i64(&p_vals);
 
-        let (baseline_n, baseline_p, baseline_temp) = resolve_baselines(&e, &project_id);
+        let (baseline_n, baseline_p, _baseline_temp) = resolve_baselines(&e, &project_id);
 
         let fin = compute_finalization(
             &config,
@@ -2099,7 +2097,6 @@ impl VerificationOracle {
             med_p,
             baseline_n,
             baseline_p,
-            baseline_temp,
             config.window_secs,
         );
 
