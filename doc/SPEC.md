@@ -380,8 +380,10 @@ Both indexes are updated atomically with the record write in
 | `get_record(id)` | — | Fetch record by sequential ID |
 | `total_retired()` | — | Global sum of retired credits |
 | `record_count()` | — | Total number of records |
-| `get_retirements_by_retiree(retiree)` | — | All records for an address |
-| `get_retirements_by_project(project_id)` | — | All records for a project |
+| `get_retirements_by_retiree(retiree, offset, limit)` | — | Paginated full records |
+| `get_retirement_ids_by_retiree(retiree, offset, limit)` | — | Paginated record IDs only |
+| `get_retirements_by_project(project_id, offset, limit)` | — | Paginated full records |
+| `get_retirement_ids_by_project(project_id, offset, limit)` | — | Paginated record IDs only |
 
 ---
 

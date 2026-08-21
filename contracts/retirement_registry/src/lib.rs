@@ -307,6 +307,60 @@ impl RetirementRegistry {
         records
     }
 
+    /// Get paginated retirement record IDs for a given retiree address.
+    /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    pub fn get_retirement_ids_by_retiree(
+        e: Env,
+        retiree: Address,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<u64> {
+        let count_key = DataKey::RetireeCount(retiree.clone());
+        let total: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let mut ids: Vec<u64> = Vec::new(&e);
+        let end = (offset + limit as u64).min(total);
+        for pos in offset..end {
+            let idx_key = DataKey::RetireeIndex(retiree.clone(), pos);
+            if let Some(record_id) = e.storage().persistent().get::<_, u64>(&idx_key) {
+                e.storage().persistent().extend_ttl(
+                    &idx_key,
+                    INDEX_TTL_THRESHOLD,
+                    INDEX_TTL_BUMP,
+                );
+                ids.push_back(record_id);
+            }
+        }
+        ids
+    }
+
+    /// Get paginated retirement record IDs for a given project ID.
+    /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    pub fn get_retirement_ids_by_project(
+        e: Env,
+        project_id: BytesN<32>,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<u64> {
+        let count_key = DataKey::ProjectCount(project_id.clone());
+        let total: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let mut ids: Vec<u64> = Vec::new(&e);
+        let end = (offset + limit as u64).min(total);
+        for pos in offset..end {
+            let idx_key = DataKey::ProjectIndex(project_id.clone(), pos);
+            if let Some(record_id) = e.storage().persistent().get::<_, u64>(&idx_key) {
+                e.storage().persistent().extend_ttl(
+                    &idx_key,
+                    INDEX_TTL_THRESHOLD,
+                    INDEX_TTL_BUMP,
+                );
+                ids.push_back(record_id);
+            }
+        }
+        ids
+    }
+
     /// Get the total number of retirements for a specific retiree.
     pub fn retiree_count(e: Env, retiree: Address) -> u64 {
         e.storage()
@@ -538,6 +592,68 @@ mod tests {
         assert_eq!(client.project_retirement_count(&project_id), 0);
         client.record_retirement(&admin, &retiree, &project_id, &100, &purpose, &uri);
         assert_eq!(client.project_retirement_count(&project_id), 1);
+    }
+
+    #[test]
+    fn test_get_retirement_ids_by_retiree() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[5u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record 5 retirements for the same retiree
+        let mut expected_ids = std::vec::Vec::new();
+        for amount in [100i128, 200, 300, 400, 500] {
+            let id = client.record_retirement(&admin, &retiree, &project_id, &amount, &purpose, &uri);
+            expected_ids.push(id);
+        }
+
+        // Check correct IDs
+        let ids_page1 = client.get_retirement_ids_by_retiree(&retiree, &0, &2);
+        assert_eq!(ids_page1.len(), 2);
+        assert_eq!(ids_page1.get(0).unwrap(), expected_ids[0]);
+        assert_eq!(ids_page1.get(1).unwrap(), expected_ids[1]);
+
+        let ids_page2 = client.get_retirement_ids_by_retiree(&retiree, &2, &5); // test boundary
+        assert_eq!(ids_page2.len(), 3);
+        assert_eq!(ids_page2.get(0).unwrap(), expected_ids[2]);
+        assert_eq!(ids_page2.get(1).unwrap(), expected_ids[3]);
+        assert_eq!(ids_page2.get(2).unwrap(), expected_ids[4]);
+
+        let empty = client.get_retirement_ids_by_retiree(&retiree, &5, &2);
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn test_get_retirement_ids_by_project() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[5u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        let mut expected_ids = std::vec::Vec::new();
+        for amount in [100i128, 200, 300] {
+            let id = client.record_retirement(&admin, &retiree, &project_id, &amount, &purpose, &uri);
+            expected_ids.push(id);
+        }
+
+        let ids_page1 = client.get_retirement_ids_by_project(&project_id, &0, &2);
+        assert_eq!(ids_page1.len(), 2);
+        assert_eq!(ids_page1.get(0).unwrap(), expected_ids[0]);
+        assert_eq!(ids_page1.get(1).unwrap(), expected_ids[1]);
+
+        let ids_page2 = client.get_retirement_ids_by_project(&project_id, &2, &5);
+        assert_eq!(ids_page2.len(), 1);
+        assert_eq!(ids_page2.get(0).unwrap(), expected_ids[2]);
+
+        let empty = client.get_retirement_ids_by_project(&project_id, &3, &2);
+        assert_eq!(empty.len(), 0);
     }
 
     // ── Event tests ──
