@@ -1131,6 +1131,14 @@ An oracle node is an off-chain service that:
 4. Calls `verification_oracle.submit_reading()` with the validated data.
 5. Manages nonces and retry logic.
 
+### Oracle Staking
+
+If `min_stake` is configured to be greater than zero, an oracle node must stake tokens before it can be added to the whitelist and participate in the protocol:
+
+1. Obtain a balance of the configured staking token.
+2. Invoke `stake(oracle_address, amount)` on the `verification_oracle` contract. This directly transfers tokens from the oracle's wallet to the contract (push model) and requires the oracle's signature.
+3. Once the stake is deposited, the admin can call `add_oracle(oracle_address)` to whitelist the oracle.
+
 ### Oracle API (Internal)
 
 Each oracle node exposes a management API (not part of the smart contracts):

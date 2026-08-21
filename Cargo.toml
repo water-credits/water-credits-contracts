@@ -21,3 +21,4 @@ edition = "2021"
 
 [patch.crates-io]
 soroban-sdk-macros = { path = ".patches/soroban-sdk-macros" }
+ethnum = { path = ".patches/ethnum" }
