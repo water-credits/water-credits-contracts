@@ -32,7 +32,6 @@ pub enum ProposalStatus {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct GovernanceConfig {
-    pub fee_bps: u32,
     pub voting_period: u64,
     pub timelock_duration: u64,
     pub approval_threshold_bps: u32,
@@ -223,7 +222,6 @@ impl Governance {
         e.storage().instance().set(&DataKey::Admin, &admin);
 
         let config = GovernanceConfig {
-            fee_bps: 50,
             voting_period: 604800,
             timelock_duration: 86400,
             approval_threshold_bps: 6000,
@@ -1056,7 +1054,6 @@ mod tests {
     fn test_initialize_sets_config_and_members() {
         let (_e, _admin, member1, client) = setup();
         let config = client.get_config();
-        assert_eq!(config.fee_bps, 50);
         assert_eq!(config.approval_threshold_bps, 6000);
         assert!(client.is_member_fn(&member1));
         assert_eq!(client.member_count_fn(), 1);
@@ -1446,7 +1443,6 @@ mod tests {
         e.mock_all_auths();
 
         let new_config = GovernanceConfig {
-            fee_bps: 100,
             voting_period: 432000,
             timelock_duration: 43200,
             approval_threshold_bps: 5000,
@@ -1457,7 +1453,6 @@ mod tests {
         client.update_config(&admin, &new_config);
 
         let config = client.get_config();
-        assert_eq!(config.fee_bps, 100);
         assert_eq!(config.max_active_proposals, 20);
     }
 
@@ -1530,7 +1525,6 @@ mod tests {
 
         // New admin can now perform admin actions
         let config = GovernanceConfig {
-            fee_bps: 200,
             voting_period: 604800,
             timelock_duration: 86400,
             approval_threshold_bps: 6000,
@@ -1539,11 +1533,9 @@ mod tests {
             max_active_proposals: 10,
         };
         client.update_config(&new_admin, &config);
-        assert_eq!(client.get_config().fee_bps, 200);
 
         // Old admin should be rejected
         let config2 = GovernanceConfig {
-            fee_bps: 300,
             voting_period: 604800,
             timelock_duration: 86400,
             approval_threshold_bps: 6000,
