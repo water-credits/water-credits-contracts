@@ -18,8 +18,8 @@
 
 use credit_token::{CreditToken, CreditTokenClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, Events},
-    Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec, TryFromVal,
+    testutils::{Address as _, Events, Ledger},
+    Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
 };
 use verification_oracle::{
     compute_finalization, sha256_commitment, OracleConfig, RevealParams, VerificationOracle,
