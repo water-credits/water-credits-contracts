@@ -437,18 +437,21 @@ impl Governance {
         e.events()
             .publish((EVENT_VOTE_CAST,), (proposal_id, voter, approve));
 
-        // Resolution math uses the creation-time snapshot (`eligible_voters`),
-        // never the live membership count. This guarantees membership changes
-        // after proposal creation never retroactively alter the threshold.
+        // Resolution math uses the creation-time snapshot capped by the current
+        // member count. This guarantees that member additions do not retroactively
+        // alter the threshold, while member removals correctly lower it.
         let config: GovernanceConfig = read_config(&e);
         let total_votes = proposal.votes_for + proposal.votes_against;
 
-        // Quorum = ceil(quorum_bps/10000 * eligible_voters), computed against the
-        // snapshot. At least one vote is required to resolve.
-        let quorum = if proposal.eligible_voters == 0 {
+        let current_members = member_count(&e);
+        let effective_voters = proposal.eligible_voters.min(current_members);
+
+        // Quorum = ceil(quorum_bps/10000 * effective_voters), computed against the
+        // effective voter count. At least one vote is required to resolve.
+        let quorum = if effective_voters == 0 {
             0u64
         } else {
-            (proposal.eligible_voters as u64 * config.quorum_bps as u64).div_ceil(10000)
+            (effective_voters as u64 * config.quorum_bps as u64).div_ceil(10000)
         };
 
         if (total_votes as u64) >= quorum {
@@ -478,6 +481,7 @@ impl Governance {
                     PROPOSAL_TTL_THRESHOLD,
                     PROPOSAL_TTL_BUMP,
                 );
+                Self::remove_from_active(&e, proposal_id);
             }
         }
     }
@@ -573,19 +577,16 @@ impl Governance {
     /// This is the on-chain recovery path for a proposal whose actions can no
     /// longer succeed (for example a target contract was upgraded and its
     /// function signature changed, leaving an `Approved` proposal permanently
-    /// un-executable). It transitions the proposal to the terminal `Cancelled`
-    /// state and frees its active-proposals slot without requiring a full new
-    /// voting cycle.
+    /// Cancel an approved, active, or pending proposal. Admin or proposer only.
     ///
-    /// Restricted to the admin so a member cannot use it to block a proposal
-    /// they dislike. Already-resolved proposals (Executed/Rejected/Expired) are
-    /// not cancellable.
-    pub fn cancel_proposal(e: Env, admin: Address, proposal_id: u64) {
-        admin.require_auth();
-        let stored: Address = read_admin(&e);
-        if admin != stored {
-            panic!("unauthorized");
-        }
+    /// This is the recovery path for a proposal whose actions can no
+    /// longer succeed. It transitions the proposal to the terminal Cancelled
+    /// state and frees its active-proposals slot.
+    ///
+    /// Admin can cancel if Approved, Active, or Pending. Proposer can cancel
+    /// if Active or Pending. Already-resolved proposals are not cancellable.
+    pub fn cancel_proposal(e: Env, caller: Address, proposal_id: u64) {
+        caller.require_auth();
 
         let proposal_key = DataKey::Proposal(proposal_id);
         let mut proposal: Proposal = e
@@ -594,9 +595,26 @@ impl Governance {
             .get(&proposal_key)
             .unwrap_or_else(|| panic!("proposal not found"));
 
-        if !matches!(proposal.status, ProposalStatus::Approved)
-            && !matches!(proposal.status, ProposalStatus::Active)
-        {
+        let admin: Address = read_admin(&e);
+        if caller != admin && caller != proposal.proposer {
+            panic!("unauthorized");
+        }
+
+        let is_admin = caller == admin;
+        let is_proposer = caller == proposal.proposer;
+
+        let ok_to_cancel = if is_admin {
+            matches!(proposal.status, ProposalStatus::Approved)
+                || matches!(proposal.status, ProposalStatus::Active)
+                || matches!(proposal.status, ProposalStatus::Pending)
+        } else if is_proposer {
+            matches!(proposal.status, ProposalStatus::Active)
+                || matches!(proposal.status, ProposalStatus::Pending)
+        } else {
+            false
+        };
+
+        if !ok_to_cancel {
             panic!("proposal not cancellable");
         }
 
@@ -610,10 +628,42 @@ impl Governance {
 
         Self::remove_from_active(&e, proposal_id);
 
-        // `prop_cancel` is longer than the 9-char `symbol_short!` limit, so
-        // the topic is built at runtime.
         e.events()
             .publish((Symbol::new(&e, "prop_cancel"),), (proposal_id,));
+    }
+
+    /// Transition an expired proposal to the Expired status and free its active slot. Callable by anyone after the voting period ends.
+    pub fn expire_proposal(e: Env, proposal_id: u64) {
+        let proposal_key = DataKey::Proposal(proposal_id);
+        let mut proposal: Proposal = e
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic!("proposal not found"));
+
+        if !matches!(proposal.status, ProposalStatus::Active)
+            && !matches!(proposal.status, ProposalStatus::Pending)
+        {
+            panic!("proposal not active or pending");
+        }
+
+        let timestamp = e.ledger().timestamp();
+        if timestamp <= proposal.voting_ends_at {
+            panic!("voting period has not ended");
+        }
+
+        proposal.status = ProposalStatus::Expired;
+        e.storage().persistent().set(&proposal_key, &proposal);
+        e.storage().persistent().extend_ttl(
+            &proposal_key,
+            PROPOSAL_TTL_THRESHOLD,
+            PROPOSAL_TTL_BUMP,
+        );
+
+        Self::remove_from_active(&e, proposal_id);
+
+        e.events()
+            .publish((Symbol::new(&e, "prop_expired"),), (proposal_id,));
     }
 
     /// Update the governance configuration parameters. Admin only.
@@ -2030,5 +2080,180 @@ mod tests {
         let (ev_old_admin, ev_new_admin) = <(Address, Address)>::try_from_val(&e, data).unwrap();
         assert_eq!(ev_old_admin, admin);
         assert_eq!(ev_new_admin, new_admin);
+    }
+
+    #[test]
+    fn test_remove_member_lowers_quorum_so_proposal_resolves() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let mut members = Vec::new(&e);
+        for _ in 0..10 {
+            members.push_back(Address::generate(&e));
+        }
+
+        let contract_id = e.register_contract(None, Governance);
+        let client = GovernanceClient::new(&e, &contract_id);
+        client.initialize(&admin, &members);
+
+        let proposer = members.get(0).unwrap();
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &proposer,
+            &String::from_str(&e, "Remove Member Test"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.eligible_voters, 10);
+
+        for i in 2..10 {
+            let m = members.get(i).unwrap();
+            client.remove_member(&admin, &m);
+        }
+
+        assert_eq!(client.member_count_fn(), 2);
+
+        // Quorum is met on the first vote (ceil(2 * 50%) = 1). The proposal resolves immediately.
+        client.vote(&members.get(0).unwrap(), &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+    }
+
+    #[test]
+    fn test_all_members_vote_normally() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        // Set quorum to 100% so that both members must vote to reach quorum
+        let mut config = client.get_config();
+        config.quorum_bps = 10000;
+        client.update_config(&admin, &config);
+
+        let member2 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Normal Vote"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Active));
+
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+    }
+
+    #[test]
+    fn test_proposer_can_cancel_active_proposal() {
+        let (e, _admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Cancel by proposer"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.cancel_proposal(&member1, &id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Cancelled));
+    }
+
+    #[test]
+    fn test_permissionless_expire_proposal() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.max_active_proposals = 1;
+        client.update_config(&admin, &config);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Expire Me"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        assert!(client
+            .try_propose(
+                &member1,
+                &String::from_str(&e, "Blocked"),
+                &String::from_str(&e, "desc"),
+                &actions,
+                &false,
+            )
+            .is_err());
+
+        let mut info = e.ledger().get();
+        info.timestamp = config.voting_period + 2;
+        e.ledger().set(info);
+
+        client.expire_proposal(&id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Expired));
+
+        let id2 = client.propose(
+            &member1,
+            &String::from_str(&e, "Second Chance"),
+            &String::from_str(&e, "succeeds after expiration"),
+            &actions,
+            &false,
+        );
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_rejected_proposal_frees_slot() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.max_active_proposals = 1;
+        client.update_config(&admin, &config);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Reject Me"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &false);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Rejected));
+
+        let id2 = client.propose(
+            &member1,
+            &String::from_str(&e, "Second Chance"),
+            &String::from_str(&e, "succeeds after rejection"),
+            &actions,
+            &false,
+        );
+        assert_eq!(id2, 2);
     }
 }
