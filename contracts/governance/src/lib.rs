@@ -135,6 +135,29 @@ const PROPOSAL_TTL_BUMP: u32 = 12_614_400;
 const VOTED_TTL_THRESHOLD: u32 = 12_614_400;
 const VOTED_TTL_BUMP: u32 = 12_614_400;
 
+/// Safe ranges for `GovernanceConfig` fields, enforced by `update_config`.
+/// These are constants (not config-derived) to avoid a circular dependency
+/// where an invalid config could loosen the bounds used to validate itself.
+/// Minimum voting period (1 hour): shorter windows leave members no
+/// realistic chance to vote before a proposal expires.
+const MIN_VOTING_PERIOD: u64 = 3_600;
+/// Maximum voting period (30 days).
+const MAX_VOTING_PERIOD: u64 = 2_592_000;
+/// Maximum timelock duration (7 days). `0` is a valid "no timelock".
+const MAX_TIMELOCK_DURATION: u64 = 604_800;
+/// Minimum approval threshold (0.01%). `0` would let any single vote (or no
+/// votes) approve a proposal.
+const MIN_APPROVAL_THRESHOLD_BPS: u32 = 1;
+/// Maximum approval threshold (100%).
+const MAX_APPROVAL_THRESHOLD_BPS: u32 = 10_000;
+/// Maximum quorum (100%). `0` is a valid "no quorum requirement".
+const MAX_QUORUM_BPS: u32 = 10_000;
+/// Minimum active-proposal cap: at least one proposal must be allowed to be
+/// in flight at a time.
+const MIN_ACTIVE_PROPOSALS: u32 = 1;
+/// Maximum active-proposal cap, to keep the active-proposals list bounded.
+const MAX_ACTIVE_PROPOSALS: u32 = 100;
+
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
 }
@@ -145,6 +168,35 @@ fn read_admin(e: &Env) -> Address {
 
 fn read_config(e: &Env) -> GovernanceConfig {
     e.storage().instance().get(&DataKey::Config).unwrap()
+}
+
+/// Validate `GovernanceConfig` fields against the safe ranges above before
+/// they're written to storage. An out-of-range value here governs every
+/// future proposal, so a bad `update_config` call must be rejected outright
+/// rather than silently degrading governance (e.g. `voting_period = 0`
+/// expiring every proposal instantly, or `approval_threshold_bps = 0`
+/// letting a single vote approve anything).
+fn validate_config(config: &GovernanceConfig) {
+    if !(MIN_VOTING_PERIOD..=MAX_VOTING_PERIOD).contains(&config.voting_period) {
+        panic!("voting_period out of range");
+    }
+    if config.timelock_duration > MAX_TIMELOCK_DURATION {
+        panic!("timelock_duration out of range");
+    }
+    if !(MIN_APPROVAL_THRESHOLD_BPS..=MAX_APPROVAL_THRESHOLD_BPS)
+        .contains(&config.approval_threshold_bps)
+    {
+        panic!("approval_threshold_bps out of range");
+    }
+    if config.quorum_bps > MAX_QUORUM_BPS {
+        panic!("quorum_bps out of range");
+    }
+    if config.min_proposal_deposit < 0 {
+        panic!("min_proposal_deposit out of range");
+    }
+    if !(MIN_ACTIVE_PROPOSALS..=MAX_ACTIVE_PROPOSALS).contains(&config.max_active_proposals) {
+        panic!("max_active_proposals out of range");
+    }
 }
 
 fn is_member(e: &Env, addr: &Address) -> bool {
@@ -577,6 +629,7 @@ impl Governance {
         if admin != stored {
             panic!("unauthorized");
         }
+        validate_config(&config);
         e.storage().instance().set(&DataKey::Config, &config);
     }
 
@@ -1279,6 +1332,65 @@ mod tests {
         let config = client.get_config();
         assert_eq!(config.fee_bps, 100);
         assert_eq!(config.max_active_proposals, 20);
+    }
+
+    #[test]
+    fn test_update_config_rejects_zero_voting_period() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.voting_period = 0;
+        let result = client.try_update_config(&admin, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_rejects_approval_threshold_over_100_pct() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.approval_threshold_bps = 10001;
+        let result = client.try_update_config(&admin, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_accepts_approval_threshold_at_100_pct() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.approval_threshold_bps = 10000;
+        client.update_config(&admin, &config);
+        assert_eq!(client.get_config().approval_threshold_bps, 10000);
+    }
+
+    #[test]
+    fn test_update_config_accepts_zero_timelock() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.timelock_duration = 0;
+        client.update_config(&admin, &config);
+        assert_eq!(client.get_config().timelock_duration, 0);
+    }
+
+    #[test]
+    fn test_update_config_rejected_update_does_not_change_stored_config() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let original = client.get_config();
+
+        let mut bad_config = original.clone();
+        bad_config.voting_period = 0;
+        let result = client.try_update_config(&admin, &bad_config);
+        assert!(result.is_err());
+
+        assert_eq!(client.get_config(), original);
     }
 
     #[test]
