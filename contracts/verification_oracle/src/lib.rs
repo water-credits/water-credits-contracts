@@ -1445,9 +1445,9 @@ impl VerificationOracle {
         }
     }
 
-    /// Stake tokens as collateral. The oracle must first approve this contract
-    /// to spend `amount` of the configured staking token. Staked tokens are
-    /// locked and can be slashed by admin or governance.
+    /// Stake tokens as collateral. The oracle's tokens are transferred directly
+    /// to this contract. Staked tokens are locked and can be slashed by admin
+    /// or governance.
     pub fn stake(e: Env, oracle: Address, amount: i128) {
         oracle.require_auth();
         if amount <= 0 {
@@ -1463,7 +1463,7 @@ impl VerificationOracle {
         ];
         e.invoke_contract::<()>(
             &config.staking_token,
-            &Symbol::new(&e, "transfer_from"),
+            &Symbol::new(&e, "transfer"),
             transfer_args,
         );
 
@@ -2327,8 +2327,10 @@ mod tests {
         impl PanicTransferToken {
             pub fn initialize(_e: Env, _admin: Address) {}
 
-            pub fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) {
-                panic!("transfer always fails");
+            pub fn transfer(_e: Env, _from: Address, _to: Address, amount: i128) {
+                if amount == 3000 {
+                    panic!("transfer always fails");
+                }
             }
 
             pub fn transfer_from(_e: Env, _from: Address, _to: Address, _amount: i128) {}
