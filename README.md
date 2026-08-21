@@ -1193,7 +1193,8 @@ submission:
 | `("transferred",)` | `credit_token` | `(from, to, amount)` | `from`, `to` |
 | `("retired",)` | `credit_token` | `(retiree, amount, certificate)` | `retiree` |
 | `("project_registered",)` | `credit_factory` | `(project_id, owner)` | `owner` |
-| `("reading_verified",)` | `verification_oracle` | `(project_id, result)` | `project_id` |
+| `("rdng_vrfy_cr",)` | `verification_oracle` | `(project_id, result)` | `project_id` |
+| `("rdng_vrfy_ds",)` | `verification_oracle` | `(project_id, result)` | `project_id` |
 | `("retirement_recorded",)` | `retirement_registry` | `(retiree, amount)` | `retiree` |
 
 ### Indexing with the Backend

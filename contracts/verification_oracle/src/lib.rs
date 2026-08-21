@@ -9,7 +9,6 @@ use soroban_sdk::{
 #[cfg(test)]
 extern crate std;
 
-const EVENT_READING_VERIFIED: Symbol = symbol_short!("rdng_vrfy");
 const EVENT_ORACLE_STAKED: Symbol = symbol_short!("orc_stk");
 const EVENT_ORACLE_UNSTAKED: Symbol = symbol_short!("orc_unst");
 const EVENT_ORACLE_SLASHED: Symbol = symbol_short!("orc_slsh");
@@ -1158,8 +1157,10 @@ impl VerificationOracle {
 
             remove_open_project(&e, &project_id);
 
-            e.events()
-                .publish((EVENT_READING_VERIFIED,), (project_id, result.clone()));
+            e.events().publish(
+                (Symbol::new(&e, "rdng_vrfy_ds"),),
+                (project_id, result.clone()),
+            );
 
             Some(result)
         } else {
@@ -2245,8 +2246,10 @@ impl VerificationOracle {
             )));
         }
 
-        e.events()
-            .publish((EVENT_READING_VERIFIED,), (project_id, result.clone()));
+        e.events().publish(
+            (Symbol::new(&e, "rdng_vrfy_cr"),),
+            (project_id, result.clone()),
+        );
 
         Some(result)
     }

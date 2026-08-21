@@ -18,8 +18,8 @@
 
 use credit_token::{CreditToken, CreditTokenClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+    testutils::{Address as _, Events, Ledger},
+    Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
 };
 use verification_oracle::{
     compute_finalization, sha256_commitment, OracleConfig, RevealParams, VerificationOracle,
@@ -107,11 +107,31 @@ const DIRECT_BASELINE_TEMP: i64 = 300; // med_temp = 250 → no penalty
 
 /// Register a project and drive three real `submit_reading` calls, returning
 /// the on-chain result the third submission finalizes.
+fn last_event_data(
+    e: &soroban_sdk::Env,
+    contract: &soroban_sdk::Address,
+    topic: soroban_sdk::Symbol,
+) -> soroban_sdk::Val {
+    let events = e.events().all();
+    let mut found: Option<soroban_sdk::Val> = None;
+    for i in 0..events.len() {
+        let (c, topics, data) = events.get(i).unwrap();
+        if c == *contract {
+            if let Ok(t) = soroban_sdk::Symbol::try_from_val(e, &topics.get(0).unwrap()) {
+                if t == topic {
+                    found = Some(data);
+                }
+            }
+        }
+    }
+    found.unwrap_or_else(|| panic!("expected event with topic {topic:?} from {contract:?}"))
+}
+
 fn finalize_via_submit_reading(
     f: &Fixture,
     project_seed: u8,
 ) -> verification_oracle::VerificationResult {
-    let project_id = BytesN::from_array(&f.e, &[project_seed; 32]);
+    let project_id = soroban_sdk::BytesN::from_array(&f.e, &[project_seed; 32]);
     f.oracle_client.set_project_config(
         &f.admin,
         &project_id,
@@ -138,9 +158,25 @@ fn finalize_via_submit_reading(
         );
     }
 
-    f.oracle_client
+    let result = f
+        .oracle_client
         .get_last_result(&project_id)
-        .expect("window must have finalized after three submissions")
+        .expect("window must have finalized after three submissions");
+
+    let vrfy_data = last_event_data(
+        &f.e,
+        &f.oracle_client.address,
+        soroban_sdk::Symbol::new(&f.e, "rdng_vrfy_ds"),
+    );
+    let (evt_proj, evt_result) = <(
+        soroban_sdk::BytesN<32>,
+        verification_oracle::VerificationResult,
+    )>::try_from_val(&f.e, &vrfy_data)
+    .unwrap();
+    assert_eq!(evt_proj, project_id);
+    assert_eq!(evt_result, result);
+
+    result
 }
 
 /// The acceptance criterion, through the real `submit_reading` entry point:

@@ -331,8 +331,8 @@ fn test_full_six_contract_lifecycle() {
         .reveal_reading(&o3, &project_id, &reveal_params)
         .expect("third reveal must finalize the window");
 
-    // Event: rdng_vrfy(project_id, result) from the oracle.
-    let vrfy_data = last_event_data(&e, &oracle_id, symbol_short!("rdng_vrfy"));
+    // Event: rdng_vrfy_cr(project_id, result) from the oracle.
+    let vrfy_data = last_event_data(&e, &oracle_id, Symbol::new(&e, "rdng_vrfy_cr"));
     let (evt_proj, evt_result) =
         <(BytesN<32>, VerificationResult)>::try_from_val(&e, &vrfy_data).unwrap();
     assert_eq!(evt_proj, project_id);
