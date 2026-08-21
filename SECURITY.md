@@ -138,7 +138,9 @@ Use this when consensus is required (non-imminent threat, contested pause, or po
 
 **Step 1 — Create the emergency pause proposal**
 
-Any governance member can propose. The proposal action `function` field must be exactly `"emergency_pause"`:
+Any governance member can propose. The proposal action's `protocol_action`
+field must be `"EmergencyPause"` (the built-in protocol-action enum variant);
+`target`, `function` and `args` are ignored for built-in actions:
 
 ```bash
 soroban contract invoke \
@@ -147,7 +149,7 @@ soroban contract invoke \
   --arg proposer:$MEMBER_KEY \
   --arg title:"Emergency pause: oracle $ORACLE_ID compromised" \
   --arg description:"Sensor data anomalies detected. Pausing token operations pending investigation." \
-  --arg 'actions:[{"target":"'$GOVERNANCE_CONTRACT_ID'","function":"emergency_pause","args":[]}]' \
+  --arg 'actions:[{"target":"'$GOVERNANCE_CONTRACT_ID'","function":"unused","args":[],"protocol_action":"EmergencyPause"}]' \
   --network mainnet
 ```
 
@@ -186,7 +188,7 @@ Execution calls `pause()` on every registered token and sets `ProtocolPaused = t
 
 **Step 4 — Unpause via a second proposal**
 
-Once the incident is resolved, create a proposal with `function: "emergency_unpause"` and follow the same vote → timelock → execute flow.
+Once the incident is resolved, create a proposal with `protocol_action: "EmergencyUnpause"` and follow the same vote → timelock → execute flow.
 
 ---
 

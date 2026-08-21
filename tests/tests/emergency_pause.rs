@@ -2,11 +2,11 @@
 //!
 //! Covers:
 //!   1. Governance admin can directly call `emergency_pause` / `emergency_unpause`.
-//!   2. A supermajority proposal with action `"emergency_pause"` executes and pauses.
+//!   2. A supermajority proposal with `ProtocolAction::EmergencyPause` executes and pauses.
 //!   3. A paused token blocks `mint_to`, `transfer`, and `retire`.
 
 use credit_token::{CreditToken, CreditTokenClient};
-use governance::{Governance, GovernanceAction, GovernanceClient};
+use governance::{Governance, GovernanceAction, GovernanceClient, ProtocolAction};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     Address, BytesN, Env, String, Symbol, Vec,
@@ -130,11 +130,13 @@ fn test_supermajority_proposal_emergency_pause() {
     assert!(!token_client.paused());
     assert!(!gov_client.is_protocol_paused());
 
-    // Build a proposal whose single action is the built-in emergency_pause.
+    // Build a proposal whose single action is the built-in EmergencyPause.
+    // `target`/`function`/`args` are ignored for built-in actions.
     let pause_action = GovernanceAction {
-        target: gov_id.clone(), // target is ignored for built-in actions
-        function: Symbol::new(&e, "emergency_pause"),
+        target: gov_id.clone(),
+        function: Symbol::new(&e, "unused"),
         args: Vec::new(&e),
+        protocol_action: ProtocolAction::EmergencyPause,
     };
     let actions = Vec::from_array(&e, [pause_action]);
 
@@ -195,11 +197,12 @@ fn test_supermajority_proposal_emergency_unpause() {
     gov_client.emergency_pause(&admin);
     assert!(token_client.paused());
 
-    // Propose to unpause.
+    // Propose to unpause via the built-in EmergencyUnpause action.
     let unpause_action = GovernanceAction {
         target: gov_id.clone(),
-        function: Symbol::new(&e, "emergency_unpause"),
+        function: Symbol::new(&e, "unused"),
         args: Vec::new(&e),
+        protocol_action: ProtocolAction::EmergencyUnpause,
     };
     let actions = Vec::from_array(&e, [unpause_action]);
 
