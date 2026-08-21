@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `credit_token`: `retire` now commits balance and supply reductions before calling the retirement registry, preventing a reentrant registry callback from spending credits already committed to retirement
 - `verification_oracle`: `update_config` now enforces `min_oracles <= oracle_count`, so governance cannot raise the quorum above the current registered oracle count and leave the protocol under-quorum (windows would collect submissions but never finalize)
 - Duplicate admin set in `governance` initialize
 - Max supply cap enforcement in `credit_token` mint
