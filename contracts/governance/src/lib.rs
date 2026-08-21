@@ -282,6 +282,14 @@ impl Governance {
         result
     }
 
+    /// Get the list of active proposal IDs.
+    pub fn active_proposals(e: Env) -> Vec<u64> {
+        e.storage()
+            .instance()
+            .get(&DataKey::ActiveProposals)
+            .unwrap_or_else(|| Vec::new(&e))
+    }
+
     /// Create a new proposal. Only governance members can propose.
     ///
     /// `allow_partial_execution` opts the proposal into best-effort execution:
@@ -1721,6 +1729,12 @@ mod tests {
 
         // Last call wins — the mock stores the most recent value.
         assert_eq!(mock_client.get_value(), 123);
+
+        let active = gov_client.active_proposals();
+        assert!(
+            !active.contains(&proposal_id),
+            "active slot must be freed on successful atomic execute"
+        );
     }
 
     #[test]
@@ -1764,6 +1778,12 @@ mod tests {
 
         let proposal = gov_client.get_proposal(&proposal_id).unwrap();
         assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        let active = gov_client.active_proposals();
+        assert!(
+            active.contains(&proposal_id),
+            "active slot must be preserved on atomic execute revert"
+        );
     }
 
     #[test]
@@ -1842,6 +1862,12 @@ mod tests {
         assert!(ev_results.get(0).unwrap());
         assert!(!ev_results.get(1).unwrap());
         assert!(ev_results.get(2).unwrap());
+
+        let active = gov_client.active_proposals();
+        assert!(
+            !active.contains(&proposal_id),
+            "active slot must be freed on best-effort execute"
+        );
     }
 
     #[test]
