@@ -133,3 +133,95 @@ fn test_staking_with_real_token() {
     };
     oracle_client.reveal_reading(&oracle_4, &project_id, &params);
 }
+
+#[test]
+fn test_unstake_bug_fix() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.budget().reset_unlimited();
+
+    let admin = Address::generate(&e);
+    let treasury = Address::generate(&e);
+    let oracle_1 = Address::generate(&e);
+    let project_id = BytesN::from_array(&e, &[7u8; 32]);
+
+    let token_id = e.register_contract(None, CreditToken);
+    let token_client = CreditTokenClient::new(&e, &token_id);
+    token_client.initialize(
+        &admin,
+        &String::from_str(&e, "Staking Token"),
+        &String::from_str(&e, "STK"),
+        &project_id,
+        &String::from_str(&e, "Methodology"),
+    );
+
+    token_client.set_minter(&admin, &admin);
+    token_client.mint_to(&admin, &oracle_1, &5000);
+
+    let oracle_id = e.register_contract(None, VerificationOracle);
+    let oracle_client = VerificationOracleClient::new(&e, &oracle_id);
+    oracle_client.initialize(&admin, &token_id, &treasury);
+
+    let config = OracleConfig {
+        min_oracles: 3,
+        max_oracles: 10,
+        quality_threshold_ph: 600,
+        quality_threshold_ph_max: 850,
+        quality_threshold_turbidity: 100,
+        quality_threshold_do: 80,
+        quality_threshold_temp: 300,
+        credit_per_kg_n: 100,
+        credit_per_kg_p: 200,
+        staking_token: token_id.clone(),
+        treasury: treasury.clone(),
+        min_stake: 500,
+        unstake_cooldown_secs: 100,
+        commit_phase_secs: 10,
+        min_reveal_ledgers: 1,
+        max_reveal_ledgers: 20,
+        slash_pct_bps: 1000,
+        min_slash_amount: 10,
+        max_slash_amount: 500,
+        window_secs: 3600,
+        max_open_windows: 20,
+    };
+    oracle_client.update_config(&admin, &config);
+
+    // Initial stake of 1000
+    oracle_client.stake(&oracle_1, &1000);
+    assert_eq!(token_client.balance(&oracle_1), 4000);
+    assert_eq!(token_client.balance(&oracle_id), 1000);
+
+    // Unstake 300
+    oracle_client.unstake(&oracle_1, &300);
+    let stake_info = oracle_client.get_stake(&oracle_1);
+    assert_eq!(stake_info.amount, 700);
+
+    // Cancel unstake by staking 200
+    oracle_client.stake(&oracle_1, &200);
+    let stake_info = oracle_client.get_stake(&oracle_1);
+    assert_eq!(stake_info.amount, 1200); // 700 + 300 (restored) + 200
+    assert_eq!(stake_info.unstake_request, None);
+    assert_eq!(stake_info.pending_unstake, 0);
+
+    // Unstake 400
+    oracle_client.unstake(&oracle_1, &400);
+    
+    // Fast forward time to pass cooldown
+    let mut info = e.ledger().get();
+    info.timestamp += 150;
+    e.ledger().set(info);
+
+    // Claim unstake
+    oracle_client.claim_unstake(&oracle_1);
+    
+    // Oracle should have 400 tokens back: 5000 - 1000 - 200 + 400 = 4200
+    assert_eq!(token_client.balance(&oracle_1), 4200);
+    
+    // Remaining staked should be 1200 - 400 = 800
+    let stake_info = oracle_client.get_stake(&oracle_1);
+    assert_eq!(stake_info.amount, 800);
+    assert_eq!(stake_info.unstake_request, None);
+    assert_eq!(stake_info.pending_unstake, 0);
+    assert_eq!(token_client.balance(&oracle_id), 800);
+}

@@ -802,14 +802,7 @@ impl VerificationOracle {
             panic!("max oracles reached");
         }
         if config.min_stake > 0 {
-            let stake_info: StakeInfo = e
-                .storage()
-                .persistent()
-                .get(&DataKey::OracleStake(oracle.clone()))
-                .unwrap_or(StakeInfo {
-                    amount: 0,
-                    unstake_request: None,
-                });
+            let stake_info: StakeInfo = read_stake_info(&e, &oracle);
             if stake_info.amount < config.min_stake {
                 panic!("insufficient stake");
             }
@@ -846,14 +839,7 @@ impl VerificationOracle {
         {
             panic!("oracle not active");
         }
-        let stake_info: StakeInfo = e
-            .storage()
-            .persistent()
-            .get(&DataKey::OracleStake(oracle.clone()))
-            .unwrap_or(StakeInfo {
-                amount: 0,
-                unstake_request: None,
-            });
+        let stake_info: StakeInfo = read_stake_info(&e, &oracle);
         if stake_info.amount > 0 {
             panic!("oracle must unstake before removal");
         }
@@ -958,14 +944,7 @@ impl VerificationOracle {
 
         let config: OracleConfig = read_config(&e);
         if config.min_stake > 0 {
-            let stake_info: StakeInfo = e
-                .storage()
-                .persistent()
-                .get(&DataKey::OracleStake(oracle.clone()))
-                .unwrap_or(StakeInfo {
-                    amount: 0,
-                    unstake_request: None,
-                });
+            let stake_info: StakeInfo = read_stake_info(&e, &oracle);
             if stake_info.amount < config.min_stake {
                 panic!("insufficient stake");
             }
@@ -1469,14 +1448,11 @@ impl VerificationOracle {
         );
 
         let stake_key = DataKey::OracleStake(oracle.clone());
-        let mut stake_info: StakeInfo =
-            e.storage()
-                .persistent()
-                .get(&stake_key)
-                .unwrap_or(StakeInfo {
-                    amount: 0,
-                    unstake_request: None,
-                });
+        let mut stake_info = read_stake_info(&e, &oracle);
+        if stake_info.unstake_request.is_some() {
+            stake_info.amount += stake_info.pending_unstake;
+            stake_info.pending_unstake = 0;
+        }
         stake_info.amount += amount;
         stake_info.unstake_request = None;
         e.storage().persistent().set(&stake_key, &stake_info);
@@ -1498,13 +1474,7 @@ impl VerificationOracle {
         let config: OracleConfig = read_config(&e);
         let stake_key = DataKey::OracleStake(oracle.clone());
         let mut stake_info: StakeInfo =
-            e.storage()
-                .persistent()
-                .get(&stake_key)
-                .unwrap_or(StakeInfo {
-                    amount: 0,
-                    unstake_request: None,
-                });
+            read_stake_info(&e, &oracle);
         if stake_info.amount < amount {
             panic!("insufficient staked balance");
         }
@@ -1520,6 +1490,7 @@ impl VerificationOracle {
         }
         let now = e.ledger().timestamp();
         stake_info.amount -= amount;
+        stake_info.pending_unstake += amount;
         stake_info.unstake_request = Some(now + config.unstake_cooldown_secs);
         e.storage().persistent().set(&stake_key, &stake_info);
         e.storage()
@@ -1534,29 +1505,18 @@ impl VerificationOracle {
     pub fn claim_unstake(e: Env, oracle: Address) {
         oracle.require_auth();
         let stake_key = DataKey::OracleStake(oracle.clone());
-        let stake_info: StakeInfo = e
-            .storage()
-            .persistent()
-            .get(&stake_key)
-            .unwrap_or(StakeInfo {
-                amount: 0,
-                unstake_request: None,
-            });
+        let stake_info: StakeInfo = read_stake_info(&e, &oracle);
         let cooldown_end = stake_info.unstake_request.unwrap_or(0);
         let now = e.ledger().timestamp();
         if cooldown_end == 0 || now < cooldown_end {
             panic!("cooldown not elapsed");
         }
         let config: OracleConfig = read_config(&e);
-        let unstaked_amount = stake_info.amount;
+        let unstaked_amount = stake_info.pending_unstake;
+        stake_info.pending_unstake = 0;
+        stake_info.unstake_request = None;
 
-        e.storage().persistent().set(
-            &stake_key,
-            &StakeInfo {
-                amount: 0,
-                unstake_request: None,
-            },
-        );
+        e.storage().persistent().set(&stake_key, &stake_info);
         e.storage()
             .persistent()
             .extend_ttl(&stake_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
@@ -1588,13 +1548,7 @@ impl VerificationOracle {
         }
         let stake_key = DataKey::OracleStake(oracle.clone());
         let mut stake_info: StakeInfo =
-            e.storage()
-                .persistent()
-                .get(&stake_key)
-                .unwrap_or(StakeInfo {
-                    amount: 0,
-                    unstake_request: None,
-                });
+            read_stake_info(&e, &oracle);
         if stake_info.amount < amount {
             panic!("slash exceeds staked balance");
         }
@@ -1633,13 +1587,7 @@ impl VerificationOracle {
 
     /// Get the current staked balance and unstake request for an oracle.
     pub fn get_stake(e: Env, oracle: Address) -> StakeInfo {
-        e.storage()
-            .persistent()
-            .get(&DataKey::OracleStake(oracle))
-            .unwrap_or(StakeInfo {
-                amount: 0,
-                unstake_request: None,
-            })
+        read_stake_info(&e, &oracle)
     }
 
     /// Get the slash record for an oracle (most recent slash).
@@ -1733,14 +1681,7 @@ impl VerificationOracle {
 
         let config: OracleConfig = read_config(&e);
         if config.min_stake > 0 {
-            let stake_info: StakeInfo = e
-                .storage()
-                .persistent()
-                .get(&DataKey::OracleStake(oracle.clone()))
-                .unwrap_or(StakeInfo {
-                    amount: 0,
-                    unstake_request: None,
-                });
+            let stake_info: StakeInfo = read_stake_info(&e, &oracle);
             if stake_info.amount < config.min_stake {
                 panic!("insufficient stake");
             }
@@ -1869,14 +1810,7 @@ impl VerificationOracle {
 
         let config: OracleConfig = read_config(&e);
         if config.min_stake > 0 {
-            let stake_info: StakeInfo = e
-                .storage()
-                .persistent()
-                .get(&DataKey::OracleStake(oracle.clone()))
-                .unwrap_or(StakeInfo {
-                    amount: 0,
-                    unstake_request: None,
-                });
+            let stake_info: StakeInfo = read_stake_info(&e, &oracle);
             if stake_info.amount < config.min_stake {
                 panic!("insufficient stake");
             }
@@ -2054,13 +1988,7 @@ impl VerificationOracle {
                 // Slash the oracle's stake
                 let stake_key = DataKey::OracleStake(oracle.clone());
                 let mut stake_info: StakeInfo =
-                    e.storage()
-                        .persistent()
-                        .get(&stake_key)
-                        .unwrap_or(StakeInfo {
-                            amount: 0,
-                            unstake_request: None,
-                        });
+                    read_stake_info(&e, &oracle);
 
                 if stake_info.amount > 0 {
                     let slash_amount = compute_slash_amount(stake_info.amount, &config);
@@ -5529,3 +5457,4 @@ mod tests {
         client.update_config(&admin, &config);
     }
 }
+
