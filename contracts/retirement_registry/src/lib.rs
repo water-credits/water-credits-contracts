@@ -534,7 +534,7 @@ mod tests {
         let uri = String::from_str(&e, "ipfs://QmCert");
 
         // Record 5 retirements for the same retiree
-        for amount in [100i128, 200, 300, 400, 500] {
+        for &amount in &[100i128, 200, 300, 400, 500] {
             client.record_retirement(&admin, &retiree, &project_id, &amount, &purpose, &uri);
         }
 
@@ -606,7 +606,7 @@ mod tests {
 
         // Record 5 retirements for the same retiree
         let mut expected_ids = std::vec::Vec::new();
-        for amount in [100i128, 200, 300, 400, 500] {
+        for &amount in &[100i128, 200, 300, 400, 500] {
             let id = client.record_retirement(&admin, &retiree, &project_id, &amount, &purpose, &uri);
             expected_ids.push(id);
         }
@@ -638,7 +638,7 @@ mod tests {
         let uri = String::from_str(&e, "ipfs://QmCert");
 
         let mut expected_ids = std::vec::Vec::new();
-        for amount in [100i128, 200, 300] {
+        for &amount in &[100i128, 200, 300] {
             let id = client.record_retirement(&admin, &retiree, &project_id, &amount, &purpose, &uri);
             expected_ids.push(id);
         }
