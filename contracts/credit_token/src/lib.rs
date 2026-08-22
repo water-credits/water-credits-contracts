@@ -662,6 +662,19 @@ impl CreditToken {
             .get(&DataKey::RequireRegistry)
             .unwrap_or(false);
 
+        if registry_addr.is_none() && require_registry {
+            soroban_sdk::panic_with_error!(&e, soroban_sdk::Error::from_contract_error(1));
+        }
+
+        let total = read_total_supply(&e);
+        let total_retired = read_total_retired(&e);
+
+        // Commit the token accounting before handing control to the registry.
+        // If the registry call fails, Soroban rolls these writes back atomically.
+        save_balance(&e, &holder, balance - amount);
+        save_total_supply(&e, total - amount);
+        save_total_retired(&e, total_retired + amount);
+
         let registry_record_id = if let Some(registry) = registry_addr {
             let record_args: Vec<Val> = vec![
                 &e,
@@ -678,19 +691,9 @@ impl CreditToken {
                 record_args,
             );
             Some(record_id)
-        } else if require_registry {
-            soroban_sdk::panic_with_error!(&e, soroban_sdk::Error::from_contract_error(1));
         } else {
             None
         };
-
-        save_balance(&e, &holder, balance - amount);
-
-        let total = read_total_supply(&e);
-        save_total_supply(&e, total - amount);
-
-        let total_retired = read_total_retired(&e);
-        save_total_retired(&e, total_retired + amount);
 
         let cert_count: u64 = e.storage().instance().get(&DataKey::CertCount).unwrap();
         let timestamp = e.ledger().timestamp();
