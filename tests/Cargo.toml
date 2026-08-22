@@ -12,6 +12,7 @@ testutils = [
     "retirement_registry/testutils",
     "project_registry/testutils",
     "governance/testutils",
+    "credit_marketplace/testutils",
 ]
 
 [dependencies]
@@ -21,6 +22,7 @@ verification_oracle = { path = "../contracts/verification_oracle", features = ["
 retirement_registry = { path = "../contracts/retirement_registry", features = ["testutils"] }
 project_registry = { path = "../contracts/project_registry", features = ["testutils"] }
 governance = { path = "../contracts/governance", features = ["testutils"] }
+credit_marketplace = { path = "../contracts/credit_marketplace", features = ["testutils"] }
 shared = { path = "../contracts/shared" }
 soroban-sdk = { version = "20.0.0", features = ["testutils"] }
 
