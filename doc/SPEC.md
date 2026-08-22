@@ -456,17 +456,18 @@ changes after a timelock. Voting is majority-based with a configurable
 approval threshold.
 
 **Proposal execution.** Each `Proposal` carries a list of `GovernanceAction`
-entries (`target: Address`, `function: Symbol`, `args: Vec<Val>`) and a
-boolean `allow_partial_execution` flag chosen at creation time. On
-`execute()`, once the timelock has elapsed, `governance` dispatches each
-action in order:
+entries (`target: Address`, `function: Symbol`, `args: Vec<Val>`,
+`protocol_action: ProtocolAction`) and a boolean `allow_partial_execution`
+flag chosen at creation time. On `execute()`, once the timelock has elapsed,
+`governance` dispatches each action in order, switching on
+`protocol_action`:
 
-- `function == "emergency_pause"` / `"emergency_unpause"` are handled as
-  built-in protocol actions (pause/unpause every token in `RegisteredTokens`);
-  `target` is ignored for these.
-- Any other `function` is invoked generically via `e.invoke_contract(target,
-  function, args)` (atomic mode) or `e.try_invoke_contract(target, function,
-  args)` (best-effort mode).
+- `ProtocolAction::EmergencyPause` / `ProtocolAction::EmergencyUnpause` are
+  handled as built-in protocol actions (pause/unpause every token in
+  `RegisteredTokens`); `target`, `function` and `args` are ignored for these.
+- `ProtocolAction::None` (the default) is invoked generically via
+  `e.invoke_contract(target, function, args)` (atomic mode) or
+  `e.try_invoke_contract(target, function, args)` (best-effort mode).
 
 **Execution mode.**
 

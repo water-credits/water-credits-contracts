@@ -85,14 +85,24 @@ pub struct GovernanceAction {
     pub target: Address,
     pub function: Symbol,
     pub args: Vec<Val>,
+    /// Built-in protocol action to dispatch. `ProtocolAction::None` (the
+    /// default) dispatches a generic cross-contract call to `target` invoking
+    /// `function` with `args`. The emergency variants are handled internally by
+    /// `execute()` (pause/unpause every token in `RegisteredTokens`) and
+    /// ignore `target`/`function`/`args`.
+    pub protocol_action: ProtocolAction,
 }
 
-/// Built-in protocol action types. These are dispatched by `execute` and
-/// `emergency_pause`/`emergency_unpause` without requiring a generic
-/// cross-contract call encoding.
+/// Built-in protocol action types, dispatched by `execute()` via
+/// `GovernanceAction::protocol_action`. Each variant is a distinct
+/// on-chain identifier for a governance-controlled protocol operation, so
+/// proposals reference built-ins by this enum instead of ad-hoc symbol
+/// strings that can silently drift out of sync with the dispatcher.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolAction {
+    /// No built-in action: dispatch as a generic cross-contract call.
+    None,
     /// Pause all registered credit token contracts.
     EmergencyPause,
     /// Unpause all registered credit token contracts.
@@ -526,13 +536,15 @@ impl Governance {
 
         // Dispatch proposal actions.
         //
-        // Built-in protocol actions are identified by the `function` field:
-        //   "emergency_pause"   → pause all registered token contracts
-        //   "emergency_unpause" → unpause all registered token contracts
+        // Built-in protocol actions are identified by
+        // `GovernanceAction::protocol_action`:
+        //   ProtocolAction::EmergencyPause   → pause all registered tokens
+        //   ProtocolAction::EmergencyUnpause → unpause all registered tokens
         //
-        // All other actions are executed as generic cross-contract invocations
-        // via `e.invoke_contract()`, using the target address, function symbol,
-        // and arguments stored in the GovernanceAction.
+        // When `protocol_action` is `ProtocolAction::None`, the action is
+        // executed as a generic cross-contract invocation via
+        // `e.invoke_contract()`, using the target address, function symbol, and
+        // arguments stored in the GovernanceAction.
         //
         // Error policy:
         //   * Atomic (allow_partial_execution == false) — REVERT: if any
@@ -886,28 +898,32 @@ impl Governance {
 
     /// Dispatch a single proposal action.
     ///
+    /// `GovernanceAction::protocol_action` selects the built-in protocol
+    /// actions (pause/unpause every registered token); `target`, `function`
+    /// and `args` are ignored for those. Any other action is dispatched as a
+    /// generic cross-contract invocation of `target.function(args)`.
+    ///
     /// In atomic mode (`best_effort == false`) a failing action panics and
     /// aborts the whole `execute()` call. In best-effort mode the outcome is
     /// reported as a boolean so `execute()` can record per-action results.
     fn dispatch_action(e: &Env, action: &GovernanceAction, best_effort: bool) -> bool {
-        if action.function == soroban_sdk::Symbol::new(e, "emergency_pause") {
-            return Self::pause_all(e, best_effort);
-        }
-        if action.function == soroban_sdk::Symbol::new(e, "emergency_unpause") {
-            return Self::unpause_all(e, best_effort);
-        }
-
-        // Generic cross-contract invocation.
-        if best_effort {
-            e.try_invoke_contract::<Val, InvokeError>(
-                &action.target,
-                &action.function,
-                action.args.clone(),
-            )
-            .is_ok()
-        } else {
-            e.invoke_contract::<()>(&action.target, &action.function, action.args.clone());
-            true
+        match action.protocol_action {
+            ProtocolAction::EmergencyPause => Self::pause_all(e, best_effort),
+            ProtocolAction::EmergencyUnpause => Self::unpause_all(e, best_effort),
+            ProtocolAction::None => {
+                // Generic cross-contract invocation.
+                if best_effort {
+                    e.try_invoke_contract::<Val, InvokeError>(
+                        &action.target,
+                        &action.function,
+                        action.args.clone(),
+                    )
+                    .is_ok()
+                } else {
+                    e.invoke_contract::<()>(&action.target, &action.function, action.args.clone());
+                    true
+                }
+            }
         }
     }
 
@@ -1656,6 +1672,7 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&42i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action]);
 
@@ -1702,11 +1719,13 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&42i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let action2 = GovernanceAction {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&123i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action1, action2]);
 
@@ -1755,6 +1774,7 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "always_fail"),
             args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action]);
 
@@ -1807,16 +1827,19 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&1i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let action2 = GovernanceAction {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "always_fail"),
             args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
         };
         let action3 = GovernanceAction {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&3i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action1, action2, action3]);
 
@@ -2001,6 +2024,7 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&999i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action]);
 
@@ -2038,10 +2062,14 @@ mod tests {
         client.add_member(&admin, &member2);
         client.add_member(&admin, &member3);
 
+        // The built-in action is selected purely by `protocol_action`; the
+        // `target`/`function`/`args` fields are ignored (the function symbol
+        // here is deliberately not the old "emergency_pause" magic string).
         let pause_action = GovernanceAction {
-            target: admin.clone(), // target is ignored for built-in actions
-            function: soroban_sdk::Symbol::new(&e, "emergency_pause"),
+            target: admin.clone(),
+            function: soroban_sdk::Symbol::new(&e, "unused"),
             args: Vec::new(&e),
+            protocol_action: ProtocolAction::EmergencyPause,
         };
         let actions = Vec::from_array(&e, [pause_action]);
 
@@ -2064,6 +2092,51 @@ mod tests {
         client.execute(&member1, &proposal_id);
 
         assert!(client.is_protocol_paused());
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Executed));
+    }
+
+    #[test]
+    fn test_emergency_unpause_action_still_works() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        // Put the protocol into paused state via the admin shortcut.
+        client.emergency_pause(&admin);
+        assert!(client.is_protocol_paused());
+
+        let unpause_action = GovernanceAction {
+            target: admin.clone(), // target is ignored for built-in actions
+            function: soroban_sdk::Symbol::new(&e, "unused"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::EmergencyUnpause,
+        };
+        let actions = Vec::from_array(&e, [unpause_action]);
+
+        let proposal_id = client.propose(
+            &member1,
+            &String::from_str(&e, "Unpause"),
+            &String::from_str(&e, "unpause the protocol"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &proposal_id, &true);
+        client.vote(&member2, &proposal_id, &true);
+
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        client.execute(&member1, &proposal_id);
+
+        assert!(!client.is_protocol_paused());
         let proposal = client.get_proposal(&proposal_id).unwrap();
         assert!(matches!(proposal.status, ProposalStatus::Executed));
     }
