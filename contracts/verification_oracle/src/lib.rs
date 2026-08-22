@@ -70,6 +70,11 @@ pub struct VerificationResult {
     /// project token is configured. Distinguishes "credits earned" from
     /// "credits actually minted" (Issue #36).
     pub credits_minted: i128,
+    /// Amount of `total_credits` that was minted to the protocol treasury
+    /// as a fee during finalization. May be `0` when `fee_bps == 0` or
+    /// when the token's `max_supply` cap is exhausted before the fee
+    /// portion is minted. Always `<= total_credits`.
+    pub protocol_fee_minted: i128,
     pub oracle_count: u32,
     pub finalized_at: u64,
 }
@@ -135,6 +140,13 @@ pub struct OracleConfig {
     /// storage load even when the open-projects list lives in persistent
     /// storage (Issue #132). Defaults to 20 in `initialize`.
     pub max_open_windows: u32,
+    /// Protocol fee in basis points applied to every credit mint. When
+    /// credits are minted to a beneficiary during finalization, `fee_bps /
+    /// 10000` of the minted amount is redirected to the protocol treasury
+    /// address. For example, `fee_bps = 500` means 5% of every mint goes
+    /// to the treasury. Bounded to `[0, 10_000]` by `update_config`.
+    /// Defaults to `0` (no fee) in `initialize`.
+    pub fee_bps: u32,
 }
 
 /// Minimum accepted `OracleConfig::window_secs` (1 minute). Rejects
@@ -457,7 +469,8 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
 
 /// Read the token's `total_supply` and `max_supply` and mint at most
 /// `total_credits` to `beneficiary`, never exceeding the remaining supply
-/// allowance. Returns the amount actually minted.
+/// allowance. Returns the amounts actually minted to the beneficiary and
+/// the protocol treasury.
 ///
 /// This prevents the partial-rollback failure mode described in Issue #36:
 /// calling `mint_to` with `total_credits` when
@@ -471,19 +484,33 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
 /// - `max_supply == 0` → token is uncapped; the full `total_credits` is minted.
 /// - `total_supply >= max_supply` → nothing remains; returns `0`, no mint.
 /// - otherwise → mints `min(total_credits, max_supply - total_supply)`.
+///
+/// Mint `total_credits` to the beneficiary and protocol treasury, respecting
+/// the token's `max_supply` cap. Returns `(credits_minted, fee_minted)`:
+///
+/// - `credits_minted` — amount minted to the beneficiary (net of fee).
+/// - `fee_minted` — amount minted to the treasury as a protocol fee.
+///
+/// When `fee_bps == 0` the entire `total_credits` goes to the beneficiary
+/// and `fee_minted == 0`. The fee is computed as
+/// `total_credits * fee_bps / 10_000` and minted separately to the
+/// treasury, so the supply invariant
+/// `total_supply + total_retired + total_burned == ever_minted` holds.
 fn mint_credits_respecting_cap(
     e: &Env,
     token: &Address,
     beneficiary: &Address,
     total_credits: i128,
-) -> i128 {
+) -> (i128, i128) {
     if total_credits <= 0 {
-        return 0;
+        return (0, 0);
     }
 
+    let config: OracleConfig = read_config(e);
     let total_supply: i128 = e.invoke_contract(token, &Symbol::new(e, "total_supply"), vec![e]);
     let max_supply: i128 = e.invoke_contract(token, &Symbol::new(e, "max_supply"), vec![e]);
 
+    // Compute how many credits are mintable given the token cap.
     let mintable = if max_supply > 0 {
         let remaining = max_supply - total_supply;
         if remaining <= 0 {
@@ -496,17 +523,44 @@ fn mint_credits_respecting_cap(
     };
 
     if mintable <= 0 {
-        return 0;
+        return (0, 0);
     }
 
-    let mint_args: Vec<Val> = vec![
-        e,
-        e.current_contract_address().to_val(),
-        beneficiary.to_val(),
-        mintable.into_val(e),
-    ];
-    e.invoke_contract::<()>(token, &Symbol::new(e, "mint_to"), mint_args);
-    mintable
+    // Split mintable credits between beneficiary and treasury.
+    // fee = floor(mintable * fee_bps / 10_000); net = mintable - fee.
+    let fee: i128 = if config.fee_bps > 0 {
+        mintable
+            .checked_mul(config.fee_bps as i128)
+            .unwrap_or_else(|| panic!("fee overflow"))
+            / 10_000
+    } else {
+        0
+    };
+    let net = mintable - fee;
+
+    // Mint net credits to the beneficiary.
+    if net > 0 {
+        let mint_args: Vec<Val> = vec![
+            e,
+            e.current_contract_address().to_val(),
+            beneficiary.to_val(),
+            net.into_val(e),
+        ];
+        e.invoke_contract::<()>(token, &Symbol::new(e, "mint_to"), mint_args);
+    }
+
+    // Mint fee credits to the protocol treasury.
+    if fee > 0 {
+        let fee_args: Vec<Val> = vec![
+            e,
+            e.current_contract_address().to_val(),
+            config.treasury.to_val(),
+            fee.into_val(e),
+        ];
+        e.invoke_contract::<()>(token, &Symbol::new(e, "mint_to"), fee_args);
+    }
+
+    (net, fee)
 }
 
 /// Reject sensor readings that are structurally valid `i64` values but physically
@@ -757,6 +811,7 @@ impl VerificationOracle {
             // existing deployments see no change in credit amounts.
             window_secs: 3600,
             max_open_windows: DEFAULT_MAX_OPEN_WINDOWS,
+            fee_bps: 0,
         };
         e.storage().instance().set(&DataKey::Config, &config);
 
@@ -1109,6 +1164,7 @@ impl VerificationOracle {
                 volumetric_credit: fin.volumetric_credit,
                 total_credits: fin.total,
                 credits_minted: 0,
+                protocol_fee_minted: 0,
                 oracle_count: window.submissions.len(),
                 finalized_at: e.ledger().timestamp(),
             };
@@ -1121,12 +1177,14 @@ impl VerificationOracle {
             // the window still finalizes cleanly.
             let cfg_key = DataKey::ProjectConfig(project_id.clone());
             if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
-                result.credits_minted = mint_credits_respecting_cap(
+                let (net, fee) = mint_credits_respecting_cap(
                     &e,
                     &config.token_contract,
                     &config.beneficiary,
                     result.total_credits,
                 );
+                result.credits_minted = net;
+                result.protocol_fee_minted = fee;
             }
 
             // Persist last result
@@ -1353,6 +1411,9 @@ impl VerificationOracle {
         }
         if config.max_open_windows == 0 {
             panic!("max_open_windows must be at least 1");
+        }
+        if config.fee_bps > 10_000 {
+            panic!("fee_bps exceeds max (10000 = 100%)");
         }
         e.storage().instance().set(&DataKey::Config, &config);
     }
@@ -2183,6 +2244,7 @@ impl VerificationOracle {
             volumetric_credit: fin.volumetric_credit,
             total_credits: fin.total,
             credits_minted: 0,
+            protocol_fee_minted: 0,
             oracle_count: window.submissions.len(),
             finalized_at: e.ledger().timestamp(),
         };
@@ -2192,12 +2254,14 @@ impl VerificationOracle {
         // `credits_minted` is recorded accurately.
         let cfg_key = DataKey::ProjectConfig(project_id.clone());
         if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
-            result.credits_minted = mint_credits_respecting_cap(
+            let (net, fee) = mint_credits_respecting_cap(
                 &e,
                 &config.token_contract,
                 &config.beneficiary,
                 result.total_credits,
             );
+            result.credits_minted = net;
+            result.protocol_fee_minted = fee;
         }
 
         // Persist last result
@@ -2776,6 +2840,7 @@ mod tests {
             max_slash_amount: i128::MAX,
             window_secs: 1800,
             max_open_windows: 20,
+            fee_bps: 0,
         };
         client.update_config(&admin, &new_config);
 
