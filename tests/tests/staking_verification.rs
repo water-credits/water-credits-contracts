@@ -73,7 +73,7 @@ fn test_staking_with_real_token() {
 
     // Set project config
     token_client.set_minter(&admin, &oracle_id);
-    oracle_client.set_project_config(&admin, &project_id, &token_id, &admin, &10, &2, &300);
+    oracle_client.set_project_config(&admin, &project_id, &token_id, &admin, &Some(10), &Some(2), &Some(300));
 
     // Try adding oracle_4 without staking first -> should panic with "insufficient stake"
     let res = oracle_client.try_add_oracle(&admin, &oracle_4);

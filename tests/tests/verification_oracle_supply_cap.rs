@@ -61,7 +61,7 @@ fn setup() -> Fixture {
     token_client.set_minter(&admin, &oracle_id);
 
     // Wire the project to the token + beneficiary.
-    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &10, &2, &300);
+    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &Some(10), &Some(2), &Some(300));
 
     // Staking is already disabled by default (min_stake = 0), so oracles can
     // be added without funding.

@@ -106,7 +106,7 @@ fn test_oracle_mints_credits_to_beneficiary() {
     token_client.set_minter(&admin, &oracle_id);
 
     // Configure: oracle project config for auto-mint
-    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &10, &2, &300);
+    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &Some(10), &Some(2), &Some(300));
 
     // Add 3 oracles
     let o1 = Address::generate(&e);
@@ -472,7 +472,7 @@ fn test_protocol_fee_supply_conservation() {
 
     // Set minter to oracle and configure project
     token_client.set_minter(&admin, &oracle_id);
-    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &10, &2, &300);
+    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &Some(10), &Some(2), &Some(300));
 
     // Add 3 oracles
     let o1 = Address::generate(&e);

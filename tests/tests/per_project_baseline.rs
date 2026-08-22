@@ -486,3 +486,91 @@ fn test_commit_reveal_uses_per_project_baseline_n_50() {
     );
     assert!(res.total_credits > 0);
 }
+
+#[test]
+fn test_explicit_zero_baseline() {
+    let f = setup();
+
+    let mut seed = [0u8; 32];
+    seed[0] = 0x7A;
+    let proj_zero = BytesN::from_array(&f._e, &seed);
+    f.oracle_client.set_project_config(
+        &f.admin,
+        &proj_zero,
+        &f.token_client.address,
+        &f.beneficiary,
+        &Some(0),
+        &None, 
+        &None, 
+    );
+
+    let (ph, turb, do_, flow, temp, n, p) = READING; // n = 8, p = 1
+    for i in 0..3u32 {
+        f.oracle_client.submit_reading(
+            &f.oracles.get(i).unwrap(),
+            &proj_zero,
+            &1,
+            &ph,
+            &turb,
+            &do_,
+            &flow,
+            &temp,
+            &n,
+            &p,
+        );
+    }
+
+    let res = f.oracle_client.get_last_result(&proj_zero).unwrap();
+
+    // Because baseline_n is explicitly 0, and med_n is 8, 
+    // removal credit for N should be 0.
+    assert_eq!(res.n_removal_kg, 0, "explicit zero baseline should override default 10");
+    
+    // baseline_p is None -> fallback to 2. med_p is 1.
+    assert_eq!(res.p_removal_kg, (2 - 1) as i128 * 500 * 3600 / 1_000_000);
+}
+
+#[test]
+fn test_legacy_zero_is_unset() {
+    let f = setup();
+
+    let mut seed = [0u8; 32];
+    seed[0] = 0x7B;
+    let proj_legacy = BytesN::from_array(&f._e, &seed);
+    
+    let legacy_config = verification_oracle::LegacyProjectConfig {
+        token_contract: f.token_client.address.clone(),
+        beneficiary: f.beneficiary.clone(),
+        baseline_n: 0,
+        baseline_p: 0,
+        baseline_temp: 0,
+    };
+    let key = verification_oracle::DataKey::ProjectConfig(proj_legacy.clone());
+    
+    f._e.as_contract(&f.oracle_client.address, || {
+        f._e.storage().persistent().set(&key, &legacy_config);
+    });
+    
+    let (ph, turb, do_, flow, temp, n, p) = READING; // n = 8, p = 1
+    for i in 0..3u32 {
+        f.oracle_client.submit_reading(
+            &f.oracles.get(i).unwrap(),
+            &proj_legacy,
+            &1,
+            &ph,
+            &turb,
+            &do_,
+            &flow,
+            &temp,
+            &n,
+            &p,
+        );
+    }
+
+    let res = f.oracle_client.get_last_result(&proj_legacy).unwrap();
+
+    // Since legacy 0 is treated as unset, it falls back to defaults.
+    // default baseline_n = 10, default baseline_p = 2
+    assert_eq!(res.n_removal_kg, (10 - 8) as i128 * 500 * 3600 / 1_000_000, "legacy zero baseline should fall back to default 10");
+    assert_eq!(res.p_removal_kg, (2 - 1) as i128 * 500 * 3600 / 1_000_000);
+}

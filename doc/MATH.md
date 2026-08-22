@@ -75,6 +75,12 @@ too: a negative `turbidity` would make the median negative, which makes
 always false and disables the turbidity penalty; a negative `temperature` similarly
 lets a reading dodge the `med_temp > quality_threshold_temp` penalty.
 
+### 1.2 Per-Project Baselines
+A **baseline** represents the reference level against which improvements (removals) are measured. Projects can configure their own baselines via `ProjectConfig`.
+- Omitted baselines are represented as `None` (unset) and automatically fall back to the protocol defaults.
+- A baseline of `0` is a valid explicit baseline, meaning `Some(0)` will be exactly used as `0` and not fall back to defaults.
+- Legacy configurations stored before the change that encode `0` are interpreted as unset (meaning they still fall back to protocol defaults). The credit formula itself has not changed.
+
 ---
 
 ## 2. Multi-Oracle Median Aggregation
@@ -120,7 +126,7 @@ submit. A deployment reporting every 30 minutes while `window_secs` is left at
 
 ### 3.1 Nitrogen Removal
 
-**Baseline:** `baseline_n = 10` (mg/L, raw integer matching the `total_nitrogen` encoding)
+**Baseline:** Per-project `baseline_n` (mg/L). If `None` / unset, falls back to default `10` (mg/L, raw integer). Explicit `Some(0)` uses `0`.
 
 ```
 if med_n < baseline_n:
@@ -151,7 +157,7 @@ component of the credit total.
 Identical in structure to nitrogen, but with a lower baseline reflecting typical
 freshwater targets.
 
-**Baseline:** `baseline_p = 2` (mg/L, same encoding as `total_phosphorus`)
+**Baseline:** Per-project `baseline_p` (mg/L). If `None` / unset, falls back to default `2` (mg/L, same encoding). Explicit `Some(0)` uses `0`.
 
 ```
 if med_p < baseline_p:
