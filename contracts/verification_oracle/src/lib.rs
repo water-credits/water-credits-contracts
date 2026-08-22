@@ -469,7 +469,8 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
 
 /// Read the token's `total_supply` and `max_supply` and mint at most
 /// `total_credits` to `beneficiary`, never exceeding the remaining supply
-/// allowance. Returns the amount actually minted.
+/// allowance. Returns the amounts actually minted to the beneficiary and
+/// the protocol treasury.
 ///
 /// This prevents the partial-rollback failure mode described in Issue #36:
 /// calling `mint_to` with `total_credits` when
@@ -483,6 +484,7 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
 /// - `max_supply == 0` → token is uncapped; the full `total_credits` is minted.
 /// - `total_supply >= max_supply` → nothing remains; returns `0`, no mint.
 /// - otherwise → mints `min(total_credits, max_supply - total_supply)`.
+///
 /// Mint `total_credits` to the beneficiary and protocol treasury, respecting
 /// the token's `max_supply` cap. Returns `(credits_minted, fee_minted)`:
 ///
@@ -527,7 +529,7 @@ fn mint_credits_respecting_cap(
     // Split mintable credits between beneficiary and treasury.
     // fee = floor(mintable * fee_bps / 10_000); net = mintable - fee.
     let fee: i128 = if config.fee_bps > 0 {
-        (mintable as i128)
+        mintable
             .checked_mul(config.fee_bps as i128)
             .unwrap_or_else(|| panic!("fee overflow"))
             / 10_000

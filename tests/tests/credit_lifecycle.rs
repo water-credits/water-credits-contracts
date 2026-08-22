@@ -472,9 +472,7 @@ fn test_protocol_fee_supply_conservation() {
 
     // Set minter to oracle and configure project
     token_client.set_minter(&admin, &oracle_id);
-    oracle_client.set_project_config(
-        &admin, &project_id, &token_id, &beneficiary, &10, &2, &300,
-    );
+    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &10, &2, &300);
 
     // Add 3 oracles
     let o1 = Address::generate(&e);
@@ -500,7 +498,10 @@ fn test_protocol_fee_supply_conservation() {
     let beneficiary_balance = token_client.balance(&beneficiary);
     let treasury_balance = token_client.balance(&treasury);
 
-    assert!(beneficiary_balance > 0, "beneficiary should receive net credits");
+    assert!(
+        beneficiary_balance > 0,
+        "beneficiary should receive net credits"
+    );
     assert!(treasury_balance > 0, "treasury should receive protocol fee");
 
     // Core invariant: total_supply == net + fee (no credits lost or created)
