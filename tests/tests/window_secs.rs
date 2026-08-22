@@ -453,8 +453,8 @@ fn test_compute_finalization_halves_removal_at_half_the_window() {
     let config = bounds_config(&e);
 
     // Δn = 1000, Δp = 1000, flow = 5 → volumetric 0, so `total` halves too.
-    let hourly = compute_finalization(&config, 700, 10, 80, 250, 5, 8, 1, 1008, 1001, 300, 3600);
-    let half = compute_finalization(&config, 700, 10, 80, 250, 5, 8, 1, 1008, 1001, 300, 1800);
+    let hourly = compute_finalization(&config, 700, 10, 80, 250, 5, 8, 1, 1008, 1001, 3600);
+    let half = compute_finalization(&config, 700, 10, 80, 250, 5, 8, 1, 1008, 1001, 1800);
 
     assert_eq!(hourly.n_removed, 18);
     assert_eq!(hourly.p_removed, 18);
@@ -471,7 +471,7 @@ fn test_zero_window_yields_zero_nutrient_removal_without_panicking() {
     let e = Env::default();
     let config = bounds_config(&e);
 
-    let fin = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 1008, 1001, 300, 0);
+    let fin = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 1008, 1001, 0);
     assert_eq!(fin.n_removed, 0);
     assert_eq!(fin.p_removed, 0);
     // Volumetric credit has no Δt factor, so it survives a zero window.
@@ -499,7 +499,6 @@ fn test_max_window_does_not_overflow_for_plausible_magnitudes() {
         0,
         1_000_000_000,
         1_000_000_000,
-        300,
         MAX_WINDOW_SECS,
     );
     assert_eq!(
@@ -530,7 +529,6 @@ fn test_max_window_overflow_panics_instead_of_wrapping() {
         0,
         100_000_000_000_000_000, // baseline_n = 1e17
         2,
-        300,
         MAX_WINDOW_SECS,
     );
 }
@@ -554,7 +552,6 @@ fn test_same_inputs_do_not_overflow_at_the_old_hardcoded_window() {
         0,
         100_000_000_000_000_000,
         2,
-        300,
         3600,
     );
     assert_eq!(

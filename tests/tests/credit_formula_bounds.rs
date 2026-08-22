@@ -183,7 +183,6 @@ fn test_extreme_baseline_and_max_flow_overflow_panics() {
         1,
         i64::MAX as i128,
         2,
-        300,
         3600,
     );
 }
@@ -207,7 +206,6 @@ fn test_high_baseline_with_max_flow_does_not_overflow() {
         1,
         1000,
         100,
-        300,
         3600,
     );
     assert_eq!(
@@ -226,7 +224,7 @@ fn test_credit_rate_multiplication_overflow_panics() {
     let mut config = default_config(&e);
     config.credit_per_kg_n = i128::MAX;
     // med_n=8 < baseline_n=10 -> n_removed=3 (nonzero), so 3 * i128::MAX overflows.
-    compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
+    compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 10, 2, 3600);
 }
 
 /// All sensor fields at 0 (valid per entry validation) must produce zero
@@ -235,7 +233,7 @@ fn test_credit_rate_multiplication_overflow_panics() {
 fn test_all_zero_sensor_values_no_panic_zero_credits() {
     let e = Env::default();
     let config = default_config(&e);
-    let fin = compute_finalization(&config, 0, 0, 0, 0, 0, 0, 0, 10, 2, 300, 3600);
+    let fin = compute_finalization(&config, 0, 0, 0, 0, 0, 0, 0, 10, 2, 3600);
     assert_eq!(fin.total, 0);
     assert_eq!(fin.n_removed, 0);
     assert_eq!(fin.p_removed, 0);
@@ -248,7 +246,7 @@ fn test_all_zero_sensor_values_no_panic_zero_credits() {
 fn test_all_penalty_conditions_triggered_simultaneously() {
     let e = Env::default();
     let config = default_config(&e);
-    let fin = compute_finalization(&config, 300, 200, 10, 350, 500, 8, 1, 10, 2, 300, 3600);
+    let fin = compute_finalization(&config, 300, 200, 10, 350, 500, 8, 1, 10, 2, 3600);
     assert_eq!(fin.penalty, 7000);
     assert_eq!(fin.total, 30);
 }
@@ -262,7 +260,7 @@ fn test_negative_gross_from_misconfigured_credit_rate_floors_at_zero() {
     config.credit_per_kg_n = -1000;
     // n_removed=3, p_removed=1, volumetric=50, penalty=0 ->
     // gross = 3*(-1000) + 1*20 + 50 = -2930 -> would be negative pre-floor.
-    let fin = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
+    let fin = compute_finalization(&config, 700, 10, 80, 250, 500, 8, 1, 10, 2, 3600);
     assert_eq!(fin.total, 0);
 }
 
@@ -275,7 +273,7 @@ fn test_negative_gross_from_misconfigured_credit_rate_floors_at_zero() {
 fn test_max_penalty_with_nonzero_gross_credit() {
     let e = Env::default();
     let config = default_config(&e);
-    let fin = compute_finalization(&config, 300, 200, 10, 350, 500, 8, 1, 1000, 100, 300, 3600);
+    let fin = compute_finalization(&config, 300, 200, 10, 350, 500, 8, 1, 1000, 100, 3600);
 
     let n_removed = (1000i128 - 8) * 500 * 3600 / 1_000_000;
     let p_removed = (100i128 - 1) * 500 * 3600 / 1_000_000;
@@ -298,7 +296,7 @@ fn test_configurable_ph_upper_bound() {
     let mut config = default_config(&e);
 
     // Default band is [600, 700]; ph=750 breaches the (old, hardcoded) +100 max.
-    let fin_default = compute_finalization(&config, 750, 10, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
+    let fin_default = compute_finalization(&config, 750, 10, 80, 250, 500, 8, 1, 10, 2, 3600);
     assert_eq!(
         fin_default.penalty, 2000,
         "ph=750 should breach the default [600,700] band"
@@ -306,7 +304,7 @@ fn test_configurable_ph_upper_bound() {
 
     // Widen the band to [600, 900]; the same ph=750 reading is now in-range.
     config.quality_threshold_ph_max = 900;
-    let fin_widened = compute_finalization(&config, 750, 10, 80, 250, 500, 8, 1, 10, 2, 300, 3600);
+    let fin_widened = compute_finalization(&config, 750, 10, 80, 250, 500, 8, 1, 10, 2, 3600);
     assert_eq!(
         fin_widened.penalty, 0,
         "ph=750 should be in-range once the band is widened to 900"
