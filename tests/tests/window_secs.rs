@@ -1,4 +1,3 @@
-//! Configurable monitoring window (issue #93).
 //!
 //! `compute_finalization` hardcoded `3600` as the `Δt` factor in the nutrient
 //! removal formula, so credits were only correct for a deployment submitting
@@ -11,10 +10,11 @@
 //! deployments are unaffected, and `update_config` constrains it to
 //! `[MIN_WINDOW_SECS, MAX_WINDOW_SECS]`.
 //!
-//! These tests drive the **real contract entry points** — `submit_reading`
-//! (direct path) and the `commit_reading`/`reveal_reading` commit-reveal path,
-//! both ending in an on-chain `VerificationResult` read back through
-//! `get_last_result` — plus the overflow envelope at the new upper bound.
+//! All tests drive the commit-reveal entry points
+//! (`open_window` → `commit_reading` → `begin_reveal_phase` → `reveal_reading`),
+//! which is the only submission path now that `submit_reading` has been removed
+//! (Issue #155). Tests end by reading the on-chain `VerificationResult` via
+//! `get_last_result`, plus the overflow envelope at the new upper bound.
 
 use credit_token::{CreditToken, CreditTokenClient};
 use soroban_sdk::{
@@ -88,7 +88,7 @@ fn set_window_secs(f: &Fixture, window_secs: u64) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Real path 1 — direct `submit_reading`, per-project baselines
+// Commit-reveal finalization helper (the only production submission path)
 // ══════════════════════════════════════════════════════════════════════════
 
 /// Sensor readings chosen so the arithmetic is exact at both window lengths
@@ -105,8 +105,6 @@ const DIRECT_BASELINE_N: i64 = 1008; // med_n = 8   → Δ = 1000
 const DIRECT_BASELINE_P: i64 = 1001; // med_p = 1   → Δ = 1000
 const DIRECT_BASELINE_TEMP: i64 = 300; // med_temp = 250 → no penalty
 
-/// Register a project and drive three real `submit_reading` calls, returning
-/// the on-chain result the third submission finalizes.
 fn last_event_data(
     e: &soroban_sdk::Env,
     contract: &soroban_sdk::Address,
@@ -127,7 +125,13 @@ fn last_event_data(
     found.unwrap_or_else(|| panic!("expected event with topic {topic:?} from {contract:?}"))
 }
 
-fn finalize_via_submit_reading(
+/// Register a project and drive a complete commit-reveal round for three oracles,
+/// using per-project baselines from `DIRECT_READING` / `DIRECT_BASELINE_*`.
+/// Returns the on-chain `VerificationResult` produced by the third reveal.
+///
+/// This replaces the old `finalize_via_submit_reading` helper which used the
+/// now-removed plaintext `submit_reading` path (Issue #155).
+fn finalize_via_commit_reveal_direct(
     f: &Fixture,
     project_seed: u8,
 ) -> verification_oracle::VerificationResult {
@@ -143,26 +147,48 @@ fn finalize_via_submit_reading(
     );
 
     let (ph, turb, do_, flow, temp, n, p) = DIRECT_READING;
+    let salt = BytesN::from_array(&f.e, &[project_seed ^ 0xAA; 32]);
+    let nonce = 1u64;
+    let commitment = sha256_commitment(&f.e, nonce, ph, turb, do_, flow, temp, n, p, &salt);
+    let reveal_params = RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt,
+    };
+
+    f.oracle_client.open_window(&f.admin, &project_id);
     for i in 0..3u32 {
-        f.oracle_client.submit_reading(
+        f.oracle_client.commit_reading(
             &f.oracles.get(i).unwrap(),
             &project_id,
-            &1,
-            &ph,
-            &turb,
-            &do_,
-            &flow,
-            &temp,
-            &n,
-            &p,
+            &nonce,
+            &commitment,
         );
     }
 
-    let result = f
-        .oracle_client
-        .get_last_result(&project_id)
-        .expect("window must have finalized after three submissions");
+    // Advance past the commit phase (default 300 s / 60 ledgers).
+    f.e.ledger().with_mut(|l| {
+        l.timestamp += 301;
+        l.sequence_number += 61;
+    });
+    f.oracle_client.begin_reveal_phase(&project_id);
 
+    let mut finalized = None;
+    for i in 0..3u32 {
+        finalized = f
+            .oracle_client
+            .reveal_reading(&f.oracles.get(i).unwrap(), &project_id, &reveal_params);
+    }
+
+    let result = finalized.expect("third reveal must finalize the window");
+
+    // Cross-check: the `rdng_vrfy_ds` event carries the same result.
     let vrfy_data = last_event_data(
         &f.e,
         &f.oracle_client.address,
@@ -179,19 +205,19 @@ fn finalize_via_submit_reading(
     result
 }
 
-/// The acceptance criterion, through the real `submit_reading` entry point:
-/// `window_secs = 1800` yields exactly half the credits of `window_secs = 3600`
-/// for identical readings.
+/// The acceptance criterion through the commit-reveal path (per-project
+/// baselines): `window_secs = 1800` yields exactly half the credits of
+/// `window_secs = 3600` for identical readings.
 #[test]
-fn test_half_hour_window_yields_exactly_half_the_credits_via_submit_reading() {
+fn test_half_hour_window_yields_exactly_half_the_credits_via_commit_reveal_direct() {
     let f = setup();
 
     // Δ=1000, flow=5 → 1000 * 5 * 3600 / 1e6 = 18 kg of each nutrient.
     set_window_secs(&f, ONE_HOUR);
-    let hourly = finalize_via_submit_reading(&f, 0x11);
+    let hourly = finalize_via_commit_reveal_direct(&f, 0x11);
 
     set_window_secs(&f, HALF_HOUR);
-    let half_hourly = finalize_via_submit_reading(&f, 0x22);
+    let half_hourly = finalize_via_commit_reveal_direct(&f, 0x22);
 
     assert_eq!(hourly.n_removal_kg, 18);
     assert_eq!(hourly.p_removal_kg, 18);
@@ -218,14 +244,14 @@ fn test_half_hour_window_yields_exactly_half_the_credits_via_submit_reading() {
 /// A 6-hour deployment under-counted 6× before this change. It must now credit
 /// exactly 6× a 1-hour window for the same readings.
 #[test]
-fn test_six_hour_window_yields_six_times_the_credits_via_submit_reading() {
+fn test_six_hour_window_yields_six_times_the_credits_via_commit_reveal() {
     let f = setup();
 
     set_window_secs(&f, ONE_HOUR);
-    let hourly = finalize_via_submit_reading(&f, 0x31);
+    let hourly = finalize_via_commit_reveal_direct(&f, 0x31);
 
     set_window_secs(&f, 6 * ONE_HOUR);
-    let six_hourly = finalize_via_submit_reading(&f, 0x32);
+    let six_hourly = finalize_via_commit_reveal_direct(&f, 0x32);
 
     assert_eq!(six_hourly.n_removal_kg, hourly.n_removal_kg * 6);
     assert_eq!(six_hourly.p_removal_kg, hourly.p_removal_kg * 6);
@@ -240,7 +266,7 @@ fn test_default_window_reproduces_the_previous_hardcoded_behaviour() {
     let f = setup();
     assert_eq!(f.oracle_client.get_config().window_secs, ONE_HOUR);
 
-    let result = finalize_via_submit_reading(&f, 0x41);
+    let result = finalize_via_commit_reveal_direct(&f, 0x41);
 
     let (_, _, _, flow, _, med_n, med_p) = DIRECT_READING;
     assert_eq!(
@@ -254,7 +280,7 @@ fn test_default_window_reproduces_the_previous_hardcoded_behaviour() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Real path 2 — commit-reveal, global baselines
+// Commit-reveal, global baselines
 // ══════════════════════════════════════════════════════════════════════════
 
 /// `finalize_reveals` uses the global baselines (`baseline_n = 10`,
@@ -264,7 +290,7 @@ fn test_default_window_reproduces_the_previous_hardcoded_behaviour() {
 const REVEAL_READING: (i64, i64, i64, i64, i64, i64, i64) = (700, 10, 80, 2500, 250, 0, 0);
 
 /// Drive a full commit-reveal round through the real entry points and return
-/// the `VerificationResult` the third reveal finalizes.
+/// the `VerificationResult` the third reveal finalizes (using global baselines).
 fn finalize_via_commit_reveal(
     f: &Fixture,
     project_seed: u8,
@@ -323,8 +349,7 @@ fn finalize_via_commit_reveal(
 }
 
 /// The same proportionality through the commit-reveal path, which reaches
-/// `compute_finalization` via `finalize_reveals` rather than
-/// `submit_reading_impl` — both call sites must read the configured window.
+/// `compute_finalization` via `finalize_reveals`.
 #[test]
 fn test_half_hour_window_halves_nutrient_removal_via_commit_reveal() {
     let f = setup();
@@ -405,10 +430,10 @@ fn test_rejected_window_secs_does_not_change_credit_issuance() {
     let f = setup();
 
     set_window_secs(&f, HALF_HOUR);
-    let before = finalize_via_submit_reading(&f, 0x61);
+    let before = finalize_via_commit_reveal_direct(&f, 0x61);
 
     assert!(!try_update_window_secs(&f, MAX_WINDOW_SECS + 1));
-    let after = finalize_via_submit_reading(&f, 0x62);
+    let after = finalize_via_commit_reveal_direct(&f, 0x62);
 
     assert_eq!(before.total_credits, after.total_credits);
     assert_eq!(f.oracle_client.get_config().window_secs, HALF_HOUR);

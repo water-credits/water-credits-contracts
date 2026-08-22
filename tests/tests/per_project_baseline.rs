@@ -9,6 +9,10 @@
 //! These tests prove the fix: two projects with identical sensor readings but
 //! different `ProjectConfig` baselines produce different credit totals, and the
 //! per-project temperature baseline drives the temperature quality penalty.
+//!
+//! All submissions go through the commit-reveal path (Issue #155: the plaintext
+//! `submit_reading` entry point was removed as a bypass of the commit-reveal
+//! anti-frontrunning scheme).
 
 use credit_token::{CreditToken, CreditTokenClient};
 use soroban_sdk::{
@@ -99,21 +103,47 @@ fn configure_project(
     project_id
 }
 
-fn submit_three(f: &Fixture, project_id: &BytesN<32>) {
-    let (ph, turb, do_, flow, temp, n, p) = READING;
+fn finalize_three(f: &Fixture, project_id: &BytesN<32>) {
+    finalize_three_with_reading(f, project_id, READING.5, READING.6);
+}
+
+/// Run a full commit-reveal round for all 3 oracles on a project, using the
+/// standard READING fields but allowing custom n and p values.
+fn finalize_three_with_reading(f: &Fixture, project_id: &BytesN<32>, n: i64, p: i64) {
+    let (ph, turb, do_, flow, temp, _, _) = READING;
+    let nonce = 1u64;
+    // Derive a salt from the project_id bytes so distinct projects use distinct salts.
+    let first_byte = project_id.to_array()[0];
+    let salt = BytesN::from_array(&f._e, &[first_byte ^ 0x55u8; 32]);
+    let commitment = sha256_commitment(&f._e, nonce, ph, turb, do_, flow, temp, n, p, &salt);
+    let reveal_params = verification_oracle::RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt,
+    };
+
+    f.oracle_client.open_window(&f.admin, project_id);
     for i in 0..3u32 {
-        f.oracle_client.submit_reading(
-            &f.oracles.get(i).unwrap(),
-            project_id,
-            &1,
-            &ph,
-            &turb,
-            &do_,
-            &flow,
-            &temp,
-            &n,
-            &p,
-        );
+        f.oracle_client
+            .commit_reading(&f.oracles.get(i).unwrap(), project_id, &nonce, &commitment);
+    }
+
+    // Advance past the commit phase (default 300 s / 60 ledgers).
+    let mut info = f._e.ledger().get();
+    info.timestamp += 301;
+    info.sequence_number += 61;
+    f._e.ledger().set(info);
+    f.oracle_client.begin_reveal_phase(project_id);
+
+    for i in 0..3u32 {
+        f.oracle_client
+            .reveal_reading(&f.oracles.get(i).unwrap(), project_id, &reveal_params);
     }
 }
 
@@ -128,8 +158,8 @@ fn test_different_baselines_produce_different_credits() {
     // Project B: high baselines (urban stormwater, naturally low load).
     let proj_b = configure_project(&f, 3, 1, 300);
 
-    submit_three(&f, &proj_a);
-    submit_three(&f, &proj_b);
+    finalize_three(&f, &proj_a);
+    finalize_three(&f, &proj_b);
 
     let res_a = f.oracle_client.get_last_result(&proj_a).unwrap();
     let res_b = f.oracle_client.get_last_result(&proj_b).unwrap();
@@ -162,7 +192,7 @@ fn test_unset_baseline_falls_back_to_default() {
 
     // Call set_project_config with zero baselines → must behave like defaults.
     let proj = configure_project(&f, 0, 0, 0);
-    submit_three(&f, &proj);
+    finalize_three(&f, &proj);
 
     let res = f.oracle_client.get_last_result(&proj).unwrap();
     // med_n=8 < default 10 → n_removed=(10-8)=2; med_p=1 < default 2 → p_removed=(2-1)=1.
@@ -182,8 +212,8 @@ fn test_per_project_temp_baseline_drives_penalty() {
     let proj_a = configure_project(&f, 10, 2, 300);
     let proj_b = configure_project(&f, 10, 2, 200);
 
-    submit_three(&f, &proj_a);
-    submit_three(&f, &proj_b);
+    finalize_three(&f, &proj_a);
+    finalize_three(&f, &proj_b);
 
     let res_a = f.oracle_client.get_last_result(&proj_a).unwrap();
     let res_b = f.oracle_client.get_last_result(&proj_b).unwrap();
@@ -208,7 +238,7 @@ fn test_high_baseline_no_overflow() {
     // baseline_n = 1000 mg/L, med_n = 8 → diff = 992, flow = 500
     // n_removed = 992 * 500 * 3600 / 1_000_000 = 1785 (well within i128)
     let proj = configure_project(&f, 1000, 100, 300);
-    submit_three(&f, &proj);
+    finalize_three(&f, &proj);
 
     let res = f.oracle_client.get_last_result(&proj).unwrap();
     assert_eq!(
@@ -228,21 +258,7 @@ fn test_reading_equals_baseline_zero_removal() {
     // Use a custom reading where n=10, p=2.
     let proj = configure_project(&f, 10, 2, 300);
 
-    let (ph, turb, do_, flow, temp, _, _) = READING;
-    for i in 0..3u32 {
-        f.oracle_client.submit_reading(
-            &f.oracles.get(i).unwrap(),
-            &proj,
-            &1,
-            &ph,
-            &turb,
-            &do_,
-            &flow,
-            &temp,
-            &10, // n = baseline_n exactly
-            &2,  // p = baseline_p exactly
-        );
-    }
+    finalize_three_with_reading(&f, &proj, 10, 2);
 
     let res = f.oracle_client.get_last_result(&proj).unwrap();
     assert_eq!(
@@ -264,21 +280,7 @@ fn test_reading_above_baseline_zero_removal() {
     // baseline_p = 1, but med_p = 1 == 1 → p_removed = 0
     let proj = configure_project(&f, 5, 1, 300);
 
-    let (ph, turb, do_, flow, temp, _, _) = READING;
-    for i in 0..3u32 {
-        f.oracle_client.submit_reading(
-            &f.oracles.get(i).unwrap(),
-            &proj,
-            &1,
-            &ph,
-            &turb,
-            &do_,
-            &flow,
-            &temp,
-            &8, // n > baseline_n
-            &1, // p == baseline_p
-        );
-    }
+    finalize_three_with_reading(&f, &proj, 8, 1);
 
     let res = f.oracle_client.get_last_result(&proj).unwrap();
     assert_eq!(res.n_removal_kg, 0);

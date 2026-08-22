@@ -600,8 +600,7 @@ pub struct FinalizationResult {
     pub total: i128,
 }
 
-/// Shared finalization arithmetic used by both `submit_reading_impl` and
-/// `finalize_reveals`. Every multiplication uses `checked_mul` so that
+/// Shared finalization arithmetic used by `finalize_reveals`. Every multiplication uses `checked_mul` so that
 /// near-`i64::MAX` intermediate values (e.g. `flow_rate` at the top of its
 /// valid range) panic and revert the transaction instead of silently
 /// wrapping in `i128`. `total` is floored at 0 so a maximal quality penalty
@@ -900,272 +899,32 @@ impl VerificationOracle {
             .unwrap_or_else(|| Vec::new(&e))
     }
 
-    /// Submit a sensor reading for a project. Uses nonce-based replay protection.
-    /// When min_oracles submissions are collected, computes median values, calculates
-    /// nutrient removal, quality penalty, and volumetric credits. If a ProjectConfig
-    /// is set, automatically mints credits to the configured beneficiary.
+    /// `submit_reading` has been removed (Issue #155).
+    ///
+    /// The plaintext single-call submission path bypassed the commit-reveal
+    /// scheme, allowing MEV/frontrunning of oracle readings and contradicting
+    /// the SPEC guarantee that "there is no plaintext single-call entry point".
+    ///
+    /// Use the commit-reveal path instead:
+    ///   1. `open_window(admin, project_id)`
+    ///   2. `commit_reading(oracle, project_id, nonce, sha256(reading || nonce || salt))`
+    ///   3. `begin_reveal_phase(project_id)` — after `commit_phase_secs` have elapsed
+    ///   4. `reveal_reading(oracle, project_id, RevealParams { nonce, reading fields, salt })`
+    #[allow(unused_variables)]
     pub fn submit_reading(
-        e: Env,
-        oracle: Address,
-        project_id: BytesN<32>,
-        nonce: u64,
-        ph: i64,
-        turbidity: i64,
-        dissolved_oxygen: i64,
-        flow_rate: i64,
-        temperature: i64,
-        total_nitrogen: i64,
-        total_phosphorus: i64,
+        _e: Env,
+        _oracle: Address,
+        _project_id: BytesN<32>,
+        _nonce: u64,
+        _ph: i64,
+        _turbidity: i64,
+        _dissolved_oxygen: i64,
+        _flow_rate: i64,
+        _temperature: i64,
+        _total_nitrogen: i64,
+        _total_phosphorus: i64,
     ) -> Option<VerificationResult> {
-        Self::submit_reading_impl(
-            e,
-            oracle,
-            project_id,
-            nonce,
-            ph,
-            turbidity,
-            dissolved_oxygen,
-            flow_rate,
-            temperature,
-            total_nitrogen,
-            total_phosphorus,
-        )
-    }
-
-    fn submit_reading_impl(
-        e: Env,
-        oracle: Address,
-        project_id: BytesN<32>,
-        nonce: u64,
-        ph: i64,
-        turbidity: i64,
-        dissolved_oxygen: i64,
-        flow_rate: i64,
-        temperature: i64,
-        total_nitrogen: i64,
-        total_phosphorus: i64,
-    ) -> Option<VerificationResult> {
-        oracle.require_auth();
-
-        if !e
-            .storage()
-            .persistent()
-            .get(&DataKey::OracleActive(oracle.clone()))
-            .unwrap_or(false)
-        {
-            panic!("oracle not active");
-        }
-
-        let config: OracleConfig = read_config(&e);
-        if config.min_stake > 0 {
-            let stake_info: StakeInfo = e
-                .storage()
-                .persistent()
-                .get(&DataKey::OracleStake(oracle.clone()))
-                .unwrap_or(StakeInfo {
-                    amount: 0,
-                    unstake_request: None,
-                });
-            if stake_info.amount < config.min_stake {
-                panic!("insufficient stake");
-            }
-        }
-
-        validate_sensor_reading(
-            ph,
-            flow_rate,
-            total_nitrogen,
-            total_phosphorus,
-            dissolved_oxygen,
-            turbidity,
-            temperature,
-        );
-
-        let nonce_key = DataKey::OracleNonce((project_id.clone(), oracle.clone()));
-        let expected_nonce: u64 = e.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
-        if nonce != expected_nonce {
-            panic!("invalid nonce");
-        }
-        e.storage().persistent().set(&nonce_key, &nonce);
-        e.storage()
-            .persistent()
-            .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
-
-        // Track raw accepted submissions globally. Per-oracle contribution
-        // counters advance only if this window successfully finalizes.
-        let total: u64 = e
-            .storage()
-            .instance()
-            .get(&DataKey::TotalSubmissions)
-            .unwrap_or(0);
-        e.storage()
-            .instance()
-            .set(&DataKey::TotalSubmissions, &(total + 1));
-
-        // Prevent duplicate oracle per window (temporary storage)
-        let submitted_key = DataKey::OracleSubmitted(project_id.clone(), oracle.clone());
-        if e.storage().temporary().has(&submitted_key) {
-            panic!("oracle already submitted for this window");
-        }
-
-        let window_key = DataKey::WindowState(project_id.clone());
-        let mut window: WindowState =
-            e.storage()
-                .temporary()
-                .get(&window_key)
-                .unwrap_or(WindowState {
-                    phase: WindowPhase::Reveal,
-                    opened_at: e.ledger().timestamp(),
-                    reveal_opened_ledger: 0,
-                    submissions: Vec::new(&e),
-                    finalized: false,
-                });
-
-        if window.finalized {
-            panic!("window already finalized");
-        }
-
-        add_open_project(&e, &project_id, config.max_open_windows);
-
-        let timestamp = e.ledger().timestamp();
-
-        let submission = ReadingSubmission {
-            oracle: oracle.clone(),
-            nonce,
-            timestamp,
-            ph,
-            turbidity,
-            dissolved_oxygen,
-            flow_rate,
-            temperature,
-            total_nitrogen,
-            total_phosphorus,
-        };
-
-        window.submissions.push_back(submission);
-        e.storage().temporary().set(&window_key, &window);
-        e.storage()
-            .temporary()
-            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
-
-        e.storage().temporary().set(&submitted_key, &true);
-        e.storage()
-            .temporary()
-            .extend_ttl(&submitted_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
-
-        if window.submissions.len() >= config.min_oracles {
-            let subs = &window.submissions;
-            let n_subs = subs.len();
-
-            let mut ph_vals: Vec<i64> = Vec::new(&e);
-            let mut turb_vals: Vec<i64> = Vec::new(&e);
-            let mut do_vals: Vec<i64> = Vec::new(&e);
-            let mut temp_vals: Vec<i64> = Vec::new(&e);
-            let mut flow_vals: Vec<i64> = Vec::new(&e);
-            let mut n_vals: Vec<i64> = Vec::new(&e);
-            let mut p_vals: Vec<i64> = Vec::new(&e);
-            for k in 0..n_subs {
-                let s = subs.get(k).unwrap();
-                ph_vals.push_back(s.ph);
-                turb_vals.push_back(s.turbidity);
-                do_vals.push_back(s.dissolved_oxygen);
-                temp_vals.push_back(s.temperature);
-                flow_vals.push_back(s.flow_rate);
-                n_vals.push_back(s.total_nitrogen);
-                p_vals.push_back(s.total_phosphorus);
-            }
-
-            let med_ph = median_i64(&ph_vals);
-            let med_turb = median_i64(&turb_vals);
-            let med_do = median_i64(&do_vals);
-            let med_temp = median_i64(&temp_vals);
-            let med_flow = median_i64(&flow_vals);
-            let med_n = median_i64(&n_vals);
-            let med_p = median_i64(&p_vals);
-
-            // Per-project baselines via shared helper (doc/MATH.md §1).
-            let (baseline_n, baseline_p, baseline_temp) = resolve_baselines(&e, &project_id);
-
-            let fin = compute_finalization(
-                &config,
-                med_ph,
-                med_turb,
-                med_do,
-                med_temp,
-                med_flow,
-                med_n,
-                med_p,
-                baseline_n,
-                baseline_p,
-                baseline_temp,
-                config.window_secs,
-            );
-
-            let mut result = VerificationResult {
-                project_id: project_id.clone(),
-                n_removal_kg: fin.n_removed,
-                p_removal_kg: fin.p_removed,
-                quality_penalty: fin.penalty,
-                volumetric_credit: fin.volumetric_credit,
-                total_credits: fin.total,
-                credits_minted: 0,
-                oracle_count: window.submissions.len(),
-                finalized_at: e.ledger().timestamp(),
-            };
-
-            // Mint credits to the beneficiary, clamped to the token's
-            // max_supply cap. This runs BEFORE the result is persisted so that
-            // `credits_minted` is recorded accurately and so a cap breach can
-            // never roll back finalization (Issue #36). If no project token is
-            // configured, or the cap is already exhausted, no mint occurs and
-            // the window still finalizes cleanly.
-            let cfg_key = DataKey::ProjectConfig(project_id.clone());
-            if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
-                result.credits_minted = mint_credits_respecting_cap(
-                    &e,
-                    &config.token_contract,
-                    &config.beneficiary,
-                    result.total_credits,
-                );
-            }
-
-            // Persist last result
-            let last_key = DataKey::LastResult(project_id.clone());
-            e.storage().persistent().set(&last_key, &result);
-            e.storage()
-                .persistent()
-                .extend_ttl(&last_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
-
-            // Append to paginated history
-            let count_key = DataKey::ResultCount(project_id.clone());
-            let hist_pos: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
-            let hist_key = DataKey::ResultAt(project_id.clone(), hist_pos);
-            e.storage().persistent().set(&hist_key, &result);
-            e.storage()
-                .persistent()
-                .extend_ttl(&hist_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
-            e.storage().persistent().set(&count_key, &(hist_pos + 1));
-            e.storage()
-                .persistent()
-                .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
-
-            record_finalized_contributions(&e, &window.submissions);
-
-            window.finalized = true;
-            e.storage().temporary().set(&window_key, &window);
-            // no extend needed — finalized windows can expire
-
-            remove_open_project(&e, &project_id);
-
-            e.events().publish(
-                (Symbol::new(&e, "rdng_vrfy_ds"),),
-                (project_id, result.clone()),
-            );
-
-            Some(result)
-        } else {
-            None
-        }
+        panic!("submit_reading has been removed (Issue #155): use commit_reading + reveal_reading");
     }
 
     /// Configure the credit token contract and beneficiary for a project.
@@ -5140,6 +4899,11 @@ mod tests {
 
     #[test]
     fn test_window_finalizes_with_min_oracles_after_one_removed() {
+        // Verifies that after o4 is removed (it never participated in any window),
+        // the remaining three oracles can still finalize a new window — and that
+        // removal itself is allowed because o4 has no open submissions.
+        // Previously used the removed `submit_reading` path (Issue #155);
+        // rewritten to use the commit-reveal helpers.
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
@@ -5153,25 +4917,43 @@ mod tests {
         client.add_oracle(&admin, &o4);
 
         let project_id = BytesN::from_array(&e, &[216u8; 32]);
+        let salt = BytesN::from_array(&e, &[0xE0u8; 32]);
 
-        // First window: 3 oracles submit, finalize
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        let result =
-            client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        // Build a Vec of o1, o2, o3 (o4 never participates).
+        let mut three_oracles: Vec<Address> = Vec::new(&e);
+        three_oracles.push_back(o1.clone());
+        three_oracles.push_back(o2.clone());
+        three_oracles.push_back(o3.clone());
+
+        // Window 1: o1, o2, o3 commit-reveal → auto-finalizes on the 3rd reveal.
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &three_oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
 
-        // Remove o4 (never submitted to this window)
+        // o4 never committed/revealed, so remove_oracle must succeed.
         client.remove_oracle(&admin, &o4);
         assert!(!client.is_oracle_active(&o4));
 
-        // Reset and resubmit — 3 remaining oracles finalize the window
+        // Window 2: reset, then o1, o2, o3 run a second commit-reveal round.
         client.reset_window(&admin, &project_id);
-        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        let result =
-            client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        let result = commit_reveal_round_same_no_open(
+            &e,
+            &client,
+            &project_id,
+            &three_oracles,
+            2,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
     }

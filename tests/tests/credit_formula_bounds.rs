@@ -17,7 +17,7 @@
 //! See doc/MATH.md for the formula this suite exercises.
 //!
 //! ## Why the panic-path tests call `validate_sensor_reading` / `compute_finalization`
-//! directly instead of going through `submit_reading`
+//! directly instead of going through the contract entry points
 //!
 //! Soroban's native test-contract dispatch (`Env::register_contract(None, T)` +
 //! client calls, used by every test in this workspace) cannot catch a contract
@@ -38,6 +38,10 @@
 //! required by this issue's acceptance criteria can be unit-tested as ordinary
 //! Rust function calls, with no contract dispatch involved and normal
 //! `#[should_panic]` semantics.
+//!
+//! The contract-level integration tests at the bottom of this file use the
+//! commit-reveal path (Issue #155: `submit_reading` was removed as a plaintext
+//! bypass of the anti-frontrunning scheme).
 
 use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
 use verification_oracle::{
@@ -313,9 +317,20 @@ fn test_configurable_ph_upper_bound() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Contract-level integration tests (through submit_reading), no-panic paths
-// only — see module doc comment above for why panic paths aren't tested here.
+// Contract-level integration tests (through the commit-reveal path).
+//
+// `submit_reading` was removed in Issue #155 to close the plaintext bypass
+// of the commit-reveal anti-frontrunning scheme. All contract-level
+// integration tests now go through:
+//   open_window → commit_reading × N → (advance ledger) → begin_reveal_phase
+//   → reveal_reading × N
+//
+// The no-panic acceptance criteria verified by these tests are unchanged;
+// only the submission path has changed.
 // ══════════════════════════════════════════════════════════════════════════
+
+use soroban_sdk::testutils::Ledger;
+use verification_oracle::{sha256_commitment, RevealParams};
 
 struct Fixture {
     e: Env,
@@ -352,8 +367,10 @@ fn setup() -> Fixture {
     }
 }
 
+/// Run a full commit-reveal round for 3 oracles, all submitting the same reading.
+/// Returns the finalized `VerificationResult`.
 #[allow(clippy::too_many_arguments)]
-fn submit_three(
+fn finalize_three(
     f: &Fixture,
     project_id: &BytesN<32>,
     ph: i64,
@@ -364,65 +381,82 @@ fn submit_three(
     n: i64,
     p: i64,
 ) {
+    let nonce = 1u64;
+    let salt = BytesN::from_array(&f.e, &[0xABu8; 32]);
+    let commitment = sha256_commitment(&f.e, nonce, ph, turb, do_, flow, temp, n, p, &salt);
+    let reveal_params = RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt,
+    };
+
+    f.client.open_window(&f.admin, project_id);
     for i in 0..3u32 {
-        f.client.submit_reading(
-            &f.oracles.get(i).unwrap(),
-            project_id,
-            &1,
-            &ph,
-            &turb,
-            &do_,
-            &flow,
-            &temp,
-            &n,
-            &p,
-        );
+        f.client
+            .commit_reading(&f.oracles.get(i).unwrap(), project_id, &nonce, &commitment);
+    }
+
+    // Advance past the commit phase (default 300 s / 60 ledgers).
+    f.e.ledger().with_mut(|l| {
+        l.timestamp += 301;
+        l.sequence_number += 61;
+    });
+    f.client.begin_reveal_phase(project_id);
+
+    for i in 0..3u32 {
+        f.client
+            .reveal_reading(&f.oracles.get(i).unwrap(), project_id, &reveal_params);
     }
 }
 
 /// End-to-end (through the real contract, not the direct formula call): pH 0
 /// and 1400 are accepted and finalize normally.
 #[test]
-fn test_submit_reading_accepts_ph_boundary_values() {
+fn test_commit_reveal_accepts_ph_boundary_values() {
     let f = setup();
 
     let proj_low = BytesN::from_array(&f.e, &[7u8; 32]);
-    submit_three(&f, &proj_low, 0, 10, 80, 500, 250, 8, 1);
+    finalize_three(&f, &proj_low, 0, 10, 80, 500, 250, 8, 1);
     assert!(f.client.get_last_result(&proj_low).is_some());
 
     let proj_high = BytesN::from_array(&f.e, &[8u8; 32]);
-    submit_three(&f, &proj_high, 1400, 10, 80, 500, 250, 8, 1);
+    finalize_three(&f, &proj_high, 1400, 10, 80, 500, 250, 8, 1);
     assert!(f.client.get_last_result(&proj_high).is_some());
 }
 
 /// End-to-end: all sensor fields at 0 finalize with zero credits, no panic.
 #[test]
-fn test_submit_reading_all_zero_sensor_values_no_panic() {
+fn test_commit_reveal_all_zero_sensor_values_no_panic() {
     let f = setup();
     let project_id = BytesN::from_array(&f.e, &[13u8; 32]);
-    submit_three(&f, &project_id, 0, 0, 0, 0, 0, 0, 0);
+    finalize_three(&f, &project_id, 0, 0, 0, 0, 0, 0, 0);
 
     let res = f.client.get_last_result(&project_id).unwrap();
     assert_eq!(res.total_credits, 0);
 }
 
-// A contract-level (submit_reading) equivalent of
-// test_high_baseline_with_max_flow_does_not_overflow above was intentionally
-// omitted: exercising it requires set_project_config, which also configures a
-// token contract for auto-minting — and finalizing with i64::MAX flow_rate
-// yields a nonzero total_credits, so the mint step would invoke_contract
-// against a fake `Address::generate` with no deployed contract, panicking for
-// an unrelated reason (not the formula). The direct-unit-test version above
-// already fully covers this scenario without that setup mismatch.
+// A contract-level equivalent of test_high_baseline_with_max_flow_does_not_overflow
+// above was intentionally omitted: exercising it requires set_project_config,
+// which also configures a token contract for auto-minting — and finalizing with
+// i64::MAX flow_rate yields a nonzero total_credits, so the mint step would
+// invoke_contract against a fake `Address::generate` with no deployed contract,
+// panicking for an unrelated reason (not the formula). The direct-unit-test
+// version above already fully covers this scenario without that setup mismatch.
 
 /// End-to-end: the configurable pH band, exercised through the real contract
-/// update_config -> submit_reading path.
+/// update_config → commit-reveal path.
 #[test]
-fn test_submit_reading_configurable_ph_upper_bound() {
+fn test_commit_reveal_configurable_ph_upper_bound() {
     let f = setup();
 
     let proj_default = BytesN::from_array(&f.e, &[17u8; 32]);
-    submit_three(&f, &proj_default, 750, 10, 80, 500, 250, 8, 1);
+    finalize_three(&f, &proj_default, 750, 10, 80, 500, 250, 8, 1);
     let res_default = f.client.get_last_result(&proj_default).unwrap();
     assert_eq!(res_default.quality_penalty, 2000);
 
@@ -431,7 +465,7 @@ fn test_submit_reading_configurable_ph_upper_bound() {
     f.client.update_config(&f.admin, &config);
 
     let proj_widened = BytesN::from_array(&f.e, &[18u8; 32]);
-    submit_three(&f, &proj_widened, 750, 10, 80, 500, 250, 8, 1);
+    finalize_three(&f, &proj_widened, 750, 10, 80, 500, 250, 8, 1);
     let res_widened = f.client.get_last_result(&proj_widened).unwrap();
     assert_eq!(res_widened.quality_penalty, 0);
 }
@@ -439,10 +473,10 @@ fn test_submit_reading_configurable_ph_upper_bound() {
 /// End-to-end: max achievable penalty (7000 bps) applied to a nonzero gross
 /// credit through the real contract path.
 #[test]
-fn test_submit_reading_all_penalty_conditions_simultaneously() {
+fn test_commit_reveal_all_penalty_conditions_simultaneously() {
     let f = setup();
     let project_id = BytesN::from_array(&f.e, &[14u8; 32]);
-    submit_three(&f, &project_id, 300, 200, 10, 500, 350, 8, 1);
+    finalize_three(&f, &project_id, 300, 200, 10, 500, 350, 8, 1);
 
     let res = f.client.get_last_result(&project_id).unwrap();
     assert_eq!(res.quality_penalty, 7000);
@@ -452,7 +486,7 @@ fn test_submit_reading_all_penalty_conditions_simultaneously() {
 /// End-to-end: a misconfigured negative `credit_per_kg_n` floors total_credits
 /// at 0 through the real contract path.
 #[test]
-fn test_submit_reading_negative_gross_floors_at_zero() {
+fn test_commit_reveal_negative_gross_floors_at_zero() {
     let f = setup();
     let project_id = BytesN::from_array(&f.e, &[15u8; 32]);
 
@@ -460,7 +494,7 @@ fn test_submit_reading_negative_gross_floors_at_zero() {
     config.credit_per_kg_n = -1000;
     f.client.update_config(&f.admin, &config);
 
-    submit_three(&f, &project_id, 700, 10, 80, 500, 250, 8, 1);
+    finalize_three(&f, &project_id, 700, 10, 80, 500, 250, 8, 1);
 
     let res = f.client.get_last_result(&project_id).unwrap();
     assert_eq!(res.total_credits, 0);
