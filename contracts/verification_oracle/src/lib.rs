@@ -104,9 +104,36 @@ pub struct OracleConfig {
     /// `begin_reveal_phase` to transition Commit → Reveal.
     pub commit_phase_secs: u64,
     /// Minimum number of ledgers that must elapse after the reveal phase opens
-    /// before a reveal is accepted. Guards against a reveal landing in the same
-    /// ledger the phase transitioned, which would otherwise let a still-open
-    /// mempool observer react within the same block.
+    /// before a reveal is accepted. This is the primary MEV protection mechanism:
+    /// it enforces a mandatory gap between commit and reveal phases, preventing
+    /// attackers from observing a reveal phase opening and reacting within the
+    /// same ledger.
+    ///
+    /// # MEV Protection
+    /// A value of 0 allows same-ledger reveals — an attacker who observes the
+    /// reveal phase opening can submit a competing reveal in the same ledger,
+    /// undermining the commit-reveal scheme entirely. This contract rejects 0
+    /// as an invalid configuration.
+    ///
+    /// # Time-vs-Ledger Hybrid Model
+    /// This contract mixes time-based and ledger-based bounds:
+    /// - `commit_phase_secs`: time-based (wall clock), operator-readable
+    /// - `min_reveal_ledgers`: ledger-based (block count)
+    /// - `max_reveal_ledgers`: ledger-based (block count)
+    ///
+    /// At ~5 seconds per ledger on Stellar mainnet:
+    /// - min_reveal_ledgers = 5  → ~25 second minimum reveal delay
+    /// - min_reveal_ledgers = 12 → ~60 second minimum reveal delay
+    /// - max_reveal_ledgers = 60 → ~5 minute reveal window
+    ///
+    /// # Recommended Values
+    /// | Security Level | min_reveal_ledgers | Approximate Delay |
+    /// |---|---|---|
+    /// | Minimum (default) | 5 | ~25 seconds |
+    /// | Standard | 12 | ~60 seconds |
+    /// | High | 24 | ~2 minutes |
+    ///
+    /// Operators may increase for higher security; decrease only with justification.
     pub min_reveal_ledgers: u32,
     /// Maximum number of ledgers after the reveal phase opens during which a
     /// reveal is still accepted. A commitment not revealed within this window
@@ -802,7 +829,7 @@ impl VerificationOracle {
             min_stake: 0,
             unstake_cooldown_secs: 86400,
             commit_phase_secs: 300,
-            min_reveal_ledgers: 0,
+            min_reveal_ledgers: 5,
             max_reveal_ledgers: 60,
             slash_pct_bps: 1000,
             min_slash_amount: 0,
@@ -813,6 +840,12 @@ impl VerificationOracle {
             max_open_windows: DEFAULT_MAX_OPEN_WINDOWS,
             fee_bps: 0,
         };
+        
+        // Validate min_reveal_ledgers: must be >= 1 for MEV protection
+        if config.min_reveal_ledgers == 0 {
+            panic!("min_reveal_ledgers must be >= 1 for MEV protection");
+        }
+        
         e.storage().instance().set(&DataKey::Config, &config);
 
         e.events().publish((EVENT_INITIALIZED,), (admin,));
@@ -1414,6 +1447,14 @@ impl VerificationOracle {
         }
         if config.fee_bps > 10_000 {
             panic!("fee_bps exceeds max (10000 = 100%)");
+        }
+        // Validate min_reveal_ledgers: must be >= 1 for MEV protection
+        if config.min_reveal_ledgers == 0 {
+            panic!("min_reveal_ledgers must be >= 1 for MEV protection");
+        }
+        // Ensure min_reveal_ledgers does not exceed max_reveal_ledgers
+        if config.min_reveal_ledgers > config.max_reveal_ledgers {
+            panic!("min_reveal_ledgers exceeds max_reveal_ledgers");
         }
         e.storage().instance().set(&DataKey::Config, &config);
     }
@@ -2560,10 +2601,35 @@ mod tests {
         assert_eq!(config.min_stake, 0);
         assert_eq!(config.unstake_cooldown_secs, 86400);
         assert_eq!(config.commit_phase_secs, 300);
-        assert_eq!(config.min_reveal_ledgers, 0);
+        assert_eq!(config.min_reveal_ledgers, 5);
         assert_eq!(config.max_reveal_ledgers, 60);
         // Backward compatible: the interval the formula used to hardcode.
         assert_eq!(config.window_secs, 3600);
+    }
+
+    #[test]
+    #[should_panic(expected = "min_reveal_ledgers must be >= 1 for MEV protection")]
+    fn test_initialize_rejects_min_reveal_ledgers_zero() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let admin = Address::generate(&e);
+        let staking_token = Address::generate(&e);
+        let treasury = Address::generate(&e);
+
+        // Manually invoke initialize and then create a config with min_reveal_ledgers = 0
+        // to test that the validation rejects it.
+        let oracle_client = VerificationOracleClient::new(&e, &Address::generate(&e));
+
+        // Call initialize to set up the contract
+        oracle_client.initialize(&admin, &staking_token, &treasury);
+
+        // Now try to update config with min_reveal_ledgers = 0
+        let mut config = oracle_client.get_config();
+        config.min_reveal_ledgers = 0;
+
+        // This should panic with the validation error
+        oracle_client.update_config(&admin, &config);
     }
 
     #[test]
@@ -2833,7 +2899,7 @@ mod tests {
             min_stake: 2000,
             unstake_cooldown_secs: 172800,
             commit_phase_secs: 600,
-            min_reveal_ledgers: 0,
+            min_reveal_ledgers: 5,
             max_reveal_ledgers: 120,
             slash_pct_bps: 1000,
             min_slash_amount: 0,

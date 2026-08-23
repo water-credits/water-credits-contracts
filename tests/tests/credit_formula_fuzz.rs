@@ -89,7 +89,7 @@ fn default_config(e: &Env) -> OracleConfig {
         min_stake: 0,
         unstake_cooldown_secs: 86400,
         commit_phase_secs: 300,
-        min_reveal_ledgers: 0,
+        min_reveal_ledgers: 5,
         max_reveal_ledgers: 60,
         slash_pct_bps: 1000,
         min_slash_amount: 0,
