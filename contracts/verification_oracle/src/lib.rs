@@ -495,7 +495,7 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
 /// and `fee_minted == 0`. The fee is computed as
 /// `total_credits * fee_bps / 10_000` and minted separately to the
 /// treasury, so the supply invariant
-/// `total_supply + total_retired + total_burned == ever_minted` holds.
+/// `total_supply + total_retired + total_burned == ever_minted()` holds.
 fn mint_credits_respecting_cap(
     e: &Env,
     token: &Address,
