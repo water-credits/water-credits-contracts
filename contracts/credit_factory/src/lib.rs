@@ -43,6 +43,8 @@ pub enum DataKey {
     Admin,
     ProjectCount,
     ProjectRegistry,
+    RetirementRegistry,
+    PauseGuardian,
     // ── Persistent ──
     Project(BytesN<32>),
 }
@@ -99,11 +101,48 @@ impl CreditFactory {
         match registry {
             Some(addr) => {
                 e.storage().instance().set(&DataKey::ProjectRegistry, &addr);
+                let auth_args: Vec<Val> = vec![
+                    &e,
+                    admin.clone().to_val(),
+                    e.current_contract_address().to_val(),
+                    true.into_val(&e),
+                ];
+                e.invoke_contract::<()>(
+                    &addr,
+                    &Symbol::new(&e, "set_authorized_caller"),
+                    auth_args,
+                );
                 e.events().publish((EVENT_REGISTRY_SET,), (addr,));
             }
             None => {
                 e.storage().instance().remove(&DataKey::ProjectRegistry);
             }
+        }
+    }
+
+    /// Set the retirement registry contract address. Admin only.
+    pub fn set_retirement_registry(e: Env, admin: Address, registry: Option<Address>) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        match registry {
+            Some(addr) => e.storage().instance().set(&DataKey::RetirementRegistry, &addr),
+            None => e.storage().instance().remove(&DataKey::RetirementRegistry),
+        }
+    }
+
+    /// Set the pause guardian contract address. Admin only.
+    pub fn set_pause_guardian(e: Env, admin: Address, guardian: Option<Address>) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        match guardian {
+            Some(addr) => e.storage().instance().set(&DataKey::PauseGuardian, &addr),
+            None => e.storage().instance().remove(&DataKey::PauseGuardian),
         }
     }
 
@@ -198,6 +237,41 @@ impl CreditFactory {
                 &token_address,
                 &Symbol::new(&e, "set_minter"),
                 set_minter_args,
+            );
+        }
+
+        if let Some(registry_addr) = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::RetirementRegistry)
+        {
+            let set_registry_args: Vec<Val> =
+                vec![&e, admin.clone().to_val(), registry_addr.to_val()];
+            e.invoke_contract::<()>(
+                &token_address,
+                &Symbol::new(&e, "set_retirement_registry"),
+                set_registry_args,
+            );
+        }
+
+        if let Some(guardian_addr) = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::PauseGuardian)
+        {
+            let set_guardian_args: Vec<Val> =
+                vec![&e, admin.clone().to_val(), guardian_addr.to_val()];
+            e.invoke_contract::<()>(
+                &token_address,
+                &Symbol::new(&e, "set_pause_guardian"),
+                set_guardian_args,
+            );
+            let register_token_args: Vec<Val> =
+                vec![&e, admin.clone().to_val(), token_address.to_val()];
+            e.invoke_contract::<()>(
+                &guardian_addr,
+                &Symbol::new(&e, "register_token"),
+                register_token_args,
             );
         }
 
