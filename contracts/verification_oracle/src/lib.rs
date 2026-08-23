@@ -240,7 +240,7 @@ pub enum DataKey {
     /// Moved to persistent storage (Issue #132) — loaded on demand rather
     /// than on every invocation as instance storage was.
     OpenProjects,
-    // ── Temporary (window-scoped, can expire after finalization) ──
+    // ── Persistent (window-scoped; markers are cleaned up after finalization) ──
     WindowState(BytesN<32>),
     /// SHA-256 commitment for an oracle's pending reading in the current window.
     Commitment((BytesN<32>, Address)),
@@ -258,10 +258,10 @@ const RESULT_TTL_BUMP: u32 = 63_072_000;
 /// Project config: 1 year.
 const PROJ_CFG_TTL_THRESHOLD: u32 = 6_307_200;
 const PROJ_CFG_TTL_BUMP: u32 = 6_307_200;
-/// Temporary window entries: 7 days (2 × commit + reveal phases, with buffer).
-/// 7 days ≈ 120_960 ledgers at 5 s/ledger.
-const WINDOW_TTL_THRESHOLD: u32 = 120_960;
-const WINDOW_TTL_BUMP: u32 = 120_960;
+/// In-flight window state: 1 year. Persistent storage prevents long commit phases
+/// from expiring before they can transition to Reveal; phase writes refresh this TTL.
+const WINDOW_TTL_THRESHOLD: u32 = 6_307_200;
+const WINDOW_TTL_BUMP: u32 = 6_307_200;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -455,10 +455,10 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
     for i in 0..open.len() {
         let pid = open.get(i).unwrap();
         if e.storage()
-            .temporary()
+            .persistent()
             .has(&DataKey::Commitment((pid.clone(), oracle.clone())))
             || e.storage()
-                .temporary()
+                .persistent()
                 .has(&DataKey::OracleRevealed((pid.clone(), oracle.clone())))
         {
             return true;
@@ -1057,16 +1057,16 @@ impl VerificationOracle {
             .instance()
             .set(&DataKey::TotalSubmissions, &(total + 1));
 
-        // Prevent duplicate oracle per window (temporary storage)
+        // Prevent duplicate oracle per window (persistent window-scoped storage)
         let submitted_key = DataKey::OracleSubmitted(project_id.clone(), oracle.clone());
-        if e.storage().temporary().has(&submitted_key) {
+        if e.storage().persistent().has(&submitted_key) {
             panic!("oracle already submitted for this window");
         }
 
         let window_key = DataKey::WindowState(project_id.clone());
         let mut window: WindowState =
             e.storage()
-                .temporary()
+                .persistent()
                 .get(&window_key)
                 .unwrap_or(WindowState {
                     phase: WindowPhase::Reveal,
@@ -1098,14 +1098,14 @@ impl VerificationOracle {
         };
 
         window.submissions.push_back(submission);
-        e.storage().temporary().set(&window_key, &window);
+        e.storage().persistent().set(&window_key, &window);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
-        e.storage().temporary().set(&submitted_key, &true);
+        e.storage().persistent().set(&submitted_key, &true);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&submitted_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         if window.submissions.len() >= config.min_oracles {
@@ -1210,8 +1210,10 @@ impl VerificationOracle {
             record_finalized_contributions(&e, &window.submissions);
 
             window.finalized = true;
-            e.storage().temporary().set(&window_key, &window);
-            // no extend needed — finalized windows can expire
+            e.storage().persistent().set(&window_key, &window);
+            e.storage()
+                .persistent()
+                .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
             remove_open_project(&e, &project_id);
 
@@ -1430,7 +1432,7 @@ impl VerificationOracle {
         }
 
         let window_key = DataKey::WindowState(project_id.clone());
-        let window: Option<WindowState> = e.storage().temporary().get(&window_key);
+        let window: Option<WindowState> = e.storage().persistent().get(&window_key);
 
         if window.is_none() {
             panic!("no window found for project");
@@ -1441,15 +1443,15 @@ impl VerificationOracle {
         // Remove OracleSubmitted markers for all submissions in this window
         for i in 0..window.submissions.len() {
             let sub = window.submissions.get(i).unwrap();
-            e.storage().temporary().remove(&DataKey::Commitment((
+            e.storage().persistent().remove(&DataKey::Commitment((
                 project_id.clone(),
                 sub.oracle.clone(),
             )));
-            e.storage().temporary().remove(&DataKey::OracleRevealed((
+            e.storage().persistent().remove(&DataKey::OracleRevealed((
                 project_id.clone(),
                 sub.oracle.clone(),
             )));
-            e.storage().temporary().remove(&DataKey::OracleSubmitted(
+            e.storage().persistent().remove(&DataKey::OracleSubmitted(
                 project_id.clone(),
                 sub.oracle.clone(),
             ));
@@ -1467,13 +1469,13 @@ impl VerificationOracle {
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
             e.storage()
-                .temporary()
+                .persistent()
                 .remove(&DataKey::Commitment((project_id.clone(), oracle.clone())));
-            e.storage().temporary().remove(&DataKey::OracleRevealed((
+            e.storage().persistent().remove(&DataKey::OracleRevealed((
                 project_id.clone(),
                 oracle.clone(),
             )));
-            e.storage().temporary().remove(&DataKey::OracleSubmitted(
+            e.storage().persistent().remove(&DataKey::OracleSubmitted(
                 project_id.clone(),
                 oracle.clone(),
             ));
@@ -1487,9 +1489,9 @@ impl VerificationOracle {
             submissions: Vec::new(&e),
             finalized: false,
         };
-        e.storage().temporary().set(&window_key, &fresh);
+        e.storage().persistent().set(&window_key, &fresh);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
     }
 
@@ -1498,7 +1500,7 @@ impl VerificationOracle {
     pub fn window_submission_count(e: Env, project_id: BytesN<32>) -> u32 {
         let window: Option<WindowState> = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&DataKey::WindowState(project_id));
         match window {
             None => 0,
@@ -1740,7 +1742,7 @@ impl VerificationOracle {
         }
 
         let window_key = DataKey::WindowState(project_id.clone());
-        let existing: Option<WindowState> = e.storage().temporary().get(&window_key);
+        let existing: Option<WindowState> = e.storage().persistent().get(&window_key);
         match existing {
             Some(ref w) if !w.finalized => panic!("window already active"),
             _ => {}
@@ -1753,9 +1755,9 @@ impl VerificationOracle {
             submissions: Vec::new(&e),
             finalized: false,
         };
-        e.storage().temporary().set(&window_key, &window);
+        e.storage().persistent().set(&window_key, &window);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         add_open_project(&e, &project_id, read_config(&e).max_open_windows);
@@ -1767,7 +1769,7 @@ impl VerificationOracle {
     pub fn get_window_phase(e: Env, project_id: BytesN<32>) -> Option<WindowPhase> {
         let window: Option<WindowState> = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&DataKey::WindowState(project_id));
         window.map(|w| w.phase)
     }
@@ -1816,7 +1818,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -1828,7 +1830,7 @@ impl VerificationOracle {
         }
 
         let commit_key = DataKey::Commitment((project_id.clone(), oracle.clone()));
-        if e.storage().temporary().has(&commit_key) {
+        if e.storage().persistent().has(&commit_key) {
             panic!("oracle already committed");
         }
 
@@ -1837,7 +1839,7 @@ impl VerificationOracle {
             .persistent()
             .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
 
-        e.storage().temporary().set(
+        e.storage().persistent().set(
             &commit_key,
             &CommitInfo {
                 commitment: commitment.clone(),
@@ -1845,8 +1847,13 @@ impl VerificationOracle {
             },
         );
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&commit_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
+        // A commit is an in-flight phase transition: refresh the window as
+        // well as the commitment so a long commit phase cannot lose state.
+        e.storage()
+            .persistent()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         e.events()
             .publish((EVENT_ORACLE_COMMITTED,), (oracle, project_id, commitment));
@@ -1858,7 +1865,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -1889,7 +1896,7 @@ impl VerificationOracle {
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
             if e.storage()
-                .temporary()
+                .persistent()
                 .has(&DataKey::Commitment((project_id.clone(), oracle)))
             {
                 has_commit = true;
@@ -1903,9 +1910,9 @@ impl VerificationOracle {
         let mut window = window;
         window.phase = WindowPhase::Reveal;
         window.reveal_opened_ledger = e.ledger().sequence();
-        e.storage().temporary().set(&window_key, &window);
+        e.storage().persistent().set(&window_key, &window);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
     }
 
@@ -1946,7 +1953,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let mut window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -1968,7 +1975,7 @@ impl VerificationOracle {
         let commit_key = DataKey::Commitment((project_id.clone(), oracle.clone()));
         let commit_info: CommitInfo = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&commit_key)
             .expect("oracle did not commit");
 
@@ -1977,7 +1984,7 @@ impl VerificationOracle {
         }
 
         let reveal_key = DataKey::OracleRevealed((project_id.clone(), oracle.clone()));
-        if e.storage().temporary().has(&reveal_key) {
+        if e.storage().persistent().has(&reveal_key) {
             panic!("oracle already revealed");
         }
 
@@ -2035,14 +2042,14 @@ impl VerificationOracle {
         };
 
         window.submissions.push_back(submission);
-        e.storage().temporary().set(&window_key, &window);
+        e.storage().persistent().set(&window_key, &window);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
-        e.storage().temporary().set(&reveal_key, &true);
+        e.storage().persistent().set(&reveal_key, &true);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&reveal_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         e.events()
@@ -2062,7 +2069,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -2098,8 +2105,8 @@ impl VerificationOracle {
             let commit_key = DataKey::Commitment((project_id.clone(), oracle.clone()));
             let reveal_key = DataKey::OracleRevealed((project_id.clone(), oracle.clone()));
 
-            let committed = e.storage().temporary().has(&commit_key);
-            let revealed = e.storage().temporary().has(&reveal_key);
+            let committed = e.storage().persistent().has(&commit_key);
+            let revealed = e.storage().persistent().has(&reveal_key);
 
             if committed && !revealed {
                 // Increment missed reveals counter
@@ -2165,8 +2172,8 @@ impl VerificationOracle {
                     }
                 }
 
-                // Clean up commitment from temporary storage
-                e.storage().temporary().remove(&commit_key);
+                // Clean up the persisted commitment
+                e.storage().persistent().remove(&commit_key);
             }
         }
     }
@@ -2177,7 +2184,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let mut window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -2288,8 +2295,11 @@ impl VerificationOracle {
 
         window.finalized = true;
         window.phase = WindowPhase::Finalized;
-        // Write finalized state back; window will naturally expire via TTL
-        e.storage().temporary().set(&window_key, &window);
+        // Persist the finalized state and refresh its retention TTL.
+        e.storage().persistent().set(&window_key, &window);
+        e.storage()
+            .persistent()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         remove_open_project(&e, &project_id);
 
@@ -2302,9 +2312,9 @@ impl VerificationOracle {
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
             e.storage()
-                .temporary()
+                .persistent()
                 .remove(&DataKey::Commitment((project_id.clone(), oracle.clone())));
-            e.storage().temporary().remove(&DataKey::OracleRevealed((
+            e.storage().persistent().remove(&DataKey::OracleRevealed((
                 project_id.clone(),
                 oracle.clone(),
             )));
@@ -4117,6 +4127,54 @@ mod tests {
         client.begin_reveal_phase(&project_id);
         let phase = client.get_window_phase(&project_id);
         assert_eq!(phase.unwrap(), WindowPhase::Reveal);
+    }
+
+    #[test]
+    fn test_long_commit_reveal_window_finalizes_without_state_loss() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let mut config = client.get_config();
+        // Exercise a commit period longer than the former seven-day temporary
+        // TTL, followed by the largest configured ledger-based reveal period.
+        config.commit_phase_secs = 7 * 24 * 60 * 60;
+        config.max_reveal_ledgers = 120_960;
+        client.update_config(&admin, &config);
+
+        let project_id = BytesN::from_array(&e, &[122u8; 32]);
+        let salt = BytesN::from_array(&e, &[0xF1u8; 32]);
+        client.open_window(&admin, &project_id);
+        for i in 0..oracles.len() {
+            let oracle = oracles.get(i).unwrap();
+            let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+            client.commit_reading(&oracle, &project_id, &1, &commitment);
+        }
+
+        // This exceeds the old temporary-storage TTL. The window and every
+        // commitment must still exist when the commit phase is transitioned.
+        let mut info = e.ledger().get();
+        info.timestamp += config.commit_phase_secs;
+        info.sequence_number += 120_961;
+        e.ledger().set(info);
+        client.begin_reveal_phase(&project_id);
+
+        // Drive the reveal phase to its configured upper bound. The final
+        // reveal auto-finalizes and proves the full long-lived lifecycle works.
+        let mut info = e.ledger().get();
+        info.sequence_number += config.max_reveal_ledgers;
+        e.ledger().set(info);
+        let params = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        let mut result = None;
+        for i in 0..oracles.len() {
+            result = client.reveal_reading(&oracles.get(i).unwrap(), &project_id, &params);
+        }
+
+        assert!(result.is_some());
+        assert_eq!(
+            client.get_window_phase(&project_id),
+            Some(WindowPhase::Finalized)
+        );
     }
 
     #[test]
