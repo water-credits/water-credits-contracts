@@ -232,7 +232,7 @@ fn member_count(e: &Env) -> u32 {
 }
 
 /// Get the governance token address used for voting power.
-/// Returns None if no governance token is registered.
+/// Returns None if no governance token has been registered.
 fn get_governance_token(e: &Env) -> Option<Address> {
     e.storage()
         .instance()
@@ -584,7 +584,8 @@ impl Governance {
                 // Manual ceiling: ceil(a/b) = (a + b - 1) / b
                 // Cannot use div_ceil due to unstable feature
                 #[allow(clippy::manual_div_ceil)]
-                let result = ((effective_voters as u64 * config.quorum_bps as u64) + 10000 - 1) / 10000;
+                let result =
+                    ((effective_voters as u64 * config.quorum_bps as u64) + 10000 - 1) / 10000;
                 result
             };
 
