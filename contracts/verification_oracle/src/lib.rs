@@ -887,7 +887,10 @@ impl VerificationOracle {
     }
 
     /// Remove an oracle from the whitelist. Must maintain at least min_oracles.
-    /// The oracle must have zero stake (fully unstaked) before removal.
+    /// The oracle must have zero stake (fully unstaked) before removal, unless
+    /// it has fallen below the configured minimum stake. This lets an admin
+    /// remove a slashed oracle that can no longer submit, without first
+    /// slashing its remaining collateral to zero.
     pub fn remove_oracle(e: Env, admin: Address, oracle: Address) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -909,11 +912,12 @@ impl VerificationOracle {
                 amount: 0,
                 unstake_request: None,
             });
-        if stake_info.amount > 0 {
-            panic!("oracle must unstake before removal");
-        }
         let count: u32 = e.storage().instance().get(&DataKey::OracleCount).unwrap();
         let config: OracleConfig = read_config(&e);
+        let below_minimum_stake = config.min_stake > 0 && stake_info.amount < config.min_stake;
+        if stake_info.amount > 0 && !below_minimum_stake {
+            panic!("oracle must unstake before removal");
+        }
         if count <= config.min_oracles {
             panic!("minimum oracles required");
         }
@@ -3599,6 +3603,62 @@ mod tests {
         client.unstake(&o4, &1500);
         client.remove_oracle(&admin, &o4);
         assert!(!client.is_oracle_active(&o4));
+    }
+
+    #[test]
+    fn test_remove_oracle_slashed_below_min_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 4, 1500);
+        let oracle = oracles.get(3).unwrap();
+        let mut config = client.get_config();
+        config.min_stake = 1000;
+        client.update_config(&admin, &config);
+
+        // Slashing leaves collateral that cannot be unstaked while the oracle
+        // is active, but is insufficient for the oracle to participate.
+        client.slash(&admin, &oracle, &600, &1);
+        assert_eq!(client.get_stake(&oracle).amount, 900);
+
+        // The below-minimum balance is removable without a second slash.
+        client.remove_oracle(&admin, &oracle);
+        assert!(!client.is_oracle_active(&oracle));
+        assert_eq!(client.oracle_count(), 3);
+        assert_eq!(client.get_stake(&oracle).amount, 900);
+    }
+
+    #[test]
+    fn test_remove_slashed_oracle_waits_for_open_submission_cleanup() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 4, 1500);
+        let oracle = oracles.get(3).unwrap();
+        let mut config = client.get_config();
+        config.min_stake = 1000;
+        client.update_config(&admin, &config);
+
+        let project_id = BytesN::from_array(&e, &[0xB4u8; 32]);
+        let salt = BytesN::from_array(&e, &[0xB4u8; 32]);
+        client.open_window(&admin, &project_id);
+        let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracle, &project_id, &1, &commitment);
+        client.slash(&admin, &oracle, &600, &1);
+
+        // A committed reading remains protected until the window is reset or
+        // finalized; removal must not alter an in-flight window.
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "remove_oracle"),
+            vec![&e, admin.to_val(), oracle.to_val()],
+        );
+        assert!(result.is_err());
+        assert!(client.is_oracle_active(&oracle));
+
+        client.reset_window(&admin, &project_id);
+        client.remove_oracle(&admin, &oracle);
+        assert!(!client.is_oracle_active(&oracle));
     }
 
     // Note: the "insufficient stake blocks participation" case is covered by
