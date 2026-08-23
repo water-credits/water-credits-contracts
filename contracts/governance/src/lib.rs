@@ -43,6 +43,12 @@ pub struct GovernanceConfig {
     pub quorum_bps: u32,
     pub min_proposal_deposit: i128,
     pub max_active_proposals: u32,
+    /// Maximum number of seconds after `timelock_ends_at` during which an
+    /// `Approved` proposal may still be executed. After this deadline the
+    /// proposal auto-transitions to `Expired` and `execute` rejects it,
+    /// preventing a stale proposal from being executed far in the future
+    /// against a changed protocol state (Issue #183).
+    pub execution_period: u64,
 }
 
 #[contracttype]
@@ -76,6 +82,12 @@ pub struct Proposal {
     pub created_at: u64,
     pub voting_ends_at: u64,
     pub timelock_ends_at: u64,
+    /// Absolute timestamp after which an `Approved` proposal can no longer be
+    /// executed. Computed as `timelock_ends_at + config.execution_period` when
+    /// the proposal is approved. `0` until the proposal is approved. After this
+    /// deadline `execute` rejects the proposal and it auto-transitions to
+    /// `Expired` (Issue #183).
+    pub execution_deadline: u64,
 }
 
 #[contracttype]
@@ -166,6 +178,8 @@ const MAX_QUORUM_BPS: u32 = 10_000;
 const MIN_ACTIVE_PROPOSALS: u32 = 1;
 /// Maximum active-proposal cap, to keep the active-proposals list bounded.
 const MAX_ACTIVE_PROPOSALS: u32 = 100;
+/// Maximum execution period (30 days). `0` is a valid "no execution window".
+const MAX_EXECUTION_PERIOD: u64 = 2_592_000;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -206,6 +220,13 @@ fn validate_config(config: &GovernanceConfig) {
     if !(MIN_ACTIVE_PROPOSALS..=MAX_ACTIVE_PROPOSALS).contains(&config.max_active_proposals) {
         panic!("max_active_proposals out of range");
     }
+    // `execution_period` bounds how long an Approved proposal stays executable
+    // after its timelock ends. `0` is a valid "no execution window" (the
+    // proposal must be executed immediately after the timelock), but a value
+    // beyond 30 days would let a stale proposal linger indefinitely (Issue #183).
+    if config.execution_period > MAX_EXECUTION_PERIOD {
+        panic!("execution_period out of range");
+    }
 }
 
 fn is_member(e: &Env, addr: &Address) -> bool {
@@ -238,6 +259,9 @@ impl Governance {
             quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
+            // 7 days after the timelock ends — a reasonable window for a
+            // member to execute an approved proposal before it goes stale.
+            execution_period: 604_800,
         };
         e.storage().instance().set(&DataKey::Config, &config);
         e.storage().instance().set(&DataKey::ProposalCount, &0u64);
@@ -353,6 +377,7 @@ impl Governance {
             created_at: timestamp,
             voting_ends_at: timestamp + config.voting_period,
             timelock_ends_at: 0,
+            execution_deadline: 0,
         };
 
         e.storage()
@@ -483,6 +508,8 @@ impl Governance {
             if yes_pct >= config.approval_threshold_bps as u64 {
                 proposal.status = ProposalStatus::Approved;
                 proposal.timelock_ends_at = timestamp + config.timelock_duration;
+                proposal.execution_deadline =
+                    proposal.timelock_ends_at + config.execution_period;
                 e.storage().persistent().set(&proposal_key, &proposal);
                 e.storage().persistent().extend_ttl(
                     &proposal_key,
@@ -524,6 +551,21 @@ impl Governance {
         let timestamp = e.ledger().timestamp();
         if timestamp < proposal.timelock_ends_at {
             panic!("timelock not elapsed");
+        }
+
+        // Reject execution after the deadline and auto-transition the proposal
+        // to Expired so it can no longer be executed against a changed protocol
+        // state (Issue #183).
+        if timestamp > proposal.execution_deadline {
+            proposal.status = ProposalStatus::Expired;
+            e.storage().persistent().set(&proposal_key, &proposal);
+            e.storage().persistent().extend_ttl(
+                &proposal_key,
+                PROPOSAL_TTL_THRESHOLD,
+                PROPOSAL_TTL_BUMP,
+            );
+            Self::remove_from_active(&e, proposal_id);
+            panic!("execution deadline passed");
         }
 
         // Remove from the active list before dispatch. In atomic mode a
@@ -659,13 +701,33 @@ impl Governance {
             .get(&proposal_key)
             .unwrap_or_else(|| panic!("proposal not found"));
 
+        let timestamp = e.ledger().timestamp();
+
+        // An Approved proposal past its execution deadline auto-transitions to
+        // Expired (Issue #183).
+        if matches!(proposal.status, ProposalStatus::Approved) {
+            if timestamp <= proposal.execution_deadline {
+                panic!("execution deadline has not passed");
+            }
+            proposal.status = ProposalStatus::Expired;
+            e.storage().persistent().set(&proposal_key, &proposal);
+            e.storage().persistent().extend_ttl(
+                &proposal_key,
+                PROPOSAL_TTL_THRESHOLD,
+                PROPOSAL_TTL_BUMP,
+            );
+            Self::remove_from_active(&e, proposal_id);
+            e.events()
+                .publish((Symbol::new(&e, "prop_expired"),), (proposal_id,));
+            return;
+        }
+
         if !matches!(proposal.status, ProposalStatus::Active)
             && !matches!(proposal.status, ProposalStatus::Pending)
         {
             panic!("proposal not active or pending");
         }
 
-        let timestamp = e.ledger().timestamp();
         if timestamp <= proposal.voting_ends_at {
             panic!("voting period has not ended");
         }
@@ -1465,6 +1527,7 @@ mod tests {
             quorum_bps: 5000,
             min_proposal_deposit: 500,
             max_active_proposals: 20,
+            execution_period: 604_800,
         };
         client.update_config(&admin, &new_config);
 
@@ -1547,6 +1610,7 @@ mod tests {
             quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
+            execution_period: 604_800,
         };
         client.update_config(&new_admin, &config);
 
@@ -1558,6 +1622,7 @@ mod tests {
             quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
+            execution_period: 604_800,
         };
         let result = client.try_update_config(&admin, &config2);
         assert!(result.is_err());
@@ -2346,5 +2411,143 @@ mod tests {
             &false,
         );
         assert_eq!(id2, 2);
+    }
+
+    // ── Execution deadline (Issue #183) ──
+
+    #[test]
+    fn test_execute_after_deadline_fails_and_proposal_expires() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Deadline Test"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+        assert!(proposal.execution_deadline > 0);
+
+        // Jump past the execution deadline.
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.execution_deadline + 1;
+        e.ledger().set(info);
+
+        // Execute must fail (the panic reverts the state change, so the
+        // proposal stays Approved until expire_proposal is called).
+        let result = client.try_execute(&member1, &id);
+        assert!(result.is_err());
+
+        // The proposal can then be transitioned to Expired via expire_proposal.
+        client.expire_proposal(&id);
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Expired));
+    }
+
+    #[test]
+    fn test_execute_before_deadline_succeeds() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Before Deadline"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        // Jump past timelock but before deadline.
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        client.execute(&member1, &id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Executed));
+    }
+
+    #[test]
+    fn test_expire_proposal_handles_approved_past_deadline() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Expire Approved"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        // Jump past the execution deadline.
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.execution_deadline + 1;
+        e.ledger().set(info);
+
+        client.expire_proposal(&id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Expired));
+    }
+
+    #[test]
+    fn test_update_config_rejects_execution_period_above_max() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.execution_period = 2_592_001;
+        let result = client.try_update_config(&admin, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_accepts_zero_execution_period() {
+        let (e, admin, _member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.execution_period = 0;
+        client.update_config(&admin, &config);
+        assert_eq!(client.get_config().execution_period, 0);
     }
 }

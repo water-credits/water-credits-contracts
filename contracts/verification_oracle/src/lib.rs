@@ -1415,6 +1415,30 @@ impl VerificationOracle {
         if config.fee_bps > 10_000 {
             panic!("fee_bps exceeds max (10000 = 100%)");
         }
+        // Quality thresholds must be internally consistent and sit within the
+        // physical bounds enforced by `validate_sensor_reading`. A config with
+        // `quality_threshold_ph > quality_threshold_ph_max` would make the pH
+        // penalty always fire (every reading is outside an inverted band), while
+        // thresholds outside the physical range would silently disable or
+        // always-fire the corresponding penalty (Issue #181).
+        if config.quality_threshold_ph > config.quality_threshold_ph_max {
+            panic!("quality_threshold_ph exceeds quality_threshold_ph_max");
+        }
+        if !(0..=1400).contains(&config.quality_threshold_ph) {
+            panic!("quality_threshold_ph out of valid range [0, 1400]");
+        }
+        if !(0..=1400).contains(&config.quality_threshold_ph_max) {
+            panic!("quality_threshold_ph_max out of valid range [0, 1400]");
+        }
+        if !(0..=10_000).contains(&config.quality_threshold_turbidity) {
+            panic!("quality_threshold_turbidity out of valid range [0, 10000]");
+        }
+        if config.quality_threshold_do < 0 {
+            panic!("quality_threshold_do must be non-negative");
+        }
+        if !(0..=500).contains(&config.quality_threshold_temp) {
+            panic!("quality_threshold_temp out of valid range [0, 500]");
+        }
         e.storage().instance().set(&DataKey::Config, &config);
     }
 
@@ -4517,6 +4541,121 @@ mod tests {
             vec![&e, admin.to_val(), config.into_val(&e)],
         );
         assert!(result.is_err());
+    }
+
+    // ── Quality threshold sanity (Issue #181) ──
+
+    #[test]
+    fn test_update_config_rejects_ph_min_above_ph_max() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.quality_threshold_ph = 800;
+        config.quality_threshold_ph_max = 700;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_rejects_ph_threshold_out_of_physical_range() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        // ph below 0
+        let mut config = client.get_config();
+        config.quality_threshold_ph = -1;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+
+        // ph_max above 1400
+        let mut config = client.get_config();
+        config.quality_threshold_ph_max = 1401;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_rejects_turbidity_threshold_out_of_physical_range() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.quality_threshold_turbidity = 10_001;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_rejects_do_threshold_negative() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.quality_threshold_do = -1;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_rejects_temp_threshold_out_of_physical_range() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.quality_threshold_temp = 501;
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "update_config"),
+            vec![&e, admin.to_val(), config.into_val(&e)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_config_accepts_valid_quality_thresholds() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        // Register 3 oracles so min_oracles <= oracle_count passes.
+        for _ in 0..3u32 {
+            client.add_oracle(&admin, &Address::generate(&e));
+        }
+
+        let mut config = client.get_config();
+        config.quality_threshold_ph = 0;
+        config.quality_threshold_ph_max = 1400;
+        config.quality_threshold_turbidity = 10_000;
+        config.quality_threshold_do = 0;
+        config.quality_threshold_temp = 500;
+        client.update_config(&admin, &config);
+
+        let stored = client.get_config();
+        assert_eq!(stored.quality_threshold_ph, 0);
+        assert_eq!(stored.quality_threshold_ph_max, 1400);
+        assert_eq!(stored.quality_threshold_turbidity, 10_000);
+        assert_eq!(stored.quality_threshold_do, 0);
+        assert_eq!(stored.quality_threshold_temp, 500);
     }
 
     // ── Oracle config bounds (Issue #110) ──
