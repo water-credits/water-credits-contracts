@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Env, InvokeError, String,
-    Symbol, Val, Vec,
+    Symbol, TryFromVal, Val, Vec,
 };
 
 #[cfg(test)]
@@ -246,15 +246,16 @@ fn get_voter_voting_weight(e: &Env, voter: &Address) -> i128 {
         None => 0,
         Some(token_addr) => {
             // Invoke balance(voter) on the governance token contract
-            // If this fails, return 0 (graceful degradation)
-            match e
-                .invoke_contract::<i128>(
-                    &token_addr,
-                    &Symbol::new(e, "balance"),
-                    soroban_sdk::vec![e, voter.to_val()],
-                )
-            {
-                Ok(balance) => balance,
+            // Panics are converted to 0 via the try_invoke_contract outer Result
+            match e.try_invoke_contract::<Val, InvokeError>(
+                &token_addr,
+                &Symbol::new(e, "balance"),
+                soroban_sdk::vec![e, voter.to_val()],
+            ) {
+                Ok(inner_result) => match inner_result {
+                    Ok(val) => i128::try_from_val(e, &val).unwrap_or_default(),
+                    Err(_) => 0,
+                },
                 Err(_) => 0,
             }
         }
@@ -271,14 +272,26 @@ fn get_total_eligible_weight(e: &Env) -> i128 {
         }
         Some(token_addr) => {
             // Query total_supply from the governance token
-            match e
-                .invoke_contract::<i128>(
-                    &token_addr,
-                    &Symbol::new(e, "total_supply"),
-                    soroban_sdk::vec![e],
-                )
-            {
-                Ok(supply) => supply,
+            match e.try_invoke_contract::<Val, InvokeError>(
+                &token_addr,
+                &Symbol::new(e, "total_supply"),
+                soroban_sdk::vec![e],
+            ) {
+                Ok(inner_result) => match inner_result {
+                    Ok(val) => {
+                        match i128::try_from_val(e, &val) {
+                            Ok(supply) => supply,
+                            Err(_) => {
+                                // Fallback to member count if conversion fails
+                                member_count(e) as i128
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Fallback to member count if token query fails
+                        member_count(e) as i128
+                    }
+                },
                 Err(_) => {
                     // Fallback to member count if token query fails
                     member_count(e) as i128
@@ -538,32 +551,27 @@ impl Governance {
         // - Approval is based on voting power (not vote count)
         // This guarantees that proposals resolve based on economic weight, not just headcount.
         let config: GovernanceConfig = read_config(&e);
-        
+
         // Use token-weighted voting if governance token is set, otherwise fall back to count-based
         let use_weighted_voting = get_governance_token(&e).is_some();
 
         let should_resolve = if use_weighted_voting {
             // Token-weighted voting: quorum and approval based on voting power
             let total_weight_cast = proposal.votes_for_weight + proposal.votes_against_weight;
-            
+
             // Quorum = ceil(quorum_bps/10000 * total_eligible_weight)
+            // Manual ceiling: ceil(a/b) = (a + b - 1) / b
+            // Cannot use div_ceil due to unstable feature
             let quorum_weight = if proposal.total_eligible_weight > 0 {
-                (proposal.total_eligible_weight * config.quorum_bps as i128).div_ceil(10000)
+                #[allow(clippy::manual_div_ceil)]
+                let numerator =
+                    proposal.total_eligible_weight * config.quorum_bps as i128 + 10000 - 1;
+                numerator / 10000
             } else {
                 0
             };
 
-            if total_weight_cast >= quorum_weight {
-                // Approval = (votes_for_weight * 10000) / total_weight_cast >= approval_threshold_bps
-                let yes_pct = if total_weight_cast > 0 {
-                    (proposal.votes_for_weight * 10000) / total_weight_cast
-                } else {
-                    0
-                };
-                yes_pct >= config.approval_threshold_bps as i128
-            } else {
-                false
-            }
+            total_weight_cast >= quorum_weight
         } else {
             // Fallback: count-based voting (original logic)
             let total_votes = proposal.votes_for + proposal.votes_against;
@@ -573,42 +581,37 @@ impl Governance {
             let quorum = if effective_voters == 0 {
                 0u64
             } else {
-                (effective_voters as u64 * config.quorum_bps as u64).div_ceil(10000)
+                // Manual ceiling: ceil(a/b) = (a + b - 1) / b
+                // Cannot use div_ceil due to unstable feature
+                #[allow(clippy::manual_div_ceil)]
+                let result = ((effective_voters as u64 * config.quorum_bps as u64) + 10000 - 1) / 10000;
+                result
             };
 
-            if (total_votes as u64) >= quorum {
-                let yes_pct = if total_votes > 0 {
-                    (proposal.votes_for as u64 * 10000) / total_votes as u64
-                } else {
-                    0
-                };
-                yes_pct >= config.approval_threshold_bps as u64
-            } else {
-                false
-            }
+            (total_votes as u64) >= quorum
         };
 
         if should_resolve {
             // Determine if approved or rejected based on voting power/count
-            let votes_for_pct = if use_weighted_voting {
+            let is_approved = if use_weighted_voting {
                 let total_weight = proposal.votes_for_weight + proposal.votes_against_weight;
                 if total_weight > 0 {
-                    (proposal.votes_for_weight * 10000) / total_weight
+                    let votes_for_pct = (proposal.votes_for_weight * 10000) / total_weight;
+                    votes_for_pct >= config.approval_threshold_bps as i128
                 } else {
-                    0
+                    false
                 }
             } else {
                 let total_votes = proposal.votes_for + proposal.votes_against;
                 if total_votes > 0 {
-                    (proposal.votes_for as u64 * 10000) / total_votes as u64
+                    let yes_pct = (proposal.votes_for as u64 * 10000) / total_votes as u64;
+                    yes_pct >= config.approval_threshold_bps as u64
                 } else {
-                    0
+                    false
                 }
             };
 
-            let approval_threshold = config.approval_threshold_bps as i128;
-            
-            if votes_for_pct >= approval_threshold {
+            if is_approved {
                 proposal.status = ProposalStatus::Approved;
                 proposal.timelock_ends_at = timestamp + config.timelock_duration;
                 e.storage().persistent().set(&proposal_key, &proposal);
@@ -1012,20 +1015,23 @@ impl Governance {
             panic!("unauthorized");
         }
         // Validate that the token contract exists by querying its total_supply
-        match e
-            .invoke_contract::<i128>(
-                &token,
-                &Symbol::new(&e, "total_supply"),
-                soroban_sdk::vec![&e],
-            )
-        {
-            Ok(_) => {
-                e.storage()
-                    .instance()
-                    .set(&DataKey::GovernanceToken, &token);
-            }
+        match e.try_invoke_contract::<Val, InvokeError>(
+            &token,
+            &Symbol::new(&e, "total_supply"),
+            soroban_sdk::vec![&e],
+        ) {
+            Ok(inner_result) => match inner_result {
+                Ok(_) => {
+                    e.storage()
+                        .instance()
+                        .set(&DataKey::GovernanceToken, &token);
+                }
+                Err(_) => {
+                    panic!("governance token does not support total_supply");
+                }
+            },
             Err(_) => {
-                panic!("governance token not found or does not support total_supply");
+                panic!("governance token contract call failed");
             }
         }
     }
@@ -1180,6 +1186,7 @@ impl Governance {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_borrows_for_generic_args)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
