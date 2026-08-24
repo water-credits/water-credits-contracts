@@ -158,6 +158,28 @@ pub const MAX_WINDOW_SECS: u64 = 86_400;
 /// Default hard cap on concurrent open windows (`OracleConfig::max_open_windows`).
 const DEFAULT_MAX_OPEN_WINDOWS: u32 = 20;
 
+/// Hard upper bound on `OracleConfig::max_oracles`, enforced by `update_config`.
+///
+/// This is not only a policy cap: a window can hold at most one submission per
+/// active oracle, and `median_i64` sorts those submissions in a fixed-size
+/// stack buffer of `MEDIAN_BUFFER_LEN` elements. Because `MEDIAN_BUFFER_LEN` is
+/// derived from this constant, raising the cap grows the buffer with it and the
+/// two can never drift apart.
+///
+/// The `update_config` rejection message spells the value out (`"max_oracles
+/// exceeds hard limit (10)"`) because contract panics carry string literals
+/// only; update that message if this constant ever changes.
+pub const MAX_ORACLES_HARD_LIMIT: u32 = 10;
+
+/// Capacity of the stack buffer `median_i64` sorts in — the maximum number of
+/// readings a single window can produce, which is `MAX_ORACLES_HARD_LIMIT`.
+pub const MEDIAN_BUFFER_LEN: usize = MAX_ORACLES_HARD_LIMIT as usize;
+
+/// The median buffer must cover every reading a fully subscribed window can
+/// produce. Breaking that link is a compile error rather than a latent
+/// out-of-bounds write.
+const _: () = assert!(MEDIAN_BUFFER_LEN >= MAX_ORACLES_HARD_LIMIT as usize);
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowPhase {
@@ -331,21 +353,26 @@ pub fn sha256_commitment(
 }
 
 /// Compute the median of a `Vec<i64>`. Copies values into a local fixed-size
-/// array (max 10 elements, matching `max_oracles`) and uses an insertion sort
-/// on the stack — zero Soroban host allocations. For the hard config bound of
-/// `max_oracles = 10` this runs at most 45 local comparisons, a dramatic
-/// improvement over the previous O(n²) host-call-based insertion sort.
+/// array of `MEDIAN_BUFFER_LEN` elements and uses an insertion sort on the
+/// stack — zero Soroban host allocations. For the hard config bound of
+/// `max_oracles = MAX_ORACLES_HARD_LIMIT` (10) this runs at most 45 local
+/// comparisons, a dramatic improvement over the previous O(n²) host-call-based
+/// insertion sort.
 ///
 /// Even-length median: `(sorted[n/2-1] + sorted[n/2]) / 2` (Rust integer
 /// division truncates toward zero, matching the historical behaviour).
-/// Compute the median of a `Vec<i64>`. Copies values into a local fixed-size
-/// array (max 10 elements, matching `max_oracles`) and uses an insertion sort
-/// on the stack — zero Soroban host allocations. For the hard config bound of
-/// `max_oracles = 10` this runs at most 45 local comparisons, a dramatic
-/// improvement over the previous O(n²) host-call-based insertion sort.
 ///
-/// Even-length median: `(sorted[n/2-1] + sorted[n/2]) / 2` (Rust integer
-/// division truncates toward zero, matching the historical behaviour).
+/// # Bounds invariant
+/// `values.len()` must not exceed `MEDIAN_BUFFER_LEN`. Callers satisfy this
+/// structurally: a window holds at most one submission per active oracle,
+/// `add_oracle` caps the active set at `OracleConfig::max_oracles`, and
+/// `update_config` caps that at `MAX_ORACLES_HARD_LIMIT` — the value
+/// `MEDIAN_BUFFER_LEN` is derived from. `remove_oracle` also refuses to drop an
+/// oracle that has submissions in an open window, so swapping oracles mid-window
+/// cannot slip an extra reading past that cap. The check below makes the invariant
+/// explicit and self-diagnosing instead of relying on that reasoning holding
+/// forever: an oversized input reverts with a named error rather than an
+/// opaque index panic from the copy loop.
 ///
 /// # Bug fix (fuzz testing)
 /// The previous implementation did `arr[a] + arr[b]` in `i64`, which overflows
@@ -359,9 +386,10 @@ pub fn median_i64(values: &Vec<i64>) -> i64 {
     if n == 0 {
         panic!("median of empty vec");
     }
-    // `max_oracles = 10` is a hard config bound enforced at `add_oracle`,
-    // so `n` is always in [1, 10].
-    let mut arr = [0i64; 10];
+    if n > MEDIAN_BUFFER_LEN {
+        panic!("median input exceeds oracle buffer capacity");
+    }
+    let mut arr = [0i64; MEDIAN_BUFFER_LEN];
     for (i, val) in values.iter().enumerate() {
         arr[i] = val;
     }
@@ -1390,16 +1418,17 @@ impl VerificationOracle {
         if !(MIN_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&config.window_secs) {
             panic!("window_secs out of valid range [60, 86400]");
         }
-        // `median_i64` uses a fixed ten-element buffer, and finalization
-        // requires at least one oracle. Reject internally inconsistent bounds
-        // before comparing the requested quorum with the live oracle count.
+        // Finalization requires at least one oracle, and `median_i64` sorts a
+        // window's readings in a buffer sized to `MAX_ORACLES_HARD_LIMIT`.
+        // Reject internally inconsistent bounds before comparing the requested
+        // quorum with the live oracle count.
         if config.min_oracles == 0 {
             panic!("min_oracles must be at least 1");
         }
         if config.min_oracles > config.max_oracles {
             panic!("min_oracles exceeds max_oracles");
         }
-        if config.max_oracles > 10 {
+        if config.max_oracles > MAX_ORACLES_HARD_LIMIT {
             panic!("max_oracles exceeds hard limit (10)");
         }
         // Preserve the quorum invariant: configuration cannot require more
@@ -4676,7 +4705,7 @@ mod tests {
 
         let mut config = client.get_config();
         config.min_oracles = 1;
-        config.max_oracles = 11;
+        config.max_oracles = MAX_ORACLES_HARD_LIMIT + 1;
         client.update_config(&admin, &config);
     }
 
@@ -4689,12 +4718,12 @@ mod tests {
 
         let mut config = client.get_config();
         config.min_oracles = 1;
-        config.max_oracles = 10;
+        config.max_oracles = MAX_ORACLES_HARD_LIMIT;
         client.update_config(&admin, &config);
 
         let stored = client.get_config();
         assert_eq!(stored.min_oracles, 1);
-        assert_eq!(stored.max_oracles, 10);
+        assert_eq!(stored.max_oracles, MAX_ORACLES_HARD_LIMIT);
     }
 
     // ── Quorum invariant: min_oracles <= oracle_count (Issue #104) ──

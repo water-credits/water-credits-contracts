@@ -47,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `governance`: built-in emergency actions are dispatched via the `ProtocolAction` enum (`GovernanceAction::protocol_action`) instead of raw `function` symbol strings. Previously a proposal whose action referenced the documented enum identifier (e.g. `EmergencyPause`) fell through to a generic cross-contract call and silently failed to pause anything, breaking the governance→emergency-pause integration
 - `verification_oracle`: `update_config` now enforces `min_oracles <= oracle_count`, so governance cannot raise the quorum above the current registered oracle count and leave the protocol under-quorum (windows would collect submissions but never finalize)
+- `verification_oracle`: the fixed-size buffer `median_i64` sorts readings in is now derived from an exported `MAX_ORACLES_HARD_LIMIT` (via `MEDIAN_BUFFER_LEN`), checked explicitly at the top of `median_i64`, and tied to the `update_config` cap by a compile-time assertion. Previously the buffer was a literal `[i64; 10]` only implicitly coupled to the `max_oracles > 10` config check, so raising that cap — a natural scaling change — would have fed more readings into the buffer than it holds and made every finalization revert on an opaque out-of-bounds index. No behaviour change at `max_oracles = 10`
 - Duplicate admin set in `governance` initialize
 - Max supply cap enforcement in `credit_token` mint
 - `verification_oracle`: per-oracle submission statistics now count only
