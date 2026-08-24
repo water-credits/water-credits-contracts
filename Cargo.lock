@@ -201,6 +201,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "credit_marketplace"
+version = "0.1.0"
+dependencies = [
+ "shared",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "credit_token"
 version = "0.1.0"
 dependencies = [
@@ -1329,6 +1337,7 @@ name = "tests"
 version = "0.1.0"
 dependencies = [
  "credit_factory",
+ "credit_marketplace",
  "credit_token",
  "governance",
  "project_registry",

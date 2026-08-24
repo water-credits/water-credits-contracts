@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, Env, InvokeError, String,
-    Symbol, Val, Vec,
+    Symbol, TryFromVal, Val, Vec,
 };
 
 #[cfg(test)]
@@ -32,7 +32,6 @@ pub enum ProposalStatus {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct GovernanceConfig {
-    pub fee_bps: u32,
     pub voting_period: u64,
     pub timelock_duration: u64,
     pub approval_threshold_bps: u32,
@@ -64,7 +63,7 @@ pub struct Proposal {
     pub action_results: Vec<bool>,
     /// Number of "yes" votes. Stored as a count (not a voter list) for bounded
     /// storage and O(1) updates. Per-voter dedup is enforced via
-    /// `DataKey::HasVoted`.
+    /// `DataKey::HasVoted`. Kept for audit trail; approval uses votes_for_weight.
     pub votes_for: u32,
     /// Number of "no" votes. See `votes_for` for rationale.
     pub votes_against: u32,
@@ -73,6 +72,15 @@ pub struct Proposal {
     /// members added/removed after creation cannot change the threshold
     /// retroactively.
     pub eligible_voters: u32,
+    /// Total voting power (token weight) eligible at proposal creation time.
+    /// This is the denominator for token-weighted quorum and approval calculations.
+    /// Captured immutably to prevent last-block balance manipulation.
+    pub total_eligible_weight: i128,
+    /// Accumulated voting power ("yes" votes). Replaces vote_for counts in
+    /// quorum/approval decisions for token-weighted voting.
+    pub votes_for_weight: i128,
+    /// Accumulated voting power ("no" votes). Replaces votes_against counts.
+    pub votes_against_weight: i128,
     pub status: ProposalStatus,
     pub created_at: u64,
     pub voting_ends_at: u64,
@@ -85,14 +93,24 @@ pub struct GovernanceAction {
     pub target: Address,
     pub function: Symbol,
     pub args: Vec<Val>,
+    /// Built-in protocol action to dispatch. `ProtocolAction::None` (the
+    /// default) dispatches a generic cross-contract call to `target` invoking
+    /// `function` with `args`. The emergency variants are handled internally by
+    /// `execute()` (pause/unpause every token in `RegisteredTokens`) and
+    /// ignore `target`/`function`/`args`.
+    pub protocol_action: ProtocolAction,
 }
 
-/// Built-in protocol action types. These are dispatched by `execute` and
-/// `emergency_pause`/`emergency_unpause` without requiring a generic
-/// cross-contract call encoding.
+/// Built-in protocol action types, dispatched by `execute()` via
+/// `GovernanceAction::protocol_action`. Each variant is a distinct
+/// on-chain identifier for a governance-controlled protocol operation, so
+/// proposals reference built-ins by this enum instead of ad-hoc symbol
+/// strings that can silently drift out of sync with the dispatcher.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolAction {
+    /// No built-in action: dispatch as a generic cross-contract call.
+    None,
     /// Pause all registered credit token contracts.
     EmergencyPause,
     /// Unpause all registered credit token contracts.
@@ -120,6 +138,9 @@ pub enum DataKey {
     ActiveProposals,
     ProtocolPaused,
     RegisteredTokens,
+    /// Address of the token used for token-weighted voting power.
+    /// If not set, voting remains member-count-based.
+    GovernanceToken,
     // ── Persistent ──
     Member(Address),
     Proposal(u64),
@@ -210,6 +231,76 @@ fn member_count(e: &Env) -> u32 {
     e.storage().instance().get(&DataKey::MemberCount).unwrap()
 }
 
+/// Get the governance token address used for voting power.
+/// Returns None if no governance token has been registered.
+fn get_governance_token(e: &Env) -> Option<Address> {
+    e.storage()
+        .instance()
+        .get::<_, Address>(&DataKey::GovernanceToken)
+}
+
+/// Query the voting weight (balance) of a voter from the governance token.
+/// Returns 0 if the voter has no balance or the token is not accessible.
+fn get_voter_voting_weight(e: &Env, voter: &Address) -> i128 {
+    match get_governance_token(e) {
+        None => 0,
+        Some(token_addr) => {
+            // Invoke balance(voter) on the governance token contract
+            // Panics are converted to 0 via the try_invoke_contract outer Result
+            match e.try_invoke_contract::<Val, InvokeError>(
+                &token_addr,
+                &Symbol::new(e, "balance"),
+                soroban_sdk::vec![e, voter.to_val()],
+            ) {
+                Ok(inner_result) => match inner_result {
+                    Ok(val) => i128::try_from_val(e, &val).unwrap_or_default(),
+                    Err(_) => 0,
+                },
+                Err(_) => 0,
+            }
+        }
+    }
+}
+
+/// Get the total voting power eligible at proposal creation time.
+/// This is the total supply of the governance token, used as the quorum denominator.
+fn get_total_eligible_weight(e: &Env) -> i128 {
+    match get_governance_token(e) {
+        None => {
+            // Fallback: use member count as weight (1 member = 1 unit of weight)
+            member_count(e) as i128
+        }
+        Some(token_addr) => {
+            // Query total_supply from the governance token
+            match e.try_invoke_contract::<Val, InvokeError>(
+                &token_addr,
+                &Symbol::new(e, "total_supply"),
+                soroban_sdk::vec![e],
+            ) {
+                Ok(inner_result) => match inner_result {
+                    Ok(val) => {
+                        match i128::try_from_val(e, &val) {
+                            Ok(supply) => supply,
+                            Err(_) => {
+                                // Fallback to member count if conversion fails
+                                member_count(e) as i128
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Fallback to member count if token query fails
+                        member_count(e) as i128
+                    }
+                },
+                Err(_) => {
+                    // Fallback to member count if token query fails
+                    member_count(e) as i128
+                }
+            }
+        }
+    }
+}
+
 #[contract]
 pub struct Governance;
 
@@ -223,7 +314,6 @@ impl Governance {
         e.storage().instance().set(&DataKey::Admin, &admin);
 
         let config = GovernanceConfig {
-            fee_bps: 50,
             voting_period: 604800,
             timelock_duration: 86400,
             approval_threshold_bps: 6000,
@@ -330,6 +420,10 @@ impl Governance {
             panic!("title must not be empty");
         }
 
+        // Capture total eligible voting weight at proposal creation time.
+        // This is immutable for the proposal's lifetime and prevents last-block manipulation.
+        let total_eligible_weight = get_total_eligible_weight(&e);
+
         let proposal = Proposal {
             id: proposal_id,
             proposer: proposer.clone(),
@@ -341,6 +435,9 @@ impl Governance {
             votes_for: 0,
             votes_against: 0,
             eligible_voters: member_count(&e),
+            total_eligible_weight,
+            votes_for_weight: 0,
+            votes_against_weight: 0,
             status: ProposalStatus::Pending,
             created_at: timestamp,
             voting_ends_at: timestamp + config.voting_period,
@@ -373,18 +470,16 @@ impl Governance {
 
     /// Vote on a proposal. Members can vote once. Auto-activates pending proposals.
     ///
-    /// A proposal is resolved (Approved/Rejected) once the number of cast votes
-    /// reaches the quorum derived from `Proposal.eligible_voters` (snapshotted at
-    /// creation), not when 100% turnout is achieved. Because the quorum
-    /// denominator is frozen at creation time, adding or removing members after a
-    /// proposal exists cannot change its threshold retroactively — this fixes the
-    /// liveness bug where a proposal could get stuck in `Active` forever when a
-    /// member was added after creation.
+    /// With token-weighted voting enabled: voting power is proportional to the
+    /// voter's balance in the governance token. The proposal's `total_eligible_weight`
+    /// (total token supply snapshot at proposal creation) is the denominator for
+    /// quorum and approval calculations.
     ///
-    /// Approval is measured as a fraction of *cast* votes once quorum (a minimum
-    /// participation level of `eligible_voters`) is reached. The quorum gate
-    /// ensures a proposal cannot resolve on a single vote from a tiny subset of
-    /// the membership; see `GovernanceConfig::quorum_bps`.
+    /// With token-weighted voting disabled: voting remains member-count-based (1 member = 1 vote).
+    ///
+    /// A proposal is resolved (Approved/Rejected) once the accumulated voting power
+    /// reaches the quorum threshold. Quorum and approval thresholds are specified in
+    /// basis points of the total eligible weight (or eligible voters, if using count-based).
     pub fn vote(e: Env, voter: Address, proposal_id: u64, approve: bool) {
         voter.require_auth();
 
@@ -425,10 +520,16 @@ impl Governance {
             panic!("voting period ended");
         }
 
+        // Query voter's voting weight from the governance token
+        let voter_weight = get_voter_voting_weight(&e, &voter);
+
+        // Update both count and weight for audit trail and weighted voting
         if approve {
             proposal.votes_for += 1;
+            proposal.votes_for_weight += voter_weight;
         } else {
             proposal.votes_against += 1;
+            proposal.votes_against_weight += voter_weight;
         }
 
         e.storage().persistent().set(&voted_key, &true);
@@ -445,34 +546,73 @@ impl Governance {
         e.events()
             .publish((EVENT_VOTE_CAST,), (proposal_id, voter, approve));
 
-        // Resolution math uses the creation-time snapshot capped by the current
-        // member count. This guarantees that member additions do not retroactively
-        // alter the threshold, while member removals correctly lower it.
+        // Resolution math for token-weighted voting:
+        // - Quorum is based on total_eligible_weight (not member count)
+        // - Approval is based on voting power (not vote count)
+        // This guarantees that proposals resolve based on economic weight, not just headcount.
         let config: GovernanceConfig = read_config(&e);
-        let total_votes = proposal.votes_for + proposal.votes_against;
 
-        let current_members = member_count(&e);
-        let effective_voters = proposal.eligible_voters.min(current_members);
+        // Use token-weighted voting if governance token is set, otherwise fall back to count-based
+        let use_weighted_voting = get_governance_token(&e).is_some();
 
-        // Quorum = ceil(quorum_bps/10000 * effective_voters), computed against the
-        // effective voter count. At least one vote is required to resolve.
-        let quorum = if effective_voters == 0 {
-            0u64
-        } else {
-            (effective_voters as u64 * config.quorum_bps as u64).div_ceil(10000)
-        };
+        let should_resolve = if use_weighted_voting {
+            // Token-weighted voting: quorum and approval based on voting power
+            let total_weight_cast = proposal.votes_for_weight + proposal.votes_against_weight;
 
-        if (total_votes as u64) >= quorum {
-            // Approval is measured as a fraction of cast votes. The quorum gate
-            // above already guarantees a minimum participation level, so a
-            // proposal cannot resolve on a single vote from a tiny subset of the
-            // membership.
-            let yes_pct = if total_votes > 0 {
-                (proposal.votes_for as u64 * 10000) / total_votes as u64
+            // Quorum = ceil(quorum_bps/10000 * total_eligible_weight)
+            // Manual ceiling: ceil(a/b) = (a + b - 1) / b
+            // Cannot use div_ceil due to unstable feature
+            let quorum_weight = if proposal.total_eligible_weight > 0 {
+                #[allow(clippy::manual_div_ceil)]
+                let numerator =
+                    proposal.total_eligible_weight * config.quorum_bps as i128 + 10000 - 1;
+                numerator / 10000
             } else {
                 0
             };
-            if yes_pct >= config.approval_threshold_bps as u64 {
+
+            total_weight_cast >= quorum_weight
+        } else {
+            // Fallback: count-based voting (original logic)
+            let total_votes = proposal.votes_for + proposal.votes_against;
+            let current_members = member_count(&e);
+            let effective_voters = proposal.eligible_voters.min(current_members);
+
+            let quorum = if effective_voters == 0 {
+                0u64
+            } else {
+                // Manual ceiling: ceil(a/b) = (a + b - 1) / b
+                // Cannot use div_ceil due to unstable feature
+                #[allow(clippy::manual_div_ceil)]
+                let result =
+                    ((effective_voters as u64 * config.quorum_bps as u64) + 10000 - 1) / 10000;
+                result
+            };
+
+            (total_votes as u64) >= quorum
+        };
+
+        if should_resolve {
+            // Determine if approved or rejected based on voting power/count
+            let is_approved = if use_weighted_voting {
+                let total_weight = proposal.votes_for_weight + proposal.votes_against_weight;
+                if total_weight > 0 {
+                    let votes_for_pct = (proposal.votes_for_weight * 10000) / total_weight;
+                    votes_for_pct >= config.approval_threshold_bps as i128
+                } else {
+                    false
+                }
+            } else {
+                let total_votes = proposal.votes_for + proposal.votes_against;
+                if total_votes > 0 {
+                    let yes_pct = (proposal.votes_for as u64 * 10000) / total_votes as u64;
+                    yes_pct >= config.approval_threshold_bps as u64
+                } else {
+                    false
+                }
+            };
+
+            if is_approved {
                 proposal.status = ProposalStatus::Approved;
                 proposal.timelock_ends_at = timestamp + config.timelock_duration;
                 e.storage().persistent().set(&proposal_key, &proposal);
@@ -526,13 +666,15 @@ impl Governance {
 
         // Dispatch proposal actions.
         //
-        // Built-in protocol actions are identified by the `function` field:
-        //   "emergency_pause"   → pause all registered token contracts
-        //   "emergency_unpause" → unpause all registered token contracts
+        // Built-in protocol actions are identified by
+        // `GovernanceAction::protocol_action`:
+        //   ProtocolAction::EmergencyPause   → pause all registered tokens
+        //   ProtocolAction::EmergencyUnpause → unpause all registered tokens
         //
-        // All other actions are executed as generic cross-contract invocations
-        // via `e.invoke_contract()`, using the target address, function symbol,
-        // and arguments stored in the GovernanceAction.
+        // When `protocol_action` is `ProtocolAction::None`, the action is
+        // executed as a generic cross-contract invocation via
+        // `e.invoke_contract()`, using the target address, function symbol, and
+        // arguments stored in the GovernanceAction.
         //
         // Error policy:
         //   * Atomic (allow_partial_execution == false) — REVERT: if any
@@ -861,6 +1003,45 @@ impl Governance {
         Self::do_unpause(&e);
     }
 
+    // ── Token-Weighted Voting ──
+
+    /// Set the governance token used for computing voting power.
+    /// Once set, all new proposals will use token-weighted voting where voting power
+    /// is proportional to the voter's token balance.
+    /// Admin only.
+    pub fn set_governance_token(e: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        // Validate that the token contract exists by querying its total_supply
+        match e.try_invoke_contract::<Val, InvokeError>(
+            &token,
+            &Symbol::new(&e, "total_supply"),
+            soroban_sdk::vec![&e],
+        ) {
+            Ok(inner_result) => match inner_result {
+                Ok(_) => {
+                    e.storage()
+                        .instance()
+                        .set(&DataKey::GovernanceToken, &token);
+                }
+                Err(_) => {
+                    panic!("governance token does not support total_supply");
+                }
+            },
+            Err(_) => {
+                panic!("governance token contract call failed");
+            }
+        }
+    }
+
+    /// Get the current governance token address, or None if not set.
+    pub fn get_governance_token_fn(e: Env) -> Option<Address> {
+        get_governance_token(&e)
+    }
+
     // ── Internal helpers ──
 
     /// Remove `proposal_id` from `ActiveProposals` if present. Used by both
@@ -886,28 +1067,32 @@ impl Governance {
 
     /// Dispatch a single proposal action.
     ///
+    /// `GovernanceAction::protocol_action` selects the built-in protocol
+    /// actions (pause/unpause every registered token); `target`, `function`
+    /// and `args` are ignored for those. Any other action is dispatched as a
+    /// generic cross-contract invocation of `target.function(args)`.
+    ///
     /// In atomic mode (`best_effort == false`) a failing action panics and
     /// aborts the whole `execute()` call. In best-effort mode the outcome is
     /// reported as a boolean so `execute()` can record per-action results.
     fn dispatch_action(e: &Env, action: &GovernanceAction, best_effort: bool) -> bool {
-        if action.function == soroban_sdk::Symbol::new(e, "emergency_pause") {
-            return Self::pause_all(e, best_effort);
-        }
-        if action.function == soroban_sdk::Symbol::new(e, "emergency_unpause") {
-            return Self::unpause_all(e, best_effort);
-        }
-
-        // Generic cross-contract invocation.
-        if best_effort {
-            e.try_invoke_contract::<Val, InvokeError>(
-                &action.target,
-                &action.function,
-                action.args.clone(),
-            )
-            .is_ok()
-        } else {
-            e.invoke_contract::<()>(&action.target, &action.function, action.args.clone());
-            true
+        match action.protocol_action {
+            ProtocolAction::EmergencyPause => Self::pause_all(e, best_effort),
+            ProtocolAction::EmergencyUnpause => Self::unpause_all(e, best_effort),
+            ProtocolAction::None => {
+                // Generic cross-contract invocation.
+                if best_effort {
+                    e.try_invoke_contract::<Val, InvokeError>(
+                        &action.target,
+                        &action.function,
+                        action.args.clone(),
+                    )
+                    .is_ok()
+                } else {
+                    e.invoke_contract::<()>(&action.target, &action.function, action.args.clone());
+                    true
+                }
+            }
         }
     }
 
@@ -1002,6 +1187,7 @@ impl Governance {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_borrows_for_generic_args)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
@@ -1056,7 +1242,6 @@ mod tests {
     fn test_initialize_sets_config_and_members() {
         let (_e, _admin, member1, client) = setup();
         let config = client.get_config();
-        assert_eq!(config.fee_bps, 50);
         assert_eq!(config.approval_threshold_bps, 6000);
         assert!(client.is_member_fn(&member1));
         assert_eq!(client.member_count_fn(), 1);
@@ -1446,7 +1631,6 @@ mod tests {
         e.mock_all_auths();
 
         let new_config = GovernanceConfig {
-            fee_bps: 100,
             voting_period: 432000,
             timelock_duration: 43200,
             approval_threshold_bps: 5000,
@@ -1457,7 +1641,6 @@ mod tests {
         client.update_config(&admin, &new_config);
 
         let config = client.get_config();
-        assert_eq!(config.fee_bps, 100);
         assert_eq!(config.max_active_proposals, 20);
     }
 
@@ -1530,7 +1713,6 @@ mod tests {
 
         // New admin can now perform admin actions
         let config = GovernanceConfig {
-            fee_bps: 200,
             voting_period: 604800,
             timelock_duration: 86400,
             approval_threshold_bps: 6000,
@@ -1539,11 +1721,9 @@ mod tests {
             max_active_proposals: 10,
         };
         client.update_config(&new_admin, &config);
-        assert_eq!(client.get_config().fee_bps, 200);
 
         // Old admin should be rejected
         let config2 = GovernanceConfig {
-            fee_bps: 300,
             voting_period: 604800,
             timelock_duration: 86400,
             approval_threshold_bps: 6000,
@@ -1656,6 +1836,7 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&42i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action]);
 
@@ -1702,11 +1883,13 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&42i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let action2 = GovernanceAction {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&123i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action1, action2]);
 
@@ -1755,6 +1938,7 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "always_fail"),
             args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action]);
 
@@ -1807,16 +1991,19 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&1i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let action2 = GovernanceAction {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "always_fail"),
             args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
         };
         let action3 = GovernanceAction {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&3i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action1, action2, action3]);
 
@@ -2001,6 +2188,7 @@ mod tests {
             target: mock_id.clone(),
             function: soroban_sdk::Symbol::new(&e, "set_value"),
             args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&999i128, &e)]),
+            protocol_action: ProtocolAction::None,
         };
         let actions = Vec::from_array(&e, [action]);
 
@@ -2038,10 +2226,14 @@ mod tests {
         client.add_member(&admin, &member2);
         client.add_member(&admin, &member3);
 
+        // The built-in action is selected purely by `protocol_action`; the
+        // `target`/`function`/`args` fields are ignored (the function symbol
+        // here is deliberately not the old "emergency_pause" magic string).
         let pause_action = GovernanceAction {
-            target: admin.clone(), // target is ignored for built-in actions
-            function: soroban_sdk::Symbol::new(&e, "emergency_pause"),
+            target: admin.clone(),
+            function: soroban_sdk::Symbol::new(&e, "unused"),
             args: Vec::new(&e),
+            protocol_action: ProtocolAction::EmergencyPause,
         };
         let actions = Vec::from_array(&e, [pause_action]);
 
@@ -2064,6 +2256,51 @@ mod tests {
         client.execute(&member1, &proposal_id);
 
         assert!(client.is_protocol_paused());
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Executed));
+    }
+
+    #[test]
+    fn test_emergency_unpause_action_still_works() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        // Put the protocol into paused state via the admin shortcut.
+        client.emergency_pause(&admin);
+        assert!(client.is_protocol_paused());
+
+        let unpause_action = GovernanceAction {
+            target: admin.clone(), // target is ignored for built-in actions
+            function: soroban_sdk::Symbol::new(&e, "unused"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::EmergencyUnpause,
+        };
+        let actions = Vec::from_array(&e, [unpause_action]);
+
+        let proposal_id = client.propose(
+            &member1,
+            &String::from_str(&e, "Unpause"),
+            &String::from_str(&e, "unpause the protocol"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &proposal_id, &true);
+        client.vote(&member2, &proposal_id, &true);
+
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        client.execute(&member1, &proposal_id);
+
+        assert!(!client.is_protocol_paused());
         let proposal = client.get_proposal(&proposal_id).unwrap();
         assert!(matches!(proposal.status, ProposalStatus::Executed));
     }

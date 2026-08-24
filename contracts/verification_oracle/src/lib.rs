@@ -70,6 +70,11 @@ pub struct VerificationResult {
     /// project token is configured. Distinguishes "credits earned" from
     /// "credits actually minted" (Issue #36).
     pub credits_minted: i128,
+    /// Amount of `total_credits` that was minted to the protocol treasury
+    /// as a fee during finalization. May be `0` when `fee_bps == 0` or
+    /// when the token's `max_supply` cap is exhausted before the fee
+    /// portion is minted. Always `<= total_credits`.
+    pub protocol_fee_minted: i128,
     pub oracle_count: u32,
     pub finalized_at: u64,
 }
@@ -135,6 +140,13 @@ pub struct OracleConfig {
     /// storage load even when the open-projects list lives in persistent
     /// storage (Issue #132). Defaults to 20 in `initialize`.
     pub max_open_windows: u32,
+    /// Protocol fee in basis points applied to every credit mint. When
+    /// credits are minted to a beneficiary during finalization, `fee_bps /
+    /// 10000` of the minted amount is redirected to the protocol treasury
+    /// address. For example, `fee_bps = 500` means 5% of every mint goes
+    /// to the treasury. Bounded to `[0, 10_000]` by `update_config`.
+    /// Defaults to `0` (no fee) in `initialize`.
+    pub fee_bps: u32,
 }
 
 /// Minimum accepted `OracleConfig::window_secs` (1 minute). Rejects
@@ -145,6 +157,28 @@ pub const MIN_WINDOW_SECS: u64 = 60;
 pub const MAX_WINDOW_SECS: u64 = 86_400;
 /// Default hard cap on concurrent open windows (`OracleConfig::max_open_windows`).
 const DEFAULT_MAX_OPEN_WINDOWS: u32 = 20;
+
+/// Hard upper bound on `OracleConfig::max_oracles`, enforced by `update_config`.
+///
+/// This is not only a policy cap: a window can hold at most one submission per
+/// active oracle, and `median_i64` sorts those submissions in a fixed-size
+/// stack buffer of `MEDIAN_BUFFER_LEN` elements. Because `MEDIAN_BUFFER_LEN` is
+/// derived from this constant, raising the cap grows the buffer with it and the
+/// two can never drift apart.
+///
+/// The `update_config` rejection message spells the value out (`"max_oracles
+/// exceeds hard limit (10)"`) because contract panics carry string literals
+/// only; update that message if this constant ever changes.
+pub const MAX_ORACLES_HARD_LIMIT: u32 = 10;
+
+/// Capacity of the stack buffer `median_i64` sorts in — the maximum number of
+/// readings a single window can produce, which is `MAX_ORACLES_HARD_LIMIT`.
+pub const MEDIAN_BUFFER_LEN: usize = MAX_ORACLES_HARD_LIMIT as usize;
+
+/// The median buffer must cover every reading a fully subscribed window can
+/// produce. Breaking that link is a compile error rather than a latent
+/// out-of-bounds write.
+const _: () = assert!(MEDIAN_BUFFER_LEN >= MAX_ORACLES_HARD_LIMIT as usize);
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -228,7 +262,7 @@ pub enum DataKey {
     /// Moved to persistent storage (Issue #132) — loaded on demand rather
     /// than on every invocation as instance storage was.
     OpenProjects,
-    // ── Temporary (window-scoped, can expire after finalization) ──
+    // ── Persistent (window-scoped; markers are cleaned up after finalization) ──
     WindowState(BytesN<32>),
     /// SHA-256 commitment for an oracle's pending reading in the current window.
     Commitment((BytesN<32>, Address)),
@@ -246,10 +280,10 @@ const RESULT_TTL_BUMP: u32 = 63_072_000;
 /// Project config: 1 year.
 const PROJ_CFG_TTL_THRESHOLD: u32 = 6_307_200;
 const PROJ_CFG_TTL_BUMP: u32 = 6_307_200;
-/// Temporary window entries: 7 days (2 × commit + reveal phases, with buffer).
-/// 7 days ≈ 120_960 ledgers at 5 s/ledger.
-const WINDOW_TTL_THRESHOLD: u32 = 120_960;
-const WINDOW_TTL_BUMP: u32 = 120_960;
+/// In-flight window state: 1 year. Persistent storage prevents long commit phases
+/// from expiring before they can transition to Reveal; phase writes refresh this TTL.
+const WINDOW_TTL_THRESHOLD: u32 = 6_307_200;
+const WINDOW_TTL_BUMP: u32 = 6_307_200;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -319,21 +353,26 @@ pub fn sha256_commitment(
 }
 
 /// Compute the median of a `Vec<i64>`. Copies values into a local fixed-size
-/// array (max 10 elements, matching `max_oracles`) and uses an insertion sort
-/// on the stack — zero Soroban host allocations. For the hard config bound of
-/// `max_oracles = 10` this runs at most 45 local comparisons, a dramatic
-/// improvement over the previous O(n²) host-call-based insertion sort.
+/// array of `MEDIAN_BUFFER_LEN` elements and uses an insertion sort on the
+/// stack — zero Soroban host allocations. For the hard config bound of
+/// `max_oracles = MAX_ORACLES_HARD_LIMIT` (10) this runs at most 45 local
+/// comparisons, a dramatic improvement over the previous O(n²) host-call-based
+/// insertion sort.
 ///
 /// Even-length median: `(sorted[n/2-1] + sorted[n/2]) / 2` (Rust integer
 /// division truncates toward zero, matching the historical behaviour).
-/// Compute the median of a `Vec<i64>`. Copies values into a local fixed-size
-/// array (max 10 elements, matching `max_oracles`) and uses an insertion sort
-/// on the stack — zero Soroban host allocations. For the hard config bound of
-/// `max_oracles = 10` this runs at most 45 local comparisons, a dramatic
-/// improvement over the previous O(n²) host-call-based insertion sort.
 ///
-/// Even-length median: `(sorted[n/2-1] + sorted[n/2]) / 2` (Rust integer
-/// division truncates toward zero, matching the historical behaviour).
+/// # Bounds invariant
+/// `values.len()` must not exceed `MEDIAN_BUFFER_LEN`. Callers satisfy this
+/// structurally: a window holds at most one submission per active oracle,
+/// `add_oracle` caps the active set at `OracleConfig::max_oracles`, and
+/// `update_config` caps that at `MAX_ORACLES_HARD_LIMIT` — the value
+/// `MEDIAN_BUFFER_LEN` is derived from. `remove_oracle` also refuses to drop an
+/// oracle that has submissions in an open window, so swapping oracles mid-window
+/// cannot slip an extra reading past that cap. The check below makes the invariant
+/// explicit and self-diagnosing instead of relying on that reasoning holding
+/// forever: an oversized input reverts with a named error rather than an
+/// opaque index panic from the copy loop.
 ///
 /// # Bug fix (fuzz testing)
 /// The previous implementation did `arr[a] + arr[b]` in `i64`, which overflows
@@ -347,9 +386,10 @@ pub fn median_i64(values: &Vec<i64>) -> i64 {
     if n == 0 {
         panic!("median of empty vec");
     }
-    // `max_oracles = 10` is a hard config bound enforced at `add_oracle`,
-    // so `n` is always in [1, 10].
-    let mut arr = [0i64; 10];
+    if n > MEDIAN_BUFFER_LEN {
+        panic!("median input exceeds oracle buffer capacity");
+    }
+    let mut arr = [0i64; MEDIAN_BUFFER_LEN];
     for (i, val) in values.iter().enumerate() {
         arr[i] = val;
     }
@@ -443,10 +483,10 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
     for i in 0..open.len() {
         let pid = open.get(i).unwrap();
         if e.storage()
-            .temporary()
+            .persistent()
             .has(&DataKey::Commitment((pid.clone(), oracle.clone())))
             || e.storage()
-                .temporary()
+                .persistent()
                 .has(&DataKey::OracleRevealed((pid.clone(), oracle.clone())))
         {
             return true;
@@ -457,7 +497,8 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
 
 /// Read the token's `total_supply` and `max_supply` and mint at most
 /// `total_credits` to `beneficiary`, never exceeding the remaining supply
-/// allowance. Returns the amount actually minted.
+/// allowance. Returns the amounts actually minted to the beneficiary and
+/// the protocol treasury.
 ///
 /// This prevents the partial-rollback failure mode described in Issue #36:
 /// calling `mint_to` with `total_credits` when
@@ -471,19 +512,33 @@ fn oracle_has_open_submissions(e: &Env, oracle: &Address) -> bool {
 /// - `max_supply == 0` → token is uncapped; the full `total_credits` is minted.
 /// - `total_supply >= max_supply` → nothing remains; returns `0`, no mint.
 /// - otherwise → mints `min(total_credits, max_supply - total_supply)`.
+///
+/// Mint `total_credits` to the beneficiary and protocol treasury, respecting
+/// the token's `max_supply` cap. Returns `(credits_minted, fee_minted)`:
+///
+/// - `credits_minted` — amount minted to the beneficiary (net of fee).
+/// - `fee_minted` — amount minted to the treasury as a protocol fee.
+///
+/// When `fee_bps == 0` the entire `total_credits` goes to the beneficiary
+/// and `fee_minted == 0`. The fee is computed as
+/// `total_credits * fee_bps / 10_000` and minted separately to the
+/// treasury, so the supply invariant
+/// `total_supply + total_retired + total_burned == ever_minted()` holds.
 fn mint_credits_respecting_cap(
     e: &Env,
     token: &Address,
     beneficiary: &Address,
     total_credits: i128,
-) -> i128 {
+) -> (i128, i128) {
     if total_credits <= 0 {
-        return 0;
+        return (0, 0);
     }
 
+    let config: OracleConfig = read_config(e);
     let total_supply: i128 = e.invoke_contract(token, &Symbol::new(e, "total_supply"), vec![e]);
     let max_supply: i128 = e.invoke_contract(token, &Symbol::new(e, "max_supply"), vec![e]);
 
+    // Compute how many credits are mintable given the token cap.
     let mintable = if max_supply > 0 {
         let remaining = max_supply - total_supply;
         if remaining <= 0 {
@@ -496,17 +551,44 @@ fn mint_credits_respecting_cap(
     };
 
     if mintable <= 0 {
-        return 0;
+        return (0, 0);
     }
 
-    let mint_args: Vec<Val> = vec![
-        e,
-        e.current_contract_address().to_val(),
-        beneficiary.to_val(),
-        mintable.into_val(e),
-    ];
-    e.invoke_contract::<()>(token, &Symbol::new(e, "mint_to"), mint_args);
-    mintable
+    // Split mintable credits between beneficiary and treasury.
+    // fee = floor(mintable * fee_bps / 10_000); net = mintable - fee.
+    let fee: i128 = if config.fee_bps > 0 {
+        mintable
+            .checked_mul(config.fee_bps as i128)
+            .unwrap_or_else(|| panic!("fee overflow"))
+            / 10_000
+    } else {
+        0
+    };
+    let net = mintable - fee;
+
+    // Mint net credits to the beneficiary.
+    if net > 0 {
+        let mint_args: Vec<Val> = vec![
+            e,
+            e.current_contract_address().to_val(),
+            beneficiary.to_val(),
+            net.into_val(e),
+        ];
+        e.invoke_contract::<()>(token, &Symbol::new(e, "mint_to"), mint_args);
+    }
+
+    // Mint fee credits to the protocol treasury.
+    if fee > 0 {
+        let fee_args: Vec<Val> = vec![
+            e,
+            e.current_contract_address().to_val(),
+            config.treasury.to_val(),
+            fee.into_val(e),
+        ];
+        e.invoke_contract::<()>(token, &Symbol::new(e, "mint_to"), fee_args);
+    }
+
+    (net, fee)
 }
 
 /// Reject sensor readings that are structurally valid `i64` values but physically
@@ -756,6 +838,7 @@ impl VerificationOracle {
             // existing deployments see no change in credit amounts.
             window_secs: 3600,
             max_open_windows: DEFAULT_MAX_OPEN_WINDOWS,
+            fee_bps: 0,
         };
         e.storage().instance().set(&DataKey::Config, &config);
 
@@ -831,7 +914,10 @@ impl VerificationOracle {
     }
 
     /// Remove an oracle from the whitelist. Must maintain at least min_oracles.
-    /// The oracle must have zero stake (fully unstaked) before removal.
+    /// The oracle must have zero stake (fully unstaked) before removal, unless
+    /// it has fallen below the configured minimum stake. This lets an admin
+    /// remove a slashed oracle that can no longer submit, without first
+    /// slashing its remaining collateral to zero.
     pub fn remove_oracle(e: Env, admin: Address, oracle: Address) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -853,11 +939,12 @@ impl VerificationOracle {
                 amount: 0,
                 unstake_request: None,
             });
-        if stake_info.amount > 0 {
-            panic!("oracle must unstake before removal");
-        }
         let count: u32 = e.storage().instance().get(&DataKey::OracleCount).unwrap();
         let config: OracleConfig = read_config(&e);
+        let below_minimum_stake = config.min_stake > 0 && stake_info.amount < config.min_stake;
+        if stake_info.amount > 0 && !below_minimum_stake {
+            panic!("oracle must unstake before removal");
+        }
         if count <= config.min_oracles {
             panic!("minimum oracles required");
         }
@@ -924,7 +1011,260 @@ impl VerificationOracle {
         _total_nitrogen: i64,
         _total_phosphorus: i64,
     ) -> Option<VerificationResult> {
-        panic!("submit_reading has been removed (Issue #155): use commit_reading + reveal_reading");
+        Self::submit_reading_impl(
+            e,
+            oracle,
+            project_id,
+            nonce,
+            ph,
+            turbidity,
+            dissolved_oxygen,
+            flow_rate,
+            temperature,
+            total_nitrogen,
+            total_phosphorus,
+        )
+    }
+
+    fn submit_reading_impl(
+        e: Env,
+        oracle: Address,
+        project_id: BytesN<32>,
+        nonce: u64,
+        ph: i64,
+        turbidity: i64,
+        dissolved_oxygen: i64,
+        flow_rate: i64,
+        temperature: i64,
+        total_nitrogen: i64,
+        total_phosphorus: i64,
+    ) -> Option<VerificationResult> {
+        oracle.require_auth();
+
+        if !e
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleActive(oracle.clone()))
+            .unwrap_or(false)
+        {
+            panic!("oracle not active");
+        }
+
+        let config: OracleConfig = read_config(&e);
+        if config.min_stake > 0 {
+            let stake_info: StakeInfo = e
+                .storage()
+                .persistent()
+                .get(&DataKey::OracleStake(oracle.clone()))
+                .unwrap_or(StakeInfo {
+                    amount: 0,
+                    unstake_request: None,
+                });
+            if stake_info.amount < config.min_stake {
+                panic!("insufficient stake");
+            }
+        }
+
+        validate_sensor_reading(
+            ph,
+            flow_rate,
+            total_nitrogen,
+            total_phosphorus,
+            dissolved_oxygen,
+            turbidity,
+            temperature,
+        );
+
+        let nonce_key = DataKey::OracleNonce((project_id.clone(), oracle.clone()));
+        let expected_nonce: u64 = e.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
+        if nonce != expected_nonce {
+            panic!("invalid nonce");
+        }
+        e.storage().persistent().set(&nonce_key, &nonce);
+        e.storage()
+            .persistent()
+            .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+
+        // Track raw accepted submissions globally. Per-oracle contribution
+        // counters advance only if this window successfully finalizes.
+        let total: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSubmissions)
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalSubmissions, &(total + 1));
+
+        // Prevent duplicate oracle per window (persistent window-scoped storage)
+        let submitted_key = DataKey::OracleSubmitted(project_id.clone(), oracle.clone());
+        if e.storage().persistent().has(&submitted_key) {
+            panic!("oracle already submitted for this window");
+        }
+
+        let window_key = DataKey::WindowState(project_id.clone());
+        let mut window: WindowState =
+            e.storage()
+                .persistent()
+                .get(&window_key)
+                .unwrap_or(WindowState {
+                    phase: WindowPhase::Reveal,
+                    opened_at: e.ledger().timestamp(),
+                    reveal_opened_ledger: 0,
+                    submissions: Vec::new(&e),
+                    finalized: false,
+                });
+
+        if window.finalized {
+            panic!("window already finalized");
+        }
+
+        add_open_project(&e, &project_id, config.max_open_windows);
+
+        let timestamp = e.ledger().timestamp();
+
+        let submission = ReadingSubmission {
+            oracle: oracle.clone(),
+            nonce,
+            timestamp,
+            ph,
+            turbidity,
+            dissolved_oxygen,
+            flow_rate,
+            temperature,
+            total_nitrogen,
+            total_phosphorus,
+        };
+
+        window.submissions.push_back(submission);
+        e.storage().persistent().set(&window_key, &window);
+        e.storage()
+            .persistent()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
+
+        e.storage().persistent().set(&submitted_key, &true);
+        e.storage()
+            .persistent()
+            .extend_ttl(&submitted_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
+
+        if window.submissions.len() >= config.min_oracles {
+            let subs = &window.submissions;
+            let n_subs = subs.len();
+
+            let mut ph_vals: Vec<i64> = Vec::new(&e);
+            let mut turb_vals: Vec<i64> = Vec::new(&e);
+            let mut do_vals: Vec<i64> = Vec::new(&e);
+            let mut temp_vals: Vec<i64> = Vec::new(&e);
+            let mut flow_vals: Vec<i64> = Vec::new(&e);
+            let mut n_vals: Vec<i64> = Vec::new(&e);
+            let mut p_vals: Vec<i64> = Vec::new(&e);
+            for k in 0..n_subs {
+                let s = subs.get(k).unwrap();
+                ph_vals.push_back(s.ph);
+                turb_vals.push_back(s.turbidity);
+                do_vals.push_back(s.dissolved_oxygen);
+                temp_vals.push_back(s.temperature);
+                flow_vals.push_back(s.flow_rate);
+                n_vals.push_back(s.total_nitrogen);
+                p_vals.push_back(s.total_phosphorus);
+            }
+
+            let med_ph = median_i64(&ph_vals);
+            let med_turb = median_i64(&turb_vals);
+            let med_do = median_i64(&do_vals);
+            let med_temp = median_i64(&temp_vals);
+            let med_flow = median_i64(&flow_vals);
+            let med_n = median_i64(&n_vals);
+            let med_p = median_i64(&p_vals);
+
+            // Per-project baselines via shared helper (doc/MATH.md §1).
+            let (baseline_n, baseline_p, baseline_temp) = resolve_baselines(&e, &project_id);
+
+            let fin = compute_finalization(
+                &config,
+                med_ph,
+                med_turb,
+                med_do,
+                med_temp,
+                med_flow,
+                med_n,
+                med_p,
+                baseline_n,
+                baseline_p,
+                baseline_temp,
+                config.window_secs,
+            );
+
+            let mut result = VerificationResult {
+                project_id: project_id.clone(),
+                n_removal_kg: fin.n_removed,
+                p_removal_kg: fin.p_removed,
+                quality_penalty: fin.penalty,
+                volumetric_credit: fin.volumetric_credit,
+                total_credits: fin.total,
+                credits_minted: 0,
+                protocol_fee_minted: 0,
+                oracle_count: window.submissions.len(),
+                finalized_at: e.ledger().timestamp(),
+            };
+
+            // Mint credits to the beneficiary, clamped to the token's
+            // max_supply cap. This runs BEFORE the result is persisted so that
+            // `credits_minted` is recorded accurately and so a cap breach can
+            // never roll back finalization (Issue #36). If no project token is
+            // configured, or the cap is already exhausted, no mint occurs and
+            // the window still finalizes cleanly.
+            let cfg_key = DataKey::ProjectConfig(project_id.clone());
+            if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
+                let (net, fee) = mint_credits_respecting_cap(
+                    &e,
+                    &config.token_contract,
+                    &config.beneficiary,
+                    result.total_credits,
+                );
+                result.credits_minted = net;
+                result.protocol_fee_minted = fee;
+            }
+
+            // Persist last result
+            let last_key = DataKey::LastResult(project_id.clone());
+            e.storage().persistent().set(&last_key, &result);
+            e.storage()
+                .persistent()
+                .extend_ttl(&last_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+
+            // Append to paginated history
+            let count_key = DataKey::ResultCount(project_id.clone());
+            let hist_pos: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
+            let hist_key = DataKey::ResultAt(project_id.clone(), hist_pos);
+            e.storage().persistent().set(&hist_key, &result);
+            e.storage()
+                .persistent()
+                .extend_ttl(&hist_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+            e.storage().persistent().set(&count_key, &(hist_pos + 1));
+            e.storage()
+                .persistent()
+                .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+
+            record_finalized_contributions(&e, &window.submissions);
+
+            window.finalized = true;
+            e.storage().persistent().set(&window_key, &window);
+            e.storage()
+                .persistent()
+                .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
+
+            remove_open_project(&e, &project_id);
+
+            e.events().publish(
+                (Symbol::new(&e, "rdng_vrfy_ds"),),
+                (project_id, result.clone()),
+            );
+
+            Some(result)
+        } else {
+            None
+        }
     }
 
     /// Configure the credit token contract and beneficiary for a project.
@@ -1085,16 +1425,17 @@ impl VerificationOracle {
         if !(MIN_WINDOW_SECS..=MAX_WINDOW_SECS).contains(&config.window_secs) {
             panic!("window_secs out of valid range [60, 86400]");
         }
-        // `median_i64` uses a fixed ten-element buffer, and finalization
-        // requires at least one oracle. Reject internally inconsistent bounds
-        // before comparing the requested quorum with the live oracle count.
+        // Finalization requires at least one oracle, and `median_i64` sorts a
+        // window's readings in a buffer sized to `MAX_ORACLES_HARD_LIMIT`.
+        // Reject internally inconsistent bounds before comparing the requested
+        // quorum with the live oracle count.
         if config.min_oracles == 0 {
             panic!("min_oracles must be at least 1");
         }
         if config.min_oracles > config.max_oracles {
             panic!("min_oracles exceeds max_oracles");
         }
-        if config.max_oracles > 10 {
+        if config.max_oracles > MAX_ORACLES_HARD_LIMIT {
             panic!("max_oracles exceeds hard limit (10)");
         }
         // Preserve the quorum invariant: configuration cannot require more
@@ -1113,6 +1454,9 @@ impl VerificationOracle {
         if config.max_open_windows == 0 {
             panic!("max_open_windows must be at least 1");
         }
+        if config.fee_bps > 10_000 {
+            panic!("fee_bps exceeds max (10000 = 100%)");
+        }
         e.storage().instance().set(&DataKey::Config, &config);
     }
 
@@ -1128,7 +1472,7 @@ impl VerificationOracle {
         }
 
         let window_key = DataKey::WindowState(project_id.clone());
-        let window: Option<WindowState> = e.storage().temporary().get(&window_key);
+        let window: Option<WindowState> = e.storage().persistent().get(&window_key);
 
         if window.is_none() {
             panic!("no window found for project");
@@ -1139,15 +1483,15 @@ impl VerificationOracle {
         // Remove OracleSubmitted markers for all submissions in this window
         for i in 0..window.submissions.len() {
             let sub = window.submissions.get(i).unwrap();
-            e.storage().temporary().remove(&DataKey::Commitment((
+            e.storage().persistent().remove(&DataKey::Commitment((
                 project_id.clone(),
                 sub.oracle.clone(),
             )));
-            e.storage().temporary().remove(&DataKey::OracleRevealed((
+            e.storage().persistent().remove(&DataKey::OracleRevealed((
                 project_id.clone(),
                 sub.oracle.clone(),
             )));
-            e.storage().temporary().remove(&DataKey::OracleSubmitted(
+            e.storage().persistent().remove(&DataKey::OracleSubmitted(
                 project_id.clone(),
                 sub.oracle.clone(),
             ));
@@ -1165,13 +1509,13 @@ impl VerificationOracle {
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
             e.storage()
-                .temporary()
+                .persistent()
                 .remove(&DataKey::Commitment((project_id.clone(), oracle.clone())));
-            e.storage().temporary().remove(&DataKey::OracleRevealed((
+            e.storage().persistent().remove(&DataKey::OracleRevealed((
                 project_id.clone(),
                 oracle.clone(),
             )));
-            e.storage().temporary().remove(&DataKey::OracleSubmitted(
+            e.storage().persistent().remove(&DataKey::OracleSubmitted(
                 project_id.clone(),
                 oracle.clone(),
             ));
@@ -1185,9 +1529,9 @@ impl VerificationOracle {
             submissions: Vec::new(&e),
             finalized: false,
         };
-        e.storage().temporary().set(&window_key, &fresh);
+        e.storage().persistent().set(&window_key, &fresh);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
     }
 
@@ -1196,7 +1540,7 @@ impl VerificationOracle {
     pub fn window_submission_count(e: Env, project_id: BytesN<32>) -> u32 {
         let window: Option<WindowState> = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&DataKey::WindowState(project_id));
         match window {
             None => 0,
@@ -1438,7 +1782,7 @@ impl VerificationOracle {
         }
 
         let window_key = DataKey::WindowState(project_id.clone());
-        let existing: Option<WindowState> = e.storage().temporary().get(&window_key);
+        let existing: Option<WindowState> = e.storage().persistent().get(&window_key);
         match existing {
             Some(ref w) if !w.finalized => panic!("window already active"),
             _ => {}
@@ -1451,9 +1795,9 @@ impl VerificationOracle {
             submissions: Vec::new(&e),
             finalized: false,
         };
-        e.storage().temporary().set(&window_key, &window);
+        e.storage().persistent().set(&window_key, &window);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         add_open_project(&e, &project_id, read_config(&e).max_open_windows);
@@ -1465,7 +1809,7 @@ impl VerificationOracle {
     pub fn get_window_phase(e: Env, project_id: BytesN<32>) -> Option<WindowPhase> {
         let window: Option<WindowState> = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&DataKey::WindowState(project_id));
         window.map(|w| w.phase)
     }
@@ -1514,7 +1858,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -1526,7 +1870,7 @@ impl VerificationOracle {
         }
 
         let commit_key = DataKey::Commitment((project_id.clone(), oracle.clone()));
-        if e.storage().temporary().has(&commit_key) {
+        if e.storage().persistent().has(&commit_key) {
             panic!("oracle already committed");
         }
 
@@ -1535,7 +1879,7 @@ impl VerificationOracle {
             .persistent()
             .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
 
-        e.storage().temporary().set(
+        e.storage().persistent().set(
             &commit_key,
             &CommitInfo {
                 commitment: commitment.clone(),
@@ -1543,8 +1887,13 @@ impl VerificationOracle {
             },
         );
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&commit_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
+        // A commit is an in-flight phase transition: refresh the window as
+        // well as the commitment so a long commit phase cannot lose state.
+        e.storage()
+            .persistent()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         e.events()
             .publish((EVENT_ORACLE_COMMITTED,), (oracle, project_id, commitment));
@@ -1556,7 +1905,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -1587,7 +1936,7 @@ impl VerificationOracle {
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
             if e.storage()
-                .temporary()
+                .persistent()
                 .has(&DataKey::Commitment((project_id.clone(), oracle)))
             {
                 has_commit = true;
@@ -1601,9 +1950,9 @@ impl VerificationOracle {
         let mut window = window;
         window.phase = WindowPhase::Reveal;
         window.reveal_opened_ledger = e.ledger().sequence();
-        e.storage().temporary().set(&window_key, &window);
+        e.storage().persistent().set(&window_key, &window);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
     }
 
@@ -1644,7 +1993,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let mut window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -1666,7 +2015,7 @@ impl VerificationOracle {
         let commit_key = DataKey::Commitment((project_id.clone(), oracle.clone()));
         let commit_info: CommitInfo = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&commit_key)
             .expect("oracle did not commit");
 
@@ -1675,7 +2024,7 @@ impl VerificationOracle {
         }
 
         let reveal_key = DataKey::OracleRevealed((project_id.clone(), oracle.clone()));
-        if e.storage().temporary().has(&reveal_key) {
+        if e.storage().persistent().has(&reveal_key) {
             panic!("oracle already revealed");
         }
 
@@ -1733,14 +2082,14 @@ impl VerificationOracle {
         };
 
         window.submissions.push_back(submission);
-        e.storage().temporary().set(&window_key, &window);
+        e.storage().persistent().set(&window_key, &window);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
-        e.storage().temporary().set(&reveal_key, &true);
+        e.storage().persistent().set(&reveal_key, &true);
         e.storage()
-            .temporary()
+            .persistent()
             .extend_ttl(&reveal_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         e.events()
@@ -1760,7 +2109,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -1796,8 +2145,8 @@ impl VerificationOracle {
             let commit_key = DataKey::Commitment((project_id.clone(), oracle.clone()));
             let reveal_key = DataKey::OracleRevealed((project_id.clone(), oracle.clone()));
 
-            let committed = e.storage().temporary().has(&commit_key);
-            let revealed = e.storage().temporary().has(&reveal_key);
+            let committed = e.storage().persistent().has(&commit_key);
+            let revealed = e.storage().persistent().has(&reveal_key);
 
             if committed && !revealed {
                 // Increment missed reveals counter
@@ -1863,8 +2212,8 @@ impl VerificationOracle {
                     }
                 }
 
-                // Clean up commitment from temporary storage
-                e.storage().temporary().remove(&commit_key);
+                // Clean up the persisted commitment
+                e.storage().persistent().remove(&commit_key);
             }
         }
     }
@@ -1875,7 +2224,7 @@ impl VerificationOracle {
         let window_key = DataKey::WindowState(project_id.clone());
         let mut window: WindowState = e
             .storage()
-            .temporary()
+            .persistent()
             .get(&window_key)
             .expect("no window open");
 
@@ -1942,6 +2291,7 @@ impl VerificationOracle {
             volumetric_credit: fin.volumetric_credit,
             total_credits: fin.total,
             credits_minted: 0,
+            protocol_fee_minted: 0,
             oracle_count: window.submissions.len(),
             finalized_at: e.ledger().timestamp(),
         };
@@ -1951,12 +2301,14 @@ impl VerificationOracle {
         // `credits_minted` is recorded accurately.
         let cfg_key = DataKey::ProjectConfig(project_id.clone());
         if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
-            result.credits_minted = mint_credits_respecting_cap(
+            let (net, fee) = mint_credits_respecting_cap(
                 &e,
                 &config.token_contract,
                 &config.beneficiary,
                 result.total_credits,
             );
+            result.credits_minted = net;
+            result.protocol_fee_minted = fee;
         }
 
         // Persist last result
@@ -1983,8 +2335,11 @@ impl VerificationOracle {
 
         window.finalized = true;
         window.phase = WindowPhase::Finalized;
-        // Write finalized state back; window will naturally expire via TTL
-        e.storage().temporary().set(&window_key, &window);
+        // Persist the finalized state and refresh its retention TTL.
+        e.storage().persistent().set(&window_key, &window);
+        e.storage()
+            .persistent()
+            .extend_ttl(&window_key, WINDOW_TTL_THRESHOLD, WINDOW_TTL_BUMP);
 
         remove_open_project(&e, &project_id);
 
@@ -1997,9 +2352,9 @@ impl VerificationOracle {
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
             e.storage()
-                .temporary()
+                .persistent()
                 .remove(&DataKey::Commitment((project_id.clone(), oracle.clone())));
-            e.storage().temporary().remove(&DataKey::OracleRevealed((
+            e.storage().persistent().remove(&DataKey::OracleRevealed((
                 project_id.clone(),
                 oracle.clone(),
             )));
@@ -2535,6 +2890,7 @@ mod tests {
             max_slash_amount: i128::MAX,
             window_secs: 1800,
             max_open_windows: 20,
+            fee_bps: 0,
         };
         client.update_config(&admin, &new_config);
 
@@ -3285,6 +3641,62 @@ mod tests {
         assert!(!client.is_oracle_active(&o4));
     }
 
+    #[test]
+    fn test_remove_oracle_slashed_below_min_stake() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 4, 1500);
+        let oracle = oracles.get(3).unwrap();
+        let mut config = client.get_config();
+        config.min_stake = 1000;
+        client.update_config(&admin, &config);
+
+        // Slashing leaves collateral that cannot be unstaked while the oracle
+        // is active, but is insufficient for the oracle to participate.
+        client.slash(&admin, &oracle, &600, &1);
+        assert_eq!(client.get_stake(&oracle).amount, 900);
+
+        // The below-minimum balance is removable without a second slash.
+        client.remove_oracle(&admin, &oracle);
+        assert!(!client.is_oracle_active(&oracle));
+        assert_eq!(client.oracle_count(), 3);
+        assert_eq!(client.get_stake(&oracle).amount, 900);
+    }
+
+    #[test]
+    fn test_remove_slashed_oracle_waits_for_open_submission_cleanup() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 4, 1500);
+        let oracle = oracles.get(3).unwrap();
+        let mut config = client.get_config();
+        config.min_stake = 1000;
+        client.update_config(&admin, &config);
+
+        let project_id = BytesN::from_array(&e, &[0xB4u8; 32]);
+        let salt = BytesN::from_array(&e, &[0xB4u8; 32]);
+        client.open_window(&admin, &project_id);
+        let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracle, &project_id, &1, &commitment);
+        client.slash(&admin, &oracle, &600, &1);
+
+        // A committed reading remains protected until the window is reset or
+        // finalized; removal must not alter an in-flight window.
+        let result = e.try_invoke_contract::<Val, InvokeError>(
+            &client.address,
+            &Symbol::new(&e, "remove_oracle"),
+            vec![&e, admin.to_val(), oracle.to_val()],
+        );
+        assert!(result.is_err());
+        assert!(client.is_oracle_active(&oracle));
+
+        client.reset_window(&admin, &project_id);
+        client.remove_oracle(&admin, &oracle);
+        assert!(!client.is_oracle_active(&oracle));
+    }
+
     // Note: the "insufficient stake blocks participation" case is covered by
     // `test_commit_requires_min_stake` below, against `commit_reading` (the
     // only entry point into a submission round now that `submit_reading` is
@@ -3814,6 +4226,54 @@ mod tests {
     }
 
     #[test]
+    fn test_long_commit_reveal_window_finalizes_without_state_loss() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let mut config = client.get_config();
+        // Exercise a commit period longer than the former seven-day temporary
+        // TTL, followed by the largest configured ledger-based reveal period.
+        config.commit_phase_secs = 7 * 24 * 60 * 60;
+        config.max_reveal_ledgers = 120_960;
+        client.update_config(&admin, &config);
+
+        let project_id = BytesN::from_array(&e, &[122u8; 32]);
+        let salt = BytesN::from_array(&e, &[0xF1u8; 32]);
+        client.open_window(&admin, &project_id);
+        for i in 0..oracles.len() {
+            let oracle = oracles.get(i).unwrap();
+            let commitment = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+            client.commit_reading(&oracle, &project_id, &1, &commitment);
+        }
+
+        // This exceeds the old temporary-storage TTL. The window and every
+        // commitment must still exist when the commit phase is transitioned.
+        let mut info = e.ledger().get();
+        info.timestamp += config.commit_phase_secs;
+        info.sequence_number += 120_961;
+        e.ledger().set(info);
+        client.begin_reveal_phase(&project_id);
+
+        // Drive the reveal phase to its configured upper bound. The final
+        // reveal auto-finalizes and proves the full long-lived lifecycle works.
+        let mut info = e.ledger().get();
+        info.sequence_number += config.max_reveal_ledgers;
+        e.ledger().set(info);
+        let params = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        let mut result = None;
+        for i in 0..oracles.len() {
+            result = client.reveal_reading(&oracles.get(i).unwrap(), &project_id, &params);
+        }
+
+        assert!(result.is_some());
+        assert_eq!(
+            client.get_window_phase(&project_id),
+            Some(WindowPhase::Finalized)
+        );
+    }
+
+    #[test]
     fn test_finalize_window_requires_reveal_duration_elapsed() {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
@@ -4252,7 +4712,7 @@ mod tests {
 
         let mut config = client.get_config();
         config.min_oracles = 1;
-        config.max_oracles = 11;
+        config.max_oracles = MAX_ORACLES_HARD_LIMIT + 1;
         client.update_config(&admin, &config);
     }
 
@@ -4265,12 +4725,12 @@ mod tests {
 
         let mut config = client.get_config();
         config.min_oracles = 1;
-        config.max_oracles = 10;
+        config.max_oracles = MAX_ORACLES_HARD_LIMIT;
         client.update_config(&admin, &config);
 
         let stored = client.get_config();
         assert_eq!(stored.min_oracles, 1);
-        assert_eq!(stored.max_oracles, 10);
+        assert_eq!(stored.max_oracles, MAX_ORACLES_HARD_LIMIT);
     }
 
     // ── Quorum invariant: min_oracles <= oracle_count (Issue #104) ──

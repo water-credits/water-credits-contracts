@@ -68,7 +68,7 @@ This repository contains the **on-chain component** of the Water Quality & Reple
 | `verification_oracle` | **Verifier** — ingests sensor data, validates, computes credits | `commit_reading`, `reveal_reading`, `add_oracle`, `get_config` |
 | `retirement_registry` | **Registry** — immutable record of all credit retirements | `record_retirement`, `get_record`, `total_retired` |
 | `project_registry` | **Directory** — on-chain metadata store for all projects | `register`, `get`, `update_status`, `list_all` |
-| `governance` | **DAO** — protocol parameters, oracle whitelist, multisig | `update_fee`, `propose`, `vote`, `execute` |
+| `governance` | **DAO** — protocol parameters, oracle whitelist, multisig | `propose`, `vote`, `execute` |
 
 ### Design Principles
 
@@ -528,8 +528,6 @@ pub fn initialize(env: Env, admin: Address, multisig_members: Vec<Address>);
 /// Get current protocol configuration.
 pub fn get_config(env: Env) -> GovernanceConfig;
 
-/// Update protocol fee (basis points).
-pub fn update_fee(env: Env, admin: Address, fee_bps: u32);
 
 /// Create a new governance proposal.
 pub fn propose(
@@ -653,7 +651,6 @@ pub struct OracleConfig {
 #[derive(Clone, Debug, PartialEq)]
 #[soroban_sdk::contracttype]
 pub struct GovernanceConfig {
-    pub protocol_fee_bps: u32,         // Fee in basis points (200 = 2%)
     pub min_oracles: u32,              // Minimum confirming oracles
     pub max_supply_per_project: i128,  // Max mintable credits per project
     pub retirement_min_amount: i128,   // Minimum credits per retirement

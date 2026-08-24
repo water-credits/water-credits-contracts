@@ -116,6 +116,7 @@ jobs:
           - retirement_registry
           - project_registry
           - governance
+          - credit_marketplace
     steps:
       - uses: actions/checkout@v4
 

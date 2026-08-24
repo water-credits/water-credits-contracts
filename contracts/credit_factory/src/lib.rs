@@ -279,6 +279,24 @@ impl CreditFactory {
             panic!("unauthorized");
         }
 
+        if let Some(registry_address) = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ProjectRegistry)
+        {
+            let update_args: Vec<Val> = vec![
+                &e,
+                e.current_contract_address().to_val(),
+                project_id.clone().to_val(),
+                status.clone().to_val(),
+            ];
+            e.invoke_contract::<()>(
+                &registry_address,
+                &Symbol::new(&e, "update_status"),
+                update_args,
+            );
+        }
+
         if !is_valid_status(&e, &status) {
             panic!("invalid status");
         }
@@ -334,6 +352,24 @@ impl CreditFactory {
 
         if caller != admin && caller != project.owner {
             panic!("unauthorized");
+        }
+
+        if let Some(registry_address) = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ProjectRegistry)
+        {
+            let update_args: Vec<Val> = vec![
+                &e,
+                e.current_contract_address().to_val(),
+                project_id.clone().to_val(),
+                new_owner.clone().to_val(),
+            ];
+            e.invoke_contract::<()>(
+                &registry_address,
+                &Symbol::new(&e, "update_owner"),
+                update_args,
+            );
         }
 
         let old_owner = project.owner.clone();

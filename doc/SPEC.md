@@ -456,17 +456,18 @@ changes after a timelock. Voting is majority-based with a configurable
 approval threshold.
 
 **Proposal execution.** Each `Proposal` carries a list of `GovernanceAction`
-entries (`target: Address`, `function: Symbol`, `args: Vec<Val>`) and a
-boolean `allow_partial_execution` flag chosen at creation time. On
-`execute()`, once the timelock has elapsed, `governance` dispatches each
-action in order:
+entries (`target: Address`, `function: Symbol`, `args: Vec<Val>`,
+`protocol_action: ProtocolAction`) and a boolean `allow_partial_execution`
+flag chosen at creation time. On `execute()`, once the timelock has elapsed,
+`governance` dispatches each action in order, switching on
+`protocol_action`:
 
-- `function == "emergency_pause"` / `"emergency_unpause"` are handled as
-  built-in protocol actions (pause/unpause every token in `RegisteredTokens`);
-  `target` is ignored for these.
-- Any other `function` is invoked generically via `e.invoke_contract(target,
-  function, args)` (atomic mode) or `e.try_invoke_contract(target, function,
-  args)` (best-effort mode).
+- `ProtocolAction::EmergencyPause` / `ProtocolAction::EmergencyUnpause` are
+  handled as built-in protocol actions (pause/unpause every token in
+  `RegisteredTokens`); `target`, `function` and `args` are ignored for these.
+- `ProtocolAction::None` (the default) is invoked generically via
+  `e.invoke_contract(target, function, args)` (atomic mode) or
+  `e.try_invoke_contract(target, function, args)` (best-effort mode).
 
 **Execution mode.**
 
@@ -542,6 +543,7 @@ admin's control.
 | `TotalSupply` | `i128` | Current circulating supply: ever minted minus burned and retired |
 | `TotalRetired` | `i128` | Ever retired |
 | `TotalBurned` | `i128` | Ever burned via admin `burn()` (initialized to 0) |
+| `EverMinted` | `i128` | Cumulative sum of every `mint_to` / `batch_mint_to` (never decreases; initialized to 0) |
 | `MaxSupply` | `i128` | 0 = uncapped |
 | `Paused` | `bool` | Emergency halt flag |
 | `Name` / `Symbol` / `Decimals` | string/u32 | Token metadata |
@@ -588,11 +590,16 @@ admin's control.
 
 The following properties must hold at all times:
 
-1. **Supply conservation**: `total_supply + total_retired + total_burned == ever_minted`
-   where `ever_minted` is the cumulative sum of all `mint_to` / `batch_mint_to` calls,
+1. **Supply conservation**: `total_supply + total_retired + total_burned == ever_minted()`
+   where `ever_minted()` is the `credit_token` read-only function returning the
+   cumulative sum of every `mint_to` / `batch_mint_to` call (persisted under
+   `DataKey::EverMinted` and incremented with `checked_add`),
    `total_retired` counts credits destroyed via `retire()` (retirement record issued),
    and `total_burned` counts credits destroyed via admin `burn()` (no retirement record).
-   Equivalently: `total_supply == ever_minted - total_retired - total_burned`.
+   Equivalently: `total_supply == ever_minted() - total_retired - total_burned`.
+   `ever_minted()` is the observable reference for this invariant; it never
+   decreases — transfers only move balances, and `retire()` / `burn()` only shift
+   credits from `total_supply` into `total_retired` / `total_burned`.
 2. **No over-mint**: `total_supply <= max_supply` (when max_supply > 0)
 3. **Nonce monotonicity**: `OracleNonce[project_id, oracle]` never decreases
 4. **Window finality**: A finalized window's `finalized = true` is never reverted

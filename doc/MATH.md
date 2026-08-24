@@ -86,8 +86,12 @@ all submissions.
 
 ### Median algorithm (from `median_i64`)
 
-1. Copy the `n` values from the Soroban `Vec<i64>` into a local `[i64; 10]`
-   stack array (bounded by `max_oracles = 10`).
+1. Copy the `n` values from the Soroban `Vec<i64>` into a local
+   `[i64; MEDIAN_BUFFER_LEN]` stack array. `MEDIAN_BUFFER_LEN` is derived from
+   `MAX_ORACLES_HARD_LIMIT` (**10**) — the ceiling `update_config` enforces on
+   `max_oracles` — so the buffer always covers a fully subscribed window (one
+   submission per active oracle). An input longer than the buffer reverts with
+   `median input exceeds oracle buffer capacity` instead of writing past it.
 2. Insertion-sort the local array in-place (zero Soroban host calls; at most
    45 local comparisons for `n = 10`).
 3. If the count is **even**: `median = (arr[n/2 - 1] + arr[n/2]) / 2`  
@@ -316,7 +320,7 @@ admin via `update_config`.
 | `OracleConfig` field | Default | Meaning |
 |---|---|---|
 | `min_oracles` | `3` | Readings required before window finalises |
-| `max_oracles` | `10` | Hard cap on whitelisted oracles |
+| `max_oracles` | `10` | Cap on whitelisted oracles. `update_config` rejects anything above `MAX_ORACLES_HARD_LIMIT` (10), the size of the median buffer in §2 |
 | `quality_threshold_ph` | `600` | Lower end of acceptable pH range (= 6.00) |
 | `quality_threshold_ph_max` | `700` | Upper end of acceptable pH range (= 7.00) |
 | `quality_threshold_turbidity` | `50` | Max acceptable turbidity (= 5.0 NTU) |

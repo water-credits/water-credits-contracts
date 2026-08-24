@@ -67,6 +67,7 @@ fn test_staking_with_real_token() {
         max_slash_amount: 500,
         window_secs: 3600,
         max_open_windows: 20,
+        fee_bps: 0,
     };
     oracle_client.update_config(&admin, &config);
 

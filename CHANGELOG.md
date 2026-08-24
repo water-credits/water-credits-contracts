@@ -45,7 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `governance`: built-in emergency actions are dispatched via the `ProtocolAction` enum (`GovernanceAction::protocol_action`) instead of raw `function` symbol strings. Previously a proposal whose action referenced the documented enum identifier (e.g. `EmergencyPause`) fell through to a generic cross-contract call and silently failed to pause anything, breaking the governance→emergency-pause integration
 - `verification_oracle`: `update_config` now enforces `min_oracles <= oracle_count`, so governance cannot raise the quorum above the current registered oracle count and leave the protocol under-quorum (windows would collect submissions but never finalize)
+- `verification_oracle`: the fixed-size buffer `median_i64` sorts readings in is now derived from an exported `MAX_ORACLES_HARD_LIMIT` (via `MEDIAN_BUFFER_LEN`), checked explicitly at the top of `median_i64`, and tied to the `update_config` cap by a compile-time assertion. Previously the buffer was a literal `[i64; 10]` only implicitly coupled to the `max_oracles > 10` config check, so raising that cap — a natural scaling change — would have fed more readings into the buffer than it holds and made every finalization revert on an opaque out-of-bounds index. No behaviour change at `max_oracles = 10`
 - Duplicate admin set in `governance` initialize
 - Max supply cap enforcement in `credit_token` mint
 - `verification_oracle`: per-oracle submission statistics now count only
@@ -62,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `update_config` now validates `slash_pct_bps <= 5000` (50% max) and `min_slash_amount <= max_slash_amount`
 - **Breaking:** `shared::generate_project_id` dropped its `timestamp` parameter; the derivation is now `SHA-256(count || len(name) || name || len(methodology) || methodology || latitude || longitude || area_hectares)`. Already-registered projects keep their stored IDs; only IDs derived from this point on change. The registration timestamp is still recorded as `ProjectInfo.registration_date` / `ProjectEntry.registered_at`
 - **Breaking:** `compute_finalization` takes a trailing `window_secs: u64` parameter; both in-contract call sites pass `config.window_secs`. Direct callers (tests, off-chain reimplementations) must pass `3600` to preserve the previous behaviour
+- **Breaking:** `GovernanceAction` gains a `protocol_action: ProtocolAction` field. Built-in emergency actions are selected by setting it to `EmergencyPause` / `EmergencyUnpause` (with `target`/`function`/`args` ignored); generic cross-contract actions must set `ProtocolAction::None`. The previous string-based identifiers `"emergency_pause"` / `"emergency_unpause"` in the `function` field are no longer recognized
 
 ### Testing
 
