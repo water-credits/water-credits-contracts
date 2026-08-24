@@ -36,23 +36,28 @@ pub struct ReadingSubmission {
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
+pub struct LegacyProjectConfig {
+    pub token_contract: Address,
+    pub beneficiary: Address,
+    pub baseline_n: i64,
+    pub baseline_p: i64,
+    pub baseline_temp: i64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProjectConfig {
     pub token_contract: Address,
     pub beneficiary: Address,
-    /// Per-project nitrogen baseline (mg/L, raw integer — same encoding as
-    /// `total_nitrogen`; see doc/MATH.md §1). Falls back to the global
-    /// `OracleConfig` default when unset (0).
-    pub baseline_n: i64,
-    /// Per-project phosphorus baseline (mg/L, raw integer — same encoding as
-    /// `total_phosphorus`; see doc/MATH.md §1). Falls back to the global
-    /// `OracleConfig` default when unset (0).
-    pub baseline_p: i64,
-    /// Per-project temperature baseline (×10 °C — same encoding as
-    /// `temperature`; see doc/MATH.md §1). Used as the implicit baseline for the
-    /// temperature quality penalty (compared against the project baseline rather
-    /// than the global `quality_threshold_temp` max threshold). Falls back to the
-    /// global `OracleConfig` default when unset (0).
-    pub baseline_temp: i64,
+    /// Per-project nitrogen baseline (mg/L, raw integer).
+    /// None means unset (falls back to protocol default). Some(0) is explicit zero.
+    pub baseline_n: Option<i64>,
+    /// Per-project phosphorus baseline (mg/L, raw integer).
+    /// None means unset (falls back to protocol default). Some(0) is explicit zero.
+    pub baseline_p: Option<i64>,
+    /// Per-project temperature baseline (×10 °C).
+    /// None means unset (falls back to protocol default). Some(0) is explicit zero.
+    pub baseline_temp: Option<i64>,
 }
 
 #[contracttype]
@@ -253,6 +258,7 @@ pub enum DataKey {
     /// Per-project result count, used for paginated history
     ResultCount(BytesN<32>),
     ProjectConfig(BytesN<32>),
+    ProjectConfigV2(BytesN<32>),
     OracleSubmitCount(Address),
     OracleFinalizedCount(Address),
     OracleStake(Address),
@@ -291,6 +297,26 @@ fn has_admin(e: &Env) -> bool {
 
 fn read_admin(e: &Env) -> Address {
     e.storage().instance().get(&DataKey::Admin).unwrap()
+}
+
+
+fn read_project_config(e: &Env, project_id: &BytesN<32>) -> Option<ProjectConfig> {
+    let v2_key = DataKey::ProjectConfigV2(project_id.clone());
+    if let Some(pc) = e.storage().persistent().get::<_, ProjectConfig>(&v2_key) {
+        return Some(pc);
+    }
+    
+    let v1_key = DataKey::ProjectConfig(project_id.clone());
+    if let Some(legacy) = e.storage().persistent().get::<_, LegacyProjectConfig>(&v1_key) {
+        return Some(ProjectConfig {
+            token_contract: legacy.token_contract,
+            beneficiary: legacy.beneficiary,
+            baseline_n: if legacy.baseline_n != 0 { Some(legacy.baseline_n) } else { None },
+            baseline_p: if legacy.baseline_p != 0 { Some(legacy.baseline_p) } else { None },
+            baseline_temp: if legacy.baseline_temp != 0 { Some(legacy.baseline_temp) } else { None },
+        });
+    }
+    None
 }
 
 fn read_config(e: &Env) -> OracleConfig {
@@ -653,20 +679,28 @@ pub fn resolve_baselines(e: &Env, project_id: &BytesN<32>) -> (i128, i128, i128)
     let default_p: i128 = 2;
     let default_temp: i128 = 300;
 
-    let key = DataKey::ProjectConfig(project_id.clone());
-    let proj_cfg: Option<ProjectConfig> = e.storage().persistent().get(&key);
+    let proj_cfg = read_project_config(e, project_id);
 
     let baseline_n = match proj_cfg {
-        Some(ref pc) if pc.baseline_n != 0 => pc.baseline_n as i128,
-        _ => default_n,
+        Some(ref pc) => match pc.baseline_n {
+            Some(v) => v as i128,
+            None => default_n,
+        },
+        None => default_n,
     };
     let baseline_p = match proj_cfg {
-        Some(ref pc) if pc.baseline_p != 0 => pc.baseline_p as i128,
-        _ => default_p,
+        Some(ref pc) => match pc.baseline_p {
+            Some(v) => v as i128,
+            None => default_p,
+        },
+        None => default_p,
     };
     let baseline_temp = match proj_cfg {
-        Some(ref pc) if pc.baseline_temp != 0 => pc.baseline_temp as i128,
-        _ => default_temp,
+        Some(ref pc) => match pc.baseline_temp {
+            Some(v) => v as i128,
+            None => default_temp,
+        },
+        None => default_temp,
     };
 
     (baseline_n, baseline_p, baseline_temp)
@@ -1207,8 +1241,7 @@ impl VerificationOracle {
             // never roll back finalization (Issue #36). If no project token is
             // configured, or the cap is already exhausted, no mint occurs and
             // the window still finalizes cleanly.
-            let cfg_key = DataKey::ProjectConfig(project_id.clone());
-            if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
+            if let Some(config) = read_project_config(&e, &project_id) {
                 let (net, fee) = mint_credits_respecting_cap(
                     &e,
                     &config.token_contract,
@@ -1274,9 +1307,9 @@ impl VerificationOracle {
         project_id: BytesN<32>,
         token_contract: Address,
         beneficiary: Address,
-        baseline_n: i64,
-        baseline_p: i64,
-        baseline_temp: i64,
+        baseline_n: Option<i64>,
+        baseline_p: Option<i64>,
+        baseline_temp: Option<i64>,
     ) {
         admin.require_auth();
         let stored: Address = read_admin(&e);
@@ -1290,7 +1323,7 @@ impl VerificationOracle {
             baseline_p,
             baseline_temp,
         };
-        let key = DataKey::ProjectConfig(project_id);
+        let key = DataKey::ProjectConfigV2(project_id);
         e.storage().persistent().set(&key, &config);
         e.storage()
             .persistent()
@@ -1299,14 +1332,25 @@ impl VerificationOracle {
 
     /// Get the project config (token contract and beneficiary) for a project.
     pub fn get_project_config(e: Env, project_id: BytesN<32>) -> Option<ProjectConfig> {
-        let key = DataKey::ProjectConfig(project_id);
-        let result: Option<ProjectConfig> = e.storage().persistent().get(&key);
-        if result.is_some() {
-            e.storage()
-                .persistent()
-                .extend_ttl(&key, PROJ_CFG_TTL_THRESHOLD, PROJ_CFG_TTL_BUMP);
+        let v2_key = DataKey::ProjectConfigV2(project_id.clone());
+        if let Some(pc) = e.storage().persistent().get::<_, ProjectConfig>(&v2_key) {
+            e.storage().persistent().extend_ttl(&v2_key, PROJ_CFG_TTL_THRESHOLD, PROJ_CFG_TTL_BUMP);
+            return Some(pc);
         }
-        result
+        
+        let v1_key = DataKey::ProjectConfig(project_id.clone());
+        if let Some(legacy) = e.storage().persistent().get::<_, LegacyProjectConfig>(&v1_key) {
+            e.storage().persistent().extend_ttl(&v1_key, PROJ_CFG_TTL_THRESHOLD, PROJ_CFG_TTL_BUMP);
+            return Some(ProjectConfig {
+                token_contract: legacy.token_contract,
+                beneficiary: legacy.beneficiary,
+                baseline_n: if legacy.baseline_n != 0 { Some(legacy.baseline_n) } else { None },
+                baseline_p: if legacy.baseline_p != 0 { Some(legacy.baseline_p) } else { None },
+                baseline_temp: if legacy.baseline_temp != 0 { Some(legacy.baseline_temp) } else { None },
+            });
+        }
+        
+        None
     }
 
     /// Get the last verification result for a project. Returns None if no window has been finalized.
@@ -2292,8 +2336,7 @@ impl VerificationOracle {
         // Mint credits to the beneficiary, clamped to the token's max_supply cap
         // (see Issue #36). Runs before the result is persisted so
         // `credits_minted` is recorded accurately.
-        let cfg_key = DataKey::ProjectConfig(project_id.clone());
-        if let Some(config) = e.storage().persistent().get::<_, ProjectConfig>(&cfg_key) {
+        if let Some(config) = read_project_config(&e, &project_id) {
             let (net, fee) = mint_credits_respecting_cap(
                 &e,
                 &config.token_contract,
@@ -5515,7 +5558,7 @@ mod tests {
         let project_id = BytesN::from_array(&e, &[0xACu8; 32]);
         let token = Address::generate(&e);
         let beneficiary = Address::generate(&e);
-        client.set_project_config(&admin, &project_id, &token, &beneficiary, &50, &10, &250);
+        client.set_project_config(&admin, &project_id, &token, &beneficiary, &Some(50), &Some(10), &Some(250));
 
         let (n, p, temp) = resolve_baselines(&e, &project_id);
         assert_eq!(n, 50);
@@ -5540,7 +5583,7 @@ mod tests {
         let token = Address::generate(&e);
         let beneficiary = Address::generate(&e);
         // All zero baselines → zero-sentinel → defaults.
-        client.set_project_config(&admin, &project_id, &token, &beneficiary, &0, &0, &0);
+        client.set_project_config(&admin, &project_id, &token, &beneficiary, &None, &None, &None);
 
         let (n, p, temp) = resolve_baselines(&e, &project_id);
         assert_eq!(n, 10);
@@ -5566,7 +5609,7 @@ mod tests {
         let token = Address::generate(&e);
         let beneficiary = Address::generate(&e);
         // Only baseline_n is set; others are zero → defaults for those.
-        client.set_project_config(&admin, &project_id, &token, &beneficiary, &50, &0, &0);
+        client.set_project_config(&admin, &project_id, &token, &beneficiary, &Some(50), &None, &None);
 
         let (n, p, temp) = resolve_baselines(&e, &project_id);
         assert_eq!(n, 50);
@@ -5590,9 +5633,9 @@ mod tests {
             &project_id,
             &Address::generate(&e),
             &Address::generate(&e),
-            &50,
-            &10,
-            &300,
+            &Some(50),
+            &Some(10),
+            &Some(300),
         );
 
         let salt = BytesN::from_array(&e, &[0xAFu8; 32]);
