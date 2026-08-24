@@ -1672,11 +1672,13 @@ impl VerificationOracle {
     pub fn get_oracle_nonce(e: Env, project_id: BytesN<32>, oracle: Address) -> u64 {
         let nonce_key = DataKey::OracleNonce((project_id, oracle));
         let expected_nonce = e.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
-        
+
         if e.storage().persistent().has(&nonce_key) {
-            e.storage().persistent().extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+            e.storage()
+                .persistent()
+                .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
         }
-        
+
         expected_nonce
     }
 
