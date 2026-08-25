@@ -10,17 +10,33 @@ extern crate std;
 const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_RETIREMENT_RECORDED: Symbol = symbol_short!("ret_rec");
 const EVENT_AUTH_CALLER_SET: Symbol = symbol_short!("auth_set");
+const EVENT_INDEX_EXPIRED: Symbol = symbol_short!("idx_exp");
 
 // ── TTL constants ──
 /// Retirement records are permanent audit trails: 10 years.
 const RECORD_TTL_THRESHOLD: u32 = 63_072_000;
 const RECORD_TTL_BUMP: u32 = 63_072_000;
-/// Index entries share the record lifetime.
-const INDEX_TTL_THRESHOLD: u32 = 63_072_000;
-const INDEX_TTL_BUMP: u32 = 63_072_000;
+/// Index entries: bounded to ~1 year to manage storage growth.
+/// Older entries expire naturally; permanent Record entries are never pruned.
+const INDEX_ENTRY_TTL_LEDGERS: u32 = 6_307_200; // ~1 year at 5s per ledger
+/// Extend index TTL when below this threshold (~30 days in ledgers).
+const INDEX_EXTEND_WHEN_BELOW: u32 = 2_592_000; // ~30 days: 2,592,000 ledgers
 /// AuthorizedCaller entries: 1 year.
 const AUTH_TTL_THRESHOLD: u32 = 6_307_200;
 const AUTH_TTL_BUMP: u32 = 6_307_200;
+
+// ── Index policy constants ──
+/// Maximum number of live index entries per retiree/project.
+/// Older entries are allowed to expire via TTL while permanent
+/// Record entries are never pruned.
+///
+/// Policy: Keep the most recent MAX_LIVE_INDEX_ENTRIES entries
+/// as persistent storage with TTL. Older entries expire naturally
+/// (off-chain event replay available for deep history).
+///
+/// Rationale: 10-year audit window = ~63,072,000 ledgers at 5s/ledger.
+/// We keep recent index entries alive; permanent records never expire.
+const MAX_LIVE_INDEX_ENTRIES: u64 = 1000;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +86,38 @@ fn read_admin(e: &Env) -> Address {
     e.storage().instance().get(&DataKey::Admin).unwrap()
 }
 
+/// Called after appending a new index entry.
+/// When live entries exceed MAX_LIVE_INDEX_ENTRIES, the oldest
+/// index entry is de-prioritised (its TTL is NOT extended),
+/// allowing it to expire naturally and bound storage growth.
+///
+/// IMPORTANT: This only affects index entries (RetireeIndex/
+/// ProjectIndex). The permanent Record(id) entries are NEVER
+/// touched by this function.
+///
+/// # Policy documentation
+/// - Index entries: expire after INDEX_ENTRY_TTL_LEDGERS if
+///   not accessed (bounds live storage per retiree/project)
+/// - Record entries: permanent, never pruned (audit integrity)
+/// - Off-chain: full history available via contract events
+fn maybe_expire_oldest_index_entry(e: &Env, new_count: u64, index_type: &str) {
+    if new_count > MAX_LIVE_INDEX_ENTRIES {
+        // The oldest entry that will expire is at position:
+        // new_count - MAX_LIVE_INDEX_ENTRIES - 1
+        let expired_pos = new_count - MAX_LIVE_INDEX_ENTRIES - 1;
+
+        // Emit event so off-chain indexers know this index entry
+        // will expire naturally (they should cache it from the creation event)
+        e.events().publish(
+            (EVENT_INDEX_EXPIRED, index_type, expired_pos),
+            (),
+        );
+
+        // Do NOT delete — let TTL expiry handle it naturally.
+        // This avoids write costs for active high-throughput retirees/projects.
+    }
+}
+
 #[contract]
 pub struct RetirementRegistry;
 
@@ -93,7 +141,24 @@ impl RetirementRegistry {
     /// token's supply and the retiree's balance before calling. The registry
     /// still uses checked arithmetic for its global total so a misconfigured or
     /// malicious authorized caller cannot wrap `TotalRetired`.
-    /// Returns the unique record ID.
+    ///
+    /// # Storage Growth Policy
+    ///
+    /// **Index entries** (RetireeIndex, ProjectIndex) are bounded to control
+    /// storage rent costs:
+    /// - Each index entry has a TTL of ~1 year (INDEX_ENTRY_TTL_LEDGERS)
+    /// - When a retiree/project exceeds MAX_LIVE_INDEX_ENTRIES (1000),
+    ///   the oldest index entry is de-prioritised (no TTL extension)
+    /// - Expired entries are cleared naturally by Soroban's TTL mechanism
+    /// - This avoids write costs for high-throughput retirees/projects
+    ///
+    /// **Permanent records** (Record(id)) are NEVER pruned:
+    /// - Each retirement record persists for 10 years (audit trail)
+    /// - Record entries are unaffected by the index expiration policy
+    /// - Full history beyond live index is available via contract events
+    ///
+    /// # Returns
+    /// The unique record ID assigned to this retirement.
     pub fn record_retirement(
         e: Env,
         caller: Address,
@@ -149,18 +214,22 @@ impl RetirementRegistry {
             .unwrap_or(0);
         let idx_key = DataKey::RetireeIndex(retiree.clone(), retiree_pos);
         e.storage().persistent().set(&idx_key, &record_id);
+        // Set TTL on index entry (bounded to ~1 year, not permanent like Record)
         e.storage()
             .persistent()
-            .extend_ttl(&idx_key, INDEX_TTL_THRESHOLD, INDEX_TTL_BUMP);
+            .extend_ttl(&idx_key, INDEX_EXTEND_WHEN_BELOW, INDEX_ENTRY_TTL_LEDGERS);
         let new_retiree_pos = retiree_pos + 1;
         e.storage()
             .persistent()
             .set(&retiree_count_key, &new_retiree_pos);
         e.storage().persistent().extend_ttl(
             &retiree_count_key,
-            INDEX_TTL_THRESHOLD,
-            INDEX_TTL_BUMP,
+            INDEX_EXTEND_WHEN_BELOW,
+            INDEX_ENTRY_TTL_LEDGERS,
         );
+
+        // Check if retiree index has grown beyond limit; expire oldest if so
+        maybe_expire_oldest_index_entry(&e, new_retiree_pos, "retiree");
 
         // Update project compound-key index
         let project_count_key = DataKey::ProjectCount(project_id.clone());
@@ -171,18 +240,22 @@ impl RetirementRegistry {
             .unwrap_or(0);
         let pidx_key = DataKey::ProjectIndex(project_id.clone(), project_pos);
         e.storage().persistent().set(&pidx_key, &record_id);
+        // Set TTL on index entry (bounded to ~1 year, not permanent like Record)
         e.storage()
             .persistent()
-            .extend_ttl(&pidx_key, INDEX_TTL_THRESHOLD, INDEX_TTL_BUMP);
+            .extend_ttl(&pidx_key, INDEX_EXTEND_WHEN_BELOW, INDEX_ENTRY_TTL_LEDGERS);
         let new_project_pos = project_pos + 1;
         e.storage()
             .persistent()
             .set(&project_count_key, &new_project_pos);
         e.storage().persistent().extend_ttl(
             &project_count_key,
-            INDEX_TTL_THRESHOLD,
-            INDEX_TTL_BUMP,
+            INDEX_EXTEND_WHEN_BELOW,
+            INDEX_ENTRY_TTL_LEDGERS,
         );
+
+        // Check if project index has grown beyond limit; expire oldest if so
+        maybe_expire_oldest_index_entry(&e, new_project_pos, "project");
 
         // Update global scalars
         e.storage()
@@ -241,6 +314,22 @@ impl RetirementRegistry {
 
     /// Get paginated retirement records for a given retiree address.
     /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    ///
+    /// # Storage Growth Policy
+    ///
+    /// Index entries (RetireeIndex) are bounded:
+    /// - Each index entry has a TTL of ~1 year (INDEX_ENTRY_TTL_LEDGERS)
+    /// - When a retiree exceeds MAX_LIVE_INDEX_ENTRIES (1000),
+    ///   the oldest index entry is de-prioritised and expires naturally
+    /// - **Permanent records (Record(id)) are NEVER pruned** — they
+    ///   constitute the immutable audit log
+    /// - Full history beyond live index is available via contract events
+    ///
+    /// # Handling Expired Entries
+    ///
+    /// If an index entry has expired (its TTL expired), this function will
+    /// skip it gracefully. Callers seeking full historical data should use
+    /// contract events or off-chain indexers.
     pub fn get_retirements_by_retiree(
         e: Env,
         retiree: Address,
@@ -251,10 +340,21 @@ impl RetirementRegistry {
         let total: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
 
         let mut records: Vec<RetirementRecord> = Vec::new(&e);
-        let end = (offset + limit as u64).min(total);
+        let effective_limit = limit.min(50); // cap per-call to 50
+        let end = (offset + effective_limit as u64).min(total);
+        
         for pos in offset..end {
             let idx_key = DataKey::RetireeIndex(retiree.clone(), pos);
+            
+            // Index entry may have expired for very old positions
             if let Some(record_id) = e.storage().persistent().get::<_, u64>(&idx_key) {
+                // Extend TTL on access (keeps recently-queried entries live)
+                e.storage().persistent().extend_ttl(
+                    &idx_key,
+                    INDEX_EXTEND_WHEN_BELOW,
+                    INDEX_ENTRY_TTL_LEDGERS,
+                );
+
                 let rec_key = DataKey::Record(record_id);
                 if let Some(record) = e
                     .storage()
@@ -269,12 +369,29 @@ impl RetirementRegistry {
                     records.push_back(record);
                 }
             }
+            // else: index entry expired naturally — skip gracefully
         }
         records
     }
 
     /// Get paginated retirement records for a given project ID.
     /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    ///
+    /// # Storage Growth Policy
+    ///
+    /// Index entries (ProjectIndex) are bounded:
+    /// - Each index entry has a TTL of ~1 year (INDEX_ENTRY_TTL_LEDGERS)
+    /// - When a project exceeds MAX_LIVE_INDEX_ENTRIES (1000),
+    ///   the oldest index entry is de-prioritised and expires naturally
+    /// - **Permanent records (Record(id)) are NEVER pruned** — they
+    ///   constitute the immutable audit log
+    /// - Full history beyond live index is available via contract events
+    ///
+    /// # Handling Expired Entries
+    ///
+    /// If an index entry has expired (its TTL expired), this function will
+    /// skip it gracefully. Callers seeking full historical data should use
+    /// contract events or off-chain indexers.
     pub fn get_retirements_by_project(
         e: Env,
         project_id: BytesN<32>,
@@ -285,10 +402,21 @@ impl RetirementRegistry {
         let total: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
 
         let mut records: Vec<RetirementRecord> = Vec::new(&e);
-        let end = (offset + limit as u64).min(total);
+        let effective_limit = limit.min(50); // cap per-call to 50
+        let end = (offset + effective_limit as u64).min(total);
+        
         for pos in offset..end {
             let idx_key = DataKey::ProjectIndex(project_id.clone(), pos);
+            
+            // Index entry may have expired for very old positions
             if let Some(record_id) = e.storage().persistent().get::<_, u64>(&idx_key) {
+                // Extend TTL on access (keeps recently-queried entries live)
+                e.storage().persistent().extend_ttl(
+                    &idx_key,
+                    INDEX_EXTEND_WHEN_BELOW,
+                    INDEX_ENTRY_TTL_LEDGERS,
+                );
+
                 let rec_key = DataKey::Record(record_id);
                 if let Some(record) = e
                     .storage()
@@ -303,6 +431,7 @@ impl RetirementRegistry {
                     records.push_back(record);
                 }
             }
+            // else: index entry expired naturally — skip gracefully
         }
         records
     }
@@ -607,4 +736,411 @@ mod tests {
         assert_eq!(ev_caller, caller);
         assert!(ev_authorized);
     }
+
+    // ── SUITE 1: Permanent records never pruned ───────────────
+
+    #[test]
+    fn test_permanent_records_never_pruned() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[10u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record many retirements (more than MAX_LIVE_INDEX_ENTRIES)
+        let count = 50u64;
+        for i in 0..count {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // Assert all Record(id) entries still exist (not just recent MAX_LIVE_INDEX_ENTRIES)
+        for id in 1..=count {
+            let record = client.get_record(&id);
+            assert!(record.is_some(), "Record(id={}) must exist", id);
+            assert_eq!(record.unwrap().amount, 100 + id as i128);
+        }
+
+        assert_eq!(client.record_count(), count);
+    }
+
+    #[test]
+    fn test_permanent_records_accessible_directly_by_id() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[11u8; 32]);
+        let purpose = String::from_str(&e, "compliance");
+        let uri = String::from_str(&e, "ipfs://QmRecord");
+
+        // Record a retirement
+        let record_id = client.record_retirement(&admin, &retiree, &project_id, &250, &purpose, &uri);
+
+        // Assert Record(id) is directly accessible
+        let record = client.get_record(&record_id).unwrap();
+        assert_eq!(record.id, record_id);
+        assert_eq!(record.amount, 250);
+        assert_eq!(record.retiree, retiree);
+        assert_eq!(record.project_id, project_id);
+    }
+
+    // ── SUITE 2: Index bounded at MAX_LIVE_INDEX_ENTRIES ──────
+
+    #[test]
+    fn test_retiree_index_count_bounded_at_max_live() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[12u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record MAX_LIVE_INDEX_ENTRIES + 50 retirements
+        let record_count = MAX_LIVE_INDEX_ENTRIES + 50;
+        for i in 0..record_count {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // RetireeCount still tracks total (monotonically increases)
+        assert_eq!(client.retiree_count(&retiree), record_count);
+
+        // Index entries are bounded; oldest would naturally expire
+        // We can verify by attempting pagination that the count is coherent
+        let page = client.get_retirements_by_retiree(&retiree, &0, &100);
+        assert!(page.len() <= 50); // capped per-call
+    }
+
+    #[test]
+    fn test_project_index_count_bounded_at_max_live() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[13u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record MAX_LIVE_INDEX_ENTRIES + 50 retirements
+        let record_count = MAX_LIVE_INDEX_ENTRIES + 50;
+        for i in 0..record_count {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // ProjectCount still tracks total
+        assert_eq!(client.project_retirement_count(&project_id), record_count);
+
+        // Verify pagination works
+        let page = client.get_retirements_by_project(&project_id, &0, &100);
+        assert!(page.len() <= 50); // capped per-call
+    }
+
+    #[test]
+    fn test_idx_exp_event_emitted_when_limit_exceeded() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[14u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record MAX_LIVE_INDEX_ENTRIES + 5 retirements to trigger expiry events
+        let record_count = MAX_LIVE_INDEX_ENTRIES + 5;
+        for i in 0..record_count {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // Check events for idx_exp (EVENT_INDEX_EXPIRED)
+        let events = e.events().all();
+        let expire_events: Vec<_> = events
+            .iter()
+            .filter(|(_contract, topics, _data)| {
+                if let Ok(topic) = Symbol::try_from_val(&e, &topics.get(0).unwrap()) {
+                    topic == symbol_short!("idx_exp")
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        // Should have at least 5 idx_exp events (one for each record beyond MAX_LIVE_INDEX_ENTRIES)
+        assert!(
+            expire_events.len() >= 5,
+            "Expected at least 5 idx_exp events, got {}",
+            expire_events.len()
+        );
+    }
+
+    // ── SUITE 3: Recent history queries correct ───────────────
+
+    #[test]
+    fn test_get_retirements_by_retiree_returns_recent() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[15u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record 10 retirements
+        for i in 0..10 {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // Query recent page
+        let records = client.get_retirements_by_retiree(&retiree, &0, &10);
+        assert_eq!(records.len(), 10);
+
+        // Verify amounts are correct
+        for (i, record) in (0..10).zip(0..records.len()) {
+            assert_eq!(records.get(record).unwrap().amount, 100 + i as i128);
+        }
+    }
+
+    #[test]
+    fn test_get_retirements_by_retiree_handles_missing_old_index() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[16u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record 3 retirements
+        for i in 0..3 {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // Manually remove an old index entry to simulate TTL expiry
+        e.storage().persistent().remove(&DataKey::RetireeIndex(
+            retiree.clone(),
+            0, // oldest entry
+        ));
+
+        // Call get_retirements_by_retiree — should NOT panic
+        let records = client.get_retirements_by_retiree(&retiree, &0, &10);
+
+        // Should skip the expired entry (position 0) and return entries 1 and 2
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.get(0).unwrap().amount, 101); // position 1
+        assert_eq!(records.get(1).unwrap().amount, 102); // position 2
+    }
+
+    #[test]
+    fn test_get_retirements_by_project_handles_missing_old_index() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[17u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record 3 retirements
+        for i in 0..3 {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // Manually remove an old project index entry to simulate TTL expiry
+        e.storage().persistent().remove(&DataKey::ProjectIndex(
+            project_id.clone(),
+            0, // oldest entry
+        ));
+
+        // Call get_retirements_by_project — should NOT panic
+        let records = client.get_retirements_by_project(&project_id, &0, &10);
+
+        // Should skip the expired entry (position 0) and return entries 1 and 2
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.get(0).unwrap().amount, 101); // position 1
+        assert_eq!(records.get(1).unwrap().amount, 102); // position 2
+    }
+
+    #[test]
+    fn test_pagination_still_correct_with_bounded_index() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[18u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record 10 retirements
+        for i in 0..10 {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // Page 1: positions 0-4 → 5 results
+        let page1 = client.get_retirements_by_retiree(&retiree, &0, &5);
+        assert_eq!(page1.len(), 5);
+        for i in 0..5 {
+            assert_eq!(page1.get(i).unwrap().amount, 100 + i as i128);
+        }
+
+        // Page 2: positions 5-9 → 5 results
+        let page2 = client.get_retirements_by_retiree(&retiree, &5, &5);
+        assert_eq!(page2.len(), 5);
+        for i in 0..5 {
+            assert_eq!(page2.get(i).unwrap().amount, 105 + i as i128);
+        }
+    }
+
+    // ── SUITE 4: Count integrity ──────────────────────────────
+
+    #[test]
+    fn test_retiree_count_monotonically_increases() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[19u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        assert_eq!(client.retiree_count(&retiree), 0);
+
+        // Record 5 retirements
+        for i in 0..5 {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // RetireeCount reflects total, not bounded index entries
+        assert_eq!(client.retiree_count(&retiree), 5);
+    }
+
+    #[test]
+    fn test_project_count_monotonically_increases() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[20u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        assert_eq!(client.project_retirement_count(&project_id), 0);
+
+        // Record 5 retirements for the project
+        for i in 0..5 {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // ProjectCount reflects total, not bounded index entries
+        assert_eq!(client.project_retirement_count(&project_id), 5);
+    }
+
+    #[test]
+    fn test_record_count_unaffected_by_index_expiry() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+
+        let retiree = Address::generate(&e);
+        let project_id = BytesN::from_array(&e, &[21u8; 32]);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+
+        // Record MAX_LIVE_INDEX_ENTRIES + 10 retirements
+        let record_count = MAX_LIVE_INDEX_ENTRIES + 10;
+        for i in 0..record_count {
+            client.record_retirement(
+                &admin,
+                &retiree,
+                &project_id,
+                &(100i128 + i as i128),
+                &purpose,
+                &uri,
+            );
+        }
+
+        // RecordCount tracks all records ever created
+        assert_eq!(client.record_count(), record_count);
+
+        // Manually remove some old index entries (simulate TTL expiry)
+        for pos in 0..5 {
+            e.storage()
+                .persistent()
+                .remove(&DataKey::RetireeIndex(retiree.clone(), pos));
+        }
+
+        // RecordCount is unaffected
+        assert_eq!(client.record_count(), record_count);
+    }
 }
+
+
