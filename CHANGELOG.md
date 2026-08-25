@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `verification_oracle`: `get_result_summaries(project_id, offset, limit)` pages over verification history as four-field `VerificationSummary` entries (`total_credits`, `credits_minted`, `oracle_count`, `finalized_at`) instead of full `VerificationResult` structs. Timeline views in dashboards and indexers previously had to deserialize a 10-field result — including a 32-byte `project_id` — for every entry they paged over just to read credit totals and timestamps. Summaries are written to a new `ResultSummaryAt(project_id, position)` key alongside `ResultAt` on every finalization, under the same 10-year retention TTL; `get_result_history` is unchanged
 - Indexer-facing events across all contracts for off-chain state reconstruction:
   - `retirement_registry`: `ret_rec` on `record_retirement`, `auth_set` on `set_authorized_caller`, `init` on `initialize`
   - `project_registry`: `proj_reg` on `register`, `stat_chg` on `update_status`, `ownr_chg` on `update_owner`, `init` on `initialize`

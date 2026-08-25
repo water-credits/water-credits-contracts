@@ -79,6 +79,29 @@ pub struct VerificationResult {
     pub finalized_at: u64,
 }
 
+/// Lightweight projection of a `VerificationResult`, written alongside the full
+/// result on every finalization and served by `get_result_summaries`.
+///
+/// Timeline views (dashboards, indexers) only need the credit totals and the
+/// finalization timestamp for each window. Reading those out of
+/// `get_result_history` forces a full `VerificationResult` deserialization per
+/// entry — 10 fields including a 32-byte `project_id` — which is both a larger
+/// XDR response and more instructions than the caller needs. This struct is the
+/// four-field subset those views actually read.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerificationSummary {
+    /// Credits earned by the window, matching `VerificationResult::total_credits`.
+    pub total_credits: i128,
+    /// Credits actually minted to the beneficiary, matching
+    /// `VerificationResult::credits_minted`.
+    pub credits_minted: i128,
+    /// Number of oracle readings aggregated into the window.
+    pub oracle_count: u32,
+    /// Ledger timestamp at which the window was finalized.
+    pub finalized_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct OracleConfig {
@@ -250,6 +273,11 @@ pub enum DataKey {
     LastResult(BytesN<32>),
     /// Paginated history: ResultAt(project_id, position) → VerificationResult
     ResultAt(BytesN<32>, u64),
+    /// Summary projection of the history entry at the same position:
+    /// ResultSummaryAt(project_id, position) → VerificationSummary. Written
+    /// alongside `ResultAt` so timeline views can page over credit totals and
+    /// timestamps without deserializing the full result.
+    ResultSummaryAt(BytesN<32>, u64),
     /// Per-project result count, used for paginated history
     ResultCount(BytesN<32>),
     ProjectConfig(BytesN<32>),
@@ -303,6 +331,41 @@ fn increment_oracle_counter(e: &Env, key: &DataKey) {
     e.storage()
         .persistent()
         .extend_ttl(key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+}
+
+/// Append a finalized result to the project's paginated history.
+///
+/// Writes three entries at the next free position: the full `VerificationResult`
+/// under `ResultAt`, its `VerificationSummary` projection under
+/// `ResultSummaryAt`, and the bumped `ResultCount`. All three share the 10-year
+/// result retention TTL so a summary can never outlive — or expire before — the
+/// result it projects.
+fn append_result_history(e: &Env, project_id: &BytesN<32>, result: &VerificationResult) {
+    let count_key = DataKey::ResultCount(project_id.clone());
+    let hist_pos: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
+
+    let hist_key = DataKey::ResultAt(project_id.clone(), hist_pos);
+    e.storage().persistent().set(&hist_key, result);
+    e.storage()
+        .persistent()
+        .extend_ttl(&hist_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+
+    let summary = VerificationSummary {
+        total_credits: result.total_credits,
+        credits_minted: result.credits_minted,
+        oracle_count: result.oracle_count,
+        finalized_at: result.finalized_at,
+    };
+    let summary_key = DataKey::ResultSummaryAt(project_id.clone(), hist_pos);
+    e.storage().persistent().set(&summary_key, &summary);
+    e.storage()
+        .persistent()
+        .extend_ttl(&summary_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+
+    e.storage().persistent().set(&count_key, &(hist_pos + 1));
+    e.storage()
+        .persistent()
+        .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
 }
 
 fn record_finalized_contributions(e: &Env, submissions: &Vec<ReadingSubmission>) {
@@ -1226,18 +1289,8 @@ impl VerificationOracle {
                 .persistent()
                 .extend_ttl(&last_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
 
-            // Append to paginated history
-            let count_key = DataKey::ResultCount(project_id.clone());
-            let hist_pos: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
-            let hist_key = DataKey::ResultAt(project_id.clone(), hist_pos);
-            e.storage().persistent().set(&hist_key, &result);
-            e.storage()
-                .persistent()
-                .extend_ttl(&hist_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
-            e.storage().persistent().set(&count_key, &(hist_pos + 1));
-            e.storage()
-                .persistent()
-                .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+            // Append to paginated history (full result + summary projection)
+            append_result_history(&e, &project_id, &result);
 
             record_finalized_contributions(&e, &window.submissions);
 
@@ -1343,6 +1396,44 @@ impl VerificationOracle {
             }
         }
         results
+    }
+
+    /// Get a paginated history of verification *summaries* for a project.
+    ///
+    /// Same pagination semantics as [`get_result_history`](Self::get_result_history)
+    /// — `offset` is the zero-based start position, `limit` the max entries —
+    /// but each entry is a four-field [`VerificationSummary`] instead of the full
+    /// `VerificationResult`. Use this for timeline views that only need credit
+    /// totals, oracle counts and finalization timestamps: no `VerificationResult`
+    /// is read from storage, so both the response size and the per-entry
+    /// deserialization cost are a fraction of the full history call.
+    ///
+    /// Summaries are written from the first finalization onward; windows
+    /// finalized before this function existed have a `ResultAt` entry but no
+    /// `ResultSummaryAt` one and are skipped, exactly as `get_result_history`
+    /// skips a missing `ResultAt`.
+    pub fn get_result_summaries(
+        e: Env,
+        project_id: BytesN<32>,
+        offset: u64,
+        limit: u32,
+    ) -> Vec<VerificationSummary> {
+        let count_key = DataKey::ResultCount(project_id.clone());
+        let total: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
+        // Saturating so a caller probing a huge offset gets an empty page
+        // rather than an overflow panic.
+        let end = offset.saturating_add(limit as u64).min(total);
+        let mut summaries: Vec<VerificationSummary> = Vec::new(&e);
+        for pos in offset..end {
+            let key = DataKey::ResultSummaryAt(project_id.clone(), pos);
+            if let Some(sm) = e.storage().persistent().get::<_, VerificationSummary>(&key) {
+                e.storage()
+                    .persistent()
+                    .extend_ttl(&key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+                summaries.push_back(sm);
+            }
+        }
+        summaries
     }
 
     /// Get the total number of stored results for a project.
@@ -2311,18 +2402,8 @@ impl VerificationOracle {
             .persistent()
             .extend_ttl(&last_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
 
-        // Append to paginated history
-        let count_key = DataKey::ResultCount(project_id.clone());
-        let hist_pos: u64 = e.storage().persistent().get(&count_key).unwrap_or(0);
-        let hist_key = DataKey::ResultAt(project_id.clone(), hist_pos);
-        e.storage().persistent().set(&hist_key, &result);
-        e.storage()
-            .persistent()
-            .extend_ttl(&hist_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
-        e.storage().persistent().set(&count_key, &(hist_pos + 1));
-        e.storage()
-            .persistent()
-            .extend_ttl(&count_key, RESULT_TTL_THRESHOLD, RESULT_TTL_BUMP);
+        // Append to paginated history (full result + summary projection)
+        append_result_history(&e, &project_id, &result);
 
         record_finalized_contributions(&e, &window.submissions);
 
@@ -2848,6 +2929,143 @@ mod tests {
 
         assert_eq!(history.get(0).unwrap().oracle_count, 3);
         assert_eq!(history.get(1).unwrap().oracle_count, 3);
+    }
+
+    /// Run `windows` back-to-back commit-reveal rounds for one project, using a
+    /// fresh nonce per round so commitments never collide.
+    fn finalize_n_windows(
+        e: &Env,
+        admin: &Address,
+        client: &VerificationOracleClient<'static>,
+        project_id: &BytesN<32>,
+        oracles: &Vec<Address>,
+        windows: u64,
+        salt: &BytesN<32>,
+    ) {
+        for n in 0..windows {
+            if n == 0 {
+                commit_reveal_round_same(
+                    e,
+                    admin,
+                    client,
+                    project_id,
+                    oracles,
+                    n + 1,
+                    (700, 10, 80, 500, 250, 8, 1),
+                    salt,
+                );
+            } else {
+                client.reset_window(admin, project_id);
+                commit_reveal_round_same_no_open(
+                    e,
+                    client,
+                    project_id,
+                    oracles,
+                    n + 1,
+                    (700, 10, 80, 500, 250, 8, 1),
+                    salt,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_result_summaries_match_history() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let project_id = BytesN::from_array(&e, &[60u8; 32]);
+        let salt = BytesN::from_array(&e, &[0x60u8; 32]);
+
+        finalize_n_windows(&e, &admin, &client, &project_id, &oracles, 5, &salt);
+
+        let history = client.get_result_history(&project_id, &0, &5);
+        let summaries = client.get_result_summaries(&project_id, &0, &5);
+        assert_eq!(history.len(), 5);
+        assert_eq!(summaries.len(), 5);
+
+        for i in 0..history.len() {
+            let r = history.get(i).unwrap();
+            let sm = summaries.get(i).unwrap();
+            assert_eq!(sm.total_credits, r.total_credits);
+            assert_eq!(sm.credits_minted, r.credits_minted);
+            assert_eq!(sm.oracle_count, r.oracle_count);
+            assert_eq!(sm.finalized_at, r.finalized_at);
+        }
+
+        // Each round advances the ledger past the commit phase, so the windows
+        // must carry strictly increasing finalization timestamps — the summaries
+        // really are per-window, not five copies of the last result.
+        for i in 1..summaries.len() {
+            assert!(
+                summaries.get(i).unwrap().finalized_at > summaries.get(i - 1).unwrap().finalized_at
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_result_summaries_does_not_load_full_result() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let project_id = BytesN::from_array(&e, &[61u8; 32]);
+        let salt = BytesN::from_array(&e, &[0x61u8; 32]);
+
+        finalize_n_windows(&e, &admin, &client, &project_id, &oracles, 3, &salt);
+
+        let expected = client.get_result_summaries(&project_id, &0, &3);
+        assert_eq!(expected.len(), 3);
+
+        // Delete every full VerificationResult from storage. If
+        // get_result_summaries touched ResultAt at all it would now come back
+        // short; the summaries are served entirely from ResultSummaryAt.
+        e.as_contract(&client.address, || {
+            for pos in 0..3u64 {
+                e.storage()
+                    .persistent()
+                    .remove(&DataKey::ResultAt(project_id.clone(), pos));
+            }
+        });
+        assert_eq!(client.get_result_history(&project_id, &0, &3).len(), 0);
+
+        let summaries = client.get_result_summaries(&project_id, &0, &3);
+        assert_eq!(summaries.len(), 3);
+        for i in 0..summaries.len() {
+            assert_eq!(summaries.get(i).unwrap(), expected.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_get_result_summaries_pagination_bounds() {
+        let (e, admin, client) = setup_with_client();
+        e.mock_all_auths();
+
+        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let project_id = BytesN::from_array(&e, &[62u8; 32]);
+        let salt = BytesN::from_array(&e, &[0x62u8; 32]);
+
+        // No finalized window yet: an unknown project pages to an empty result
+        // rather than panicking on the missing count.
+        assert_eq!(client.get_result_summaries(&project_id, &0, &10).len(), 0);
+
+        finalize_n_windows(&e, &admin, &client, &project_id, &oracles, 5, &salt);
+
+        let all = client.get_result_summaries(&project_id, &0, &10);
+        assert_eq!(all.len(), 5, "limit past the end clamps to the count");
+
+        let page = client.get_result_summaries(&project_id, &1, &2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap(), all.get(1).unwrap());
+        assert_eq!(page.get(1).unwrap(), all.get(2).unwrap());
+
+        assert_eq!(
+            client.get_result_summaries(&project_id, &5, &3).len(),
+            0,
+            "offset at the end yields nothing"
+        );
+        assert_eq!(client.get_result_summaries(&project_id, &0, &0).len(), 0);
     }
 
     #[test]

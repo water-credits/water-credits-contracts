@@ -568,6 +568,9 @@ admin's control.
 | `TotalSubmissions` | `u64` | Protocol-wide accepted-reveal count |
 | `WindowState(BytesN<32>)` | `WindowState` | Open/finalized window |
 | `LastResult(BytesN<32>)` | `VerificationResult` | Latest finalized result |
+| `ResultAt(BytesN<32>, u64)` | `VerificationResult` | Paginated history entry by position |
+| `ResultSummaryAt(BytesN<32>, u64)` | `VerificationSummary` | Summary projection of the history entry at the same position |
+| `ResultCount(BytesN<32>)` | `u64` | Number of stored history entries |
 | `ProjectConfig(BytesN<32>)` | `ProjectConfig` | Auto-mint config |
 | `OracleStake(Address)` | `StakeInfo` | Oracle stake amount and unstake request |
 | `OracleSlashed(Address)` | `SlashReason` | Most recent slash record |
