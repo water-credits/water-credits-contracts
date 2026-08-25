@@ -534,9 +534,11 @@ mod tests {
         let uri = String::from_str(&e, "ipfs://QmCert");
 
         // Record 5 retirements for the same retiree
-        for &amount in &[100i128, 200, 300, 400, 500] {
-            client.record_retirement(&admin, &retiree, &project_id, &amount, &purpose, &uri);
-        }
+        client.record_retirement(&admin, &retiree, &project_id, &100, &purpose, &uri);
+        client.record_retirement(&admin, &retiree, &project_id, &200, &purpose, &uri);
+        client.record_retirement(&admin, &retiree, &project_id, &300, &purpose, &uri);
+        client.record_retirement(&admin, &retiree, &project_id, &400, &purpose, &uri);
+        client.record_retirement(&admin, &retiree, &project_id, &500, &purpose, &uri);
 
         assert_eq!(client.retiree_count(&retiree), 5);
 
@@ -606,10 +608,11 @@ mod tests {
 
         // Record 5 retirements for the same retiree
         let mut expected_ids = std::vec::Vec::new();
-        for &amount in &[100i128, 200, 300, 400, 500] {
-            let id = client.record_retirement(&admin, &retiree, &project_id, &amount, &purpose, &uri);
-            expected_ids.push(id);
-        }
+        expected_ids.push(client.record_retirement(&admin, &retiree, &project_id, &100, &purpose, &uri));
+        expected_ids.push(client.record_retirement(&admin, &retiree, &project_id, &200, &purpose, &uri));
+        expected_ids.push(client.record_retirement(&admin, &retiree, &project_id, &300, &purpose, &uri));
+        expected_ids.push(client.record_retirement(&admin, &retiree, &project_id, &400, &purpose, &uri));
+        expected_ids.push(client.record_retirement(&admin, &retiree, &project_id, &500, &purpose, &uri));
 
         // Check correct IDs
         let ids_page1 = client.get_retirement_ids_by_retiree(&retiree, &0, &2);
@@ -638,10 +641,9 @@ mod tests {
         let uri = String::from_str(&e, "ipfs://QmCert");
 
         let mut expected_ids = std::vec::Vec::new();
-        for &amount in &[100i128, 200, 300] {
-            let id = client.record_retirement(&admin, &retiree, &project_id, &amount, &purpose, &uri);
-            expected_ids.push(id);
-        }
+        expected_ids.push(client.record_retirement(&admin, &retiree, &project_id, &100, &purpose, &uri));
+        expected_ids.push(client.record_retirement(&admin, &retiree, &project_id, &200, &purpose, &uri));
+        expected_ids.push(client.record_retirement(&admin, &retiree, &project_id, &300, &purpose, &uri));
 
         let ids_page1 = client.get_retirement_ids_by_project(&project_id, &0, &2);
         assert_eq!(ids_page1.len(), 2);
