@@ -1854,6 +1854,22 @@ impl VerificationOracle {
         config.staking_token
     }
 
+    /// Get the next expected nonce for an oracle for a given project.
+    /// Returns 1 if no nonce has been committed yet.
+    /// Extends the TTL of the underlying storage entry.
+    pub fn get_oracle_nonce(e: Env, project_id: BytesN<32>, oracle: Address) -> u64 {
+        let nonce_key = DataKey::OracleNonce((project_id, oracle));
+        let expected_nonce = e.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
+
+        if e.storage().persistent().has(&nonce_key) {
+            e.storage()
+                .persistent()
+                .extend_ttl(&nonce_key, ORACLE_TTL_THRESHOLD, ORACLE_TTL_BUMP);
+        }
+
+        expected_nonce
+    }
+
     // ── Commit-Reveal Scheme ──
 
     /// Open a new commit-reveal window for a project. Starts the commit phase.
@@ -2490,6 +2506,14 @@ mod tests {
             pub fn balance(_e: Env, _addr: Address) -> i128 {
                 1_000_000
             }
+        }
+
+        pub fn total_supply(_e: Env) -> i128 {
+            0
+        }
+
+        pub fn max_supply(_e: Env) -> i128 {
+            1_000_000_000
         }
     }
     use mock_token::MockToken;
@@ -4358,7 +4382,7 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
-        let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
+        let _oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
 
         let project_id = BytesN::from_array(&e, &[108u8; 32]);
         client.open_window(&admin, &project_id);
@@ -5710,8 +5734,9 @@ mod tests {
     #[test]
     fn test_resolve_baselines_no_config_returns_defaults() {
         let e = Env::default();
+        let contract_id = e.register_contract(None, VerificationOracle);
         let project_id = BytesN::from_array(&e, &[0xABu8; 32]);
-        let (n, p, temp) = resolve_baselines(&e, &project_id);
+        let (n, p, temp) = e.as_contract(&contract_id, || resolve_baselines(&e, &project_id));
         assert_eq!(n, 10);
         assert_eq!(p, 2);
         assert_eq!(temp, 300);
@@ -5735,7 +5760,7 @@ mod tests {
         let beneficiary = Address::generate(&e);
         client.set_project_config(&admin, &project_id, &token, &beneficiary, &50, &10, &250);
 
-        let (n, p, temp) = resolve_baselines(&e, &project_id);
+        let (n, p, temp) = e.as_contract(&contract_id, || resolve_baselines(&e, &project_id));
         assert_eq!(n, 50);
         assert_eq!(p, 10);
         assert_eq!(temp, 250);
@@ -5760,7 +5785,7 @@ mod tests {
         // All zero baselines → zero-sentinel → defaults.
         client.set_project_config(&admin, &project_id, &token, &beneficiary, &0, &0, &0);
 
-        let (n, p, temp) = resolve_baselines(&e, &project_id);
+        let (n, p, temp) = e.as_contract(&contract_id, || resolve_baselines(&e, &project_id));
         assert_eq!(n, 10);
         assert_eq!(p, 2);
         assert_eq!(temp, 300);
@@ -5786,7 +5811,7 @@ mod tests {
         // Only baseline_n is set; others are zero → defaults for those.
         client.set_project_config(&admin, &project_id, &token, &beneficiary, &50, &0, &0);
 
-        let (n, p, temp) = resolve_baselines(&e, &project_id);
+        let (n, p, temp) = e.as_contract(&contract_id, || resolve_baselines(&e, &project_id));
         assert_eq!(n, 50);
         assert_eq!(p, 2);
         assert_eq!(temp, 300);
@@ -5802,11 +5827,12 @@ mod tests {
         let oracles = setup_oracles_with_stakes(&e, &admin, &client, 3, 1500);
 
         let project_id = BytesN::from_array(&e, &[0xAFu8; 32]);
+        let token_contract = e.register_contract(None, MockToken);
         // Set a non-default nitrogen baseline: 50 mg/L
         client.set_project_config(
             &admin,
             &project_id,
-            &Address::generate(&e),
+            &token_contract,
             &Address::generate(&e),
             &50,
             &10,
