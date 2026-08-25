@@ -682,8 +682,8 @@ pub struct FinalizationResult {
     pub total: i128,
 }
 
-/// Shared finalization arithmetic used by `finalize_reveals`. Every multiplication uses `checked_mul` so that
-/// near-`i64::MAX` intermediate values (e.g. `flow_rate` at the top of its
+/// Shared finalization arithmetic used by `finalize_reveals`. Every multiplication uses
+/// `checked_mul` so that near-`i64::MAX` intermediate values (e.g. `flow_rate` at the top of its
 /// valid range) panic and revert the transaction instead of silently
 /// wrapping in `i128`. `total` is floored at 0 so a maximal quality penalty
 /// can never be misread as a negative credit balance.

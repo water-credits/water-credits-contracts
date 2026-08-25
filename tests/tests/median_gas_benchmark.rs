@@ -177,8 +177,7 @@ fn test_median_gas_with_ten_oracles_within_budget() {
     let budget_before = e.budget().cpu_instruction_cost();
 
     // 10th reveal — triggers finalization, calls median_i64 7×.
-    let result =
-        client.reveal_reading(&oracles.get(9).unwrap(), &project_id, &reveal_params);
+    let result = client.reveal_reading(&oracles.get(9).unwrap(), &project_id, &reveal_params);
 
     let budget_after = e.budget().cpu_instruction_cost();
 
@@ -232,7 +231,18 @@ fn test_median_gas_scales_linearly_from_three_to_ten() {
     let nonce = 1u64;
 
     // ── 3-oracle: commit phase ──
-    let commitment3 = sha256_commitment(&e3, nonce, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt3);
+    let commitment3 = sha256_commitment(
+        &e3,
+        nonce,
+        reading.0,
+        reading.1,
+        reading.2,
+        reading.3,
+        reading.4,
+        reading.5,
+        reading.6,
+        &salt3,
+    );
     let reveal3 = RevealParams {
         nonce,
         ph: reading.0,
@@ -248,7 +258,10 @@ fn test_median_gas_scales_linearly_from_three_to_ten() {
     for i in 0..3u32 {
         client3.commit_reading(&oracles3.get(i).unwrap(), &project_id3, &nonce, &commitment3);
     }
-    e3.ledger().with_mut(|l| { l.timestamp += 301; l.sequence_number += 61; });
+    e3.ledger().with_mut(|l| {
+        l.timestamp += 301;
+        l.sequence_number += 61;
+    });
     client3.begin_reveal_phase(&project_id3);
 
     // First 2 reveals — don't finalize yet.
@@ -262,7 +275,18 @@ fn test_median_gas_scales_linearly_from_three_to_ten() {
     let cost3 = after3 - before3;
 
     // ── 10-oracle: commit phase ──
-    let commitment10 = sha256_commitment(&e10, nonce, reading.0, reading.1, reading.2, reading.3, reading.4, reading.5, reading.6, &salt10);
+    let commitment10 = sha256_commitment(
+        &e10,
+        nonce,
+        reading.0,
+        reading.1,
+        reading.2,
+        reading.3,
+        reading.4,
+        reading.5,
+        reading.6,
+        &salt10,
+    );
     let reveal10 = RevealParams {
         nonce,
         ph: reading.0,
@@ -281,7 +305,10 @@ fn test_median_gas_scales_linearly_from_three_to_ten() {
     for i in 0..10u32 {
         client10.commit_reading(&oracles10.get(i).unwrap(), &project_id10, &nonce, &commitment10);
     }
-    e10.ledger().with_mut(|l| { l.timestamp += 301; l.sequence_number += 61; });
+    e10.ledger().with_mut(|l| {
+        l.timestamp += 301;
+        l.sequence_number += 61;
+    });
     client10.begin_reveal_phase(&project_id10);
 
     // First 9 reveals — don't finalize yet.
