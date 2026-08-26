@@ -1,4 +1,4 @@
-CONTRACTS = credit_factory credit_token verification_oracle retirement_registry project_registry governance
+CONTRACTS = credit_factory credit_token verification_oracle retirement_registry project_registry governance credit_bridge
 WASM_DIR = target/wasm32-unknown-unknown/release
 
 .PHONY: build fix-wasm test lint fmt
