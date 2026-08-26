@@ -1,9 +1,9 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, BytesN, Env, Symbol,
-    Val, Vec, IntoVal,
-};
 use soroban_sdk::xdr::{FromXdr, ToXdr};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, BytesN, Env, IntoVal,
+    Symbol, Val, Vec,
+};
 
 #[contracttype]
 pub enum DataKey {
@@ -54,7 +54,9 @@ impl CreditBridge {
         e.storage().instance().set(&DataKey::Admin, &admin);
         e.storage().instance().set(&DataKey::Token, &token);
         e.storage().instance().set(&DataKey::EvmToken, &evm_token);
-        e.storage().instance().set(&DataKey::Governance, &governance);
+        e.storage()
+            .instance()
+            .set(&DataKey::Governance, &governance);
         e.storage().instance().set(&DataKey::Paused, &false);
         e.storage().instance().set(&DataKey::Relayers, &relayers);
         e.storage().instance().set(&DataKey::Threshold, &threshold);
@@ -75,8 +77,12 @@ impl CreditBridge {
         if new_threshold == 0 || new_threshold > new_relayers.len() {
             panic!("invalid threshold");
         }
-        e.storage().instance().set(&DataKey::Relayers, &new_relayers);
-        e.storage().instance().set(&DataKey::Threshold, &new_threshold);
+        e.storage()
+            .instance()
+            .set(&DataKey::Relayers, &new_relayers);
+        e.storage()
+            .instance()
+            .set(&DataKey::Threshold, &new_threshold);
     }
 
     pub fn set_token(e: Env, admin: Address, new_token: Address) {
@@ -91,8 +97,16 @@ impl CreditBridge {
     // ── Governance Pause Hook ──
     pub fn pause(e: Env, caller: Address) {
         caller.require_auth();
-        let admin = e.storage().instance().get::<_, Address>(&DataKey::Admin).unwrap();
-        let gov = e.storage().instance().get::<_, Address>(&DataKey::Governance).unwrap();
+        let admin = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Admin)
+            .unwrap();
+        let gov = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Governance)
+            .unwrap();
         if caller != admin && caller != gov {
             panic!("unauthorized");
         }
@@ -102,8 +116,16 @@ impl CreditBridge {
 
     pub fn unpause(e: Env, caller: Address) {
         caller.require_auth();
-        let admin = e.storage().instance().get::<_, Address>(&DataKey::Admin).unwrap();
-        let gov = e.storage().instance().get::<_, Address>(&DataKey::Governance).unwrap();
+        let admin = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Admin)
+            .unwrap();
+        let gov = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Governance)
+            .unwrap();
         if caller != admin && caller != gov {
             panic!("unauthorized");
         }
@@ -112,7 +134,10 @@ impl CreditBridge {
     }
 
     pub fn paused(e: Env) -> bool {
-        e.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+        e.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     // ── Bridge Deposit (Stellar -> EVM) ──
@@ -256,7 +281,9 @@ impl CreditBridge {
     }
 
     pub fn is_processed(e: Env, msg_hash: BytesN<32>) -> bool {
-        e.storage().persistent().has(&DataKey::ProcessedMessages(msg_hash))
+        e.storage()
+            .persistent()
+            .has(&DataKey::ProcessedMessages(msg_hash))
     }
 
     pub fn address_to_bytes(e: Env, address: Address) -> (u32, BytesN<32>) {
@@ -274,7 +301,10 @@ impl CreditBridge {
         sig: BytesN<64>,
     ) -> bool {
         let msg_bytes = transfer.to_xdr(&e);
-        e.events().publish((Symbol::new(&e, "verify_sig_test_msg_bytes"),), msg_bytes.clone());
+        e.events().publish(
+            (Symbol::new(&e, "verify_sig_test_msg_bytes"),),
+            msg_bytes.clone(),
+        );
         e.crypto().ed25519_verify(&signer, &msg_bytes, &sig);
         true
     }
@@ -302,15 +332,15 @@ pub fn address_to_bytes(e: &Env, address: &Address) -> (u32, BytesN<32>) {
     if len == 40 {
         // Contract: 4 bytes ScVal discriminant (18) + 4 bytes ScAddress discriminant (1) + 32 bytes hash
         let mut payload = [0u8; 32];
-        for i in 0..32 {
-            payload[i] = xdr.get((i + 8) as u32).unwrap();
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte = xdr.get((i + 8) as u32).unwrap();
         }
         (1, BytesN::from_array(e, &payload))
     } else if len == 44 {
         // Account: 4 bytes ScVal discriminant (18) + 4 bytes ScAddress discriminant (0) + 4 bytes PublicKey discriminant (0) + 32 bytes pubkey
         let mut payload = [0u8; 32];
-        for i in 0..32 {
-            payload[i] = xdr.get((i + 12) as u32).unwrap();
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte = xdr.get((i + 12) as u32).unwrap();
         }
         (0, BytesN::from_array(e, &payload))
     } else {
@@ -331,7 +361,10 @@ pub fn bytes_to_address(e: &Env, address_type: u32, payload: &BytesN<32>) -> Add
     } else if address_type == 0 {
         // Account
         let mut xdr = Bytes::new(e);
-        xdr.append(&Bytes::from_array(e, &[0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 0]));
+        xdr.append(&Bytes::from_array(
+            e,
+            &[0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0, 0],
+        ));
         xdr.append(&Bytes::from_array(e, &payload_arr));
         Address::from_xdr(e, &xdr).unwrap()
     } else {

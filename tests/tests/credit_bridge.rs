@@ -1,12 +1,12 @@
-use credit_token::{CreditToken, CreditTokenClient};
 use credit_bridge::{CreditBridge, CreditBridgeClient, InboundTransfer};
+use credit_token::{CreditToken, CreditTokenClient};
+use ed25519_dalek::{Signer, SigningKey};
 use governance::{Governance, GovernanceClient};
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
-use soroban_sdk::xdr::ToXdr;
-use ed25519_dalek::{SigningKey, Signer};
 
 // ── Helpers ──
 
@@ -30,7 +30,11 @@ fn deploy_bridge(e: &Env) -> (Address, CreditBridgeClient<'static>) {
     (contract_id, client)
 }
 
-fn deploy_governance(e: &Env, admin: &Address, members: Vec<Address>) -> (Address, GovernanceClient<'static>) {
+fn deploy_governance(
+    e: &Env,
+    admin: &Address,
+    members: Vec<Address>,
+) -> (Address, GovernanceClient<'static>) {
     let contract_id = e.register_contract(None, Governance);
     let client = GovernanceClient::new(e, &contract_id);
     client.initialize(admin, &members);
@@ -69,16 +73,26 @@ fn test_bridge_deposit_and_withdraw() {
     std::eprintln!("Relayer 1 key: {:?}", relayers_info[1].1);
     std::eprintln!("Relayer 2 key: {:?}", relayers_info[2].1);
 
-    let relayers = Vec::from_array(&e, [
-        relayers_info[0].1.clone(),
-        relayers_info[1].1.clone(),
-        relayers_info[2].1.clone(),
-    ]);
+    let relayers = Vec::from_array(
+        &e,
+        [
+            relayers_info[0].1.clone(),
+            relayers_info[1].1.clone(),
+            relayers_info[2].1.clone(),
+        ],
+    );
 
     // Initialize bridge
     let governance_addr = Address::generate(&e);
     let evm_token = BytesN::from_array(&e, &[9u8; 32]);
-    bridge_client.initialize(&admin, &token_id, &evm_token, &governance_addr, &relayers, &2);
+    bridge_client.initialize(
+        &admin,
+        &token_id,
+        &evm_token,
+        &governance_addr,
+        &relayers,
+        &2,
+    );
 
     // Set bridge contract on credit_token
     token_client.set_bridge(&admin, &bridge_id);
@@ -124,7 +138,10 @@ fn test_bridge_deposit_and_withdraw() {
     let sig2 = relayers_info[1].0.sign(&msg_vec).to_bytes();
 
     let signers = Vec::from_array(&e, [relayers_info[0].1.clone(), relayers_info[1].1.clone()]);
-    let signatures = Vec::from_array(&e, [BytesN::from_array(&e, &sig1), BytesN::from_array(&e, &sig2)]);
+    let signatures = Vec::from_array(
+        &e,
+        [BytesN::from_array(&e, &sig1), BytesN::from_array(&e, &sig2)],
+    );
 
     bridge_client.withdraw(&transfer, &signers, &signatures);
 
@@ -146,15 +163,19 @@ fn test_replay_protection() {
     let (token_id, token_client) = deploy_token(&e, &admin);
     let (bridge_id, bridge_client) = deploy_bridge(&e);
 
-    let mut relayers_info = std::vec![
-        create_relayer_key(&e, 1),
-        create_relayer_key(&e, 2),
-    ];
+    let mut relayers_info = std::vec![create_relayer_key(&e, 1), create_relayer_key(&e, 2),];
     relayers_info.sort_by(|a, b| a.1.cmp(&b.1));
 
     let relayers = Vec::from_array(&e, [relayers_info[0].1.clone(), relayers_info[1].1.clone()]);
     let evm_token = BytesN::from_array(&e, &[9u8; 32]);
-    bridge_client.initialize(&admin, &token_id, &evm_token, &Address::generate(&e), &relayers, &2);
+    bridge_client.initialize(
+        &admin,
+        &token_id,
+        &evm_token,
+        &Address::generate(&e),
+        &relayers,
+        &2,
+    );
     token_client.set_bridge(&admin, &bridge_id);
     token_client.set_minter(&admin, &bridge_id);
 
@@ -183,7 +204,10 @@ fn test_replay_protection() {
     let sig2 = relayers_info[1].0.sign(&msg_vec).to_bytes();
 
     let signers = Vec::from_array(&e, [relayers_info[0].1.clone(), relayers_info[1].1.clone()]);
-    let signatures = Vec::from_array(&e, [BytesN::from_array(&e, &sig1), BytesN::from_array(&e, &sig2)]);
+    let signatures = Vec::from_array(
+        &e,
+        [BytesN::from_array(&e, &sig1), BytesN::from_array(&e, &sig2)],
+    );
 
     // First withdraw succeeds
     bridge_client.withdraw(&transfer, &signers, &signatures);
@@ -204,15 +228,19 @@ fn test_invalid_signatures() {
     let (token_id, token_client) = deploy_token(&e, &admin);
     let (bridge_id, bridge_client) = deploy_bridge(&e);
 
-    let mut relayers_info = std::vec![
-        create_relayer_key(&e, 1),
-        create_relayer_key(&e, 2),
-    ];
+    let mut relayers_info = std::vec![create_relayer_key(&e, 1), create_relayer_key(&e, 2),];
     relayers_info.sort_by(|a, b| a.1.cmp(&b.1));
 
     let relayers = Vec::from_array(&e, [relayers_info[0].1.clone(), relayers_info[1].1.clone()]);
     let evm_token = BytesN::from_array(&e, &[9u8; 32]);
-    bridge_client.initialize(&admin, &token_id, &evm_token, &Address::generate(&e), &relayers, &2);
+    bridge_client.initialize(
+        &admin,
+        &token_id,
+        &evm_token,
+        &Address::generate(&e),
+        &relayers,
+        &2,
+    );
     token_client.set_bridge(&admin, &bridge_id);
     token_client.set_minter(&admin, &bridge_id);
 
@@ -248,7 +276,13 @@ fn test_invalid_signatures() {
     signers_info.sort_by(|a, b| a.0.cmp(&b.0));
 
     let signers = Vec::from_array(&e, [signers_info[0].0.clone(), signers_info[1].0.clone()]);
-    let signatures = Vec::from_array(&e, [BytesN::from_array(&e, &signers_info[0].1), BytesN::from_array(&e, &signers_info[1].1)]);
+    let signatures = Vec::from_array(
+        &e,
+        [
+            BytesN::from_array(&e, &signers_info[0].1),
+            BytesN::from_array(&e, &signers_info[1].1),
+        ],
+    );
 
     // Must panic because non_relayer is not authorized
     bridge_client.withdraw(&transfer, &signers, &signatures);
@@ -266,10 +300,7 @@ fn test_governance_pause() {
     let (token_id, token_client) = deploy_token(&e, &admin);
     let (bridge_id, bridge_client) = deploy_bridge(&e);
 
-    let mut relayers_info = std::vec![
-        create_relayer_key(&e, 1),
-        create_relayer_key(&e, 2),
-    ];
+    let mut relayers_info = std::vec![create_relayer_key(&e, 1), create_relayer_key(&e, 2),];
     relayers_info.sort_by(|a, b| a.1.cmp(&b.1));
 
     let relayers = Vec::from_array(&e, [relayers_info[0].1.clone(), relayers_info[1].1.clone()]);
@@ -308,15 +339,19 @@ fn test_max_supply_enforcement() {
     let (token_id, token_client) = deploy_token(&e, &admin);
     let (bridge_id, bridge_client) = deploy_bridge(&e);
 
-    let mut relayers_info = std::vec![
-        create_relayer_key(&e, 1),
-        create_relayer_key(&e, 2),
-    ];
+    let mut relayers_info = std::vec![create_relayer_key(&e, 1), create_relayer_key(&e, 2),];
     relayers_info.sort_by(|a, b| a.1.cmp(&b.1));
 
     let relayers = Vec::from_array(&e, [relayers_info[0].1.clone(), relayers_info[1].1.clone()]);
     let evm_token = BytesN::from_array(&e, &[9u8; 32]);
-    bridge_client.initialize(&admin, &token_id, &evm_token, &Address::generate(&e), &relayers, &2);
+    bridge_client.initialize(
+        &admin,
+        &token_id,
+        &evm_token,
+        &Address::generate(&e),
+        &relayers,
+        &2,
+    );
     token_client.set_bridge(&admin, &bridge_id);
     token_client.set_minter(&admin, &bridge_id);
 
@@ -349,21 +384,22 @@ fn test_ed25519_verify_sanity() {
     let (token_id, token_client) = deploy_token(&e, &admin);
     let (bridge_id, bridge_client) = deploy_bridge(&e);
 
-    let mut relayers_info = std::vec![
-        create_relayer_key(&e, 1),
-        create_relayer_key(&e, 2),
-    ];
+    let mut relayers_info = std::vec![create_relayer_key(&e, 1), create_relayer_key(&e, 2),];
     relayers_info.sort_by(|a, b| a.1.cmp(&b.1));
 
-    let relayers = Vec::from_array(&e, [
-        relayers_info[0].1.clone(),
-        relayers_info[1].1.clone(),
-    ]);
+    let relayers = Vec::from_array(&e, [relayers_info[0].1.clone(), relayers_info[1].1.clone()]);
 
     // Initialize bridge
     let governance_addr = Address::generate(&e);
     let evm_token = BytesN::from_array(&e, &[9u8; 32]);
-    bridge_client.initialize(&admin, &token_id, &evm_token, &governance_addr, &relayers, &2);
+    bridge_client.initialize(
+        &admin,
+        &token_id,
+        &evm_token,
+        &governance_addr,
+        &relayers,
+        &2,
+    );
     token_client.set_bridge(&admin, &bridge_id);
     token_client.set_minter(&admin, &bridge_id);
 
@@ -410,8 +446,11 @@ fn test_ed25519_verify_sanity() {
     let (t, bytes) = bridge_client.address_to_bytes(&addr);
     let mut bytes_vec = [0u8; 32];
     bytes.copy_into_slice(&mut bytes_vec);
-    std::eprintln!("address_to_bytes returned type {} and payload: {:?}", t, bytes_vec);
+    std::eprintln!(
+        "address_to_bytes returned type {} and payload: {:?}",
+        t,
+        bytes_vec
+    );
     let restored = bridge_client.bytes_to_address(&t, &bytes);
     assert_eq!(addr, restored);
 }
-

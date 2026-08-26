@@ -131,13 +131,15 @@ fn require_minter(e: &Env, caller: &Address) {
 }
 
 fn read_bridged_to_evm(e: &Env) -> i128 {
-    e.storage().instance().get(&DataKey::BridgedToEvm).unwrap_or(0)
+    e.storage()
+        .instance()
+        .get(&DataKey::BridgedToEvm)
+        .unwrap_or(0)
 }
 
 fn save_bridged_to_evm(e: &Env, amount: i128) {
     e.storage().instance().set(&DataKey::BridgedToEvm, &amount);
 }
-
 
 fn read_balance(e: &Env, addr: &Address) -> i128 {
     let key = DataKey::Balance(addr.clone());
@@ -469,7 +471,14 @@ impl CreditToken {
         let total = read_total_supply(&e);
         let bridged = read_bridged_to_evm(&e);
         let max: i128 = e.storage().instance().get(&DataKey::MaxSupply).unwrap_or(0);
-        if max > 0 && total.checked_add(bridged).expect("overflow").checked_add(amount).expect("overflow") > max {
+        if max > 0
+            && total
+                .checked_add(bridged)
+                .expect("overflow")
+                .checked_add(amount)
+                .expect("overflow")
+                > max
+        {
             panic!("max supply exceeded");
         }
 
@@ -540,7 +549,7 @@ impl CreditToken {
         caller.require_auth();
         let admin = read_admin(&e);
         let bridge_opt: Option<Address> = e.storage().instance().get(&DataKey::Bridge);
-        
+
         let mut is_bridge = false;
         if let Some(ref bridge) = bridge_opt {
             if caller == *bridge {
