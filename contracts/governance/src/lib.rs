@@ -138,6 +138,7 @@ pub enum DataKey {
     ActiveProposals,
     ProtocolPaused,
     RegisteredTokens,
+    RegisteredOracles,
     /// Address of the token used for token-weighted voting power.
     /// If not set, voting remains member-count-based.
     GovernanceToken,
@@ -351,6 +352,9 @@ impl Governance {
         e.storage()
             .instance()
             .set(&DataKey::RegisteredTokens, &Vec::<Address>::new(&e));
+        e.storage()
+            .instance()
+            .set(&DataKey::RegisteredOracles, &Vec::<Address>::new(&e));
 
         e.events().publish((EVENT_INITIALIZED,), (admin,));
     }
@@ -966,6 +970,61 @@ impl Governance {
             .unwrap_or_else(|| Vec::new(&e))
     }
 
+    // ── Oracle Registry ──
+
+    pub fn register_oracle(e: Env, admin: Address, oracle: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let mut oracles: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredOracles)
+            .unwrap_or_else(|| Vec::new(&e));
+        
+        for i in 0..oracles.len() {
+            if oracles.get(i).unwrap() == oracle {
+                return;
+            }
+        }
+        oracles.push_back(oracle);
+        e.storage()
+            .instance()
+            .set(&DataKey::RegisteredOracles, &oracles);
+    }
+
+    pub fn deregister_oracle(e: Env, admin: Address, oracle: Address) {
+        admin.require_auth();
+        let stored: Address = read_admin(&e);
+        if admin != stored {
+            panic!("unauthorized");
+        }
+        let oracles: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredOracles)
+            .unwrap_or_else(|| Vec::new(&e));
+        let mut filtered: Vec<Address> = Vec::new(&e);
+        for i in 0..oracles.len() {
+            let addr = oracles.get(i).unwrap();
+            if addr != oracle {
+                filtered.push_back(addr);
+            }
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::RegisteredOracles, &filtered);
+    }
+
+    pub fn list_registered_oracles(e: Env) -> Vec<Address> {
+        e.storage()
+            .instance()
+            .get(&DataKey::RegisteredOracles)
+            .unwrap_or_else(|| Vec::new(&e))
+    }
+
     // ── Emergency Pause ──
 
     /// Returns true when the protocol is in emergency-pause state.
@@ -1096,11 +1155,11 @@ impl Governance {
         }
     }
 
-    /// Pause every registered token contract.
+    /// Pause every registered token and oracle contract.
     ///
-    /// In best-effort mode a failing token is skipped and the overall result is
+    /// In best-effort mode a failing contract is skipped and the overall result is
     /// reported via the returned boolean; in atomic mode the first failure
-    /// panics. Returns true when every token paused successfully.
+    /// panics. Returns true when every contract paused successfully.
     fn pause_all(e: &Env, best_effort: bool) -> bool {
         let tokens: Vec<Address> = e
             .storage()
@@ -1108,20 +1167,46 @@ impl Governance {
             .get(&DataKey::RegisteredTokens)
             .unwrap_or_else(|| Vec::new(e));
 
+        let oracles: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredOracles)
+            .unwrap_or_else(|| Vec::new(e));
+
         let gov_addr = e.current_contract_address();
         let mut all_ok = true;
+        
+        let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
+        
         for i in 0..tokens.len() {
             let token = tokens.get(i).unwrap();
-            let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
             let ok = if best_effort {
                 e.try_invoke_contract::<Val, InvokeError>(
                     &token,
                     &soroban_sdk::Symbol::new(e, "pause"),
-                    args,
+                    args.clone(),
                 )
                 .is_ok()
             } else {
-                e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "pause"), args);
+                e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "pause"), args.clone());
+                true
+            };
+            if !ok {
+                all_ok = false;
+            }
+        }
+        
+        for i in 0..oracles.len() {
+            let oracle = oracles.get(i).unwrap();
+            let ok = if best_effort {
+                e.try_invoke_contract::<Val, InvokeError>(
+                    &oracle,
+                    &soroban_sdk::Symbol::new(e, "pause"),
+                    args.clone(),
+                )
+                .is_ok()
+            } else {
+                e.invoke_contract::<()>(&oracle, &soroban_sdk::Symbol::new(e, "pause"), args.clone());
                 true
             };
             if !ok {
@@ -1129,7 +1214,7 @@ impl Governance {
             }
         }
 
-        // Only record a clean protocol-wide pause when every token paused;
+        // Only record a clean protocol-wide pause when every contract paused;
         // otherwise the protocol is left partially paused and remediation is
         // observable via `Proposal.action_results` / the `exec_partial` event.
         if all_ok {
@@ -1139,7 +1224,7 @@ impl Governance {
         all_ok
     }
 
-    /// Unpause every registered token contract. Mirrors `pause_all`.
+    /// Unpause every registered token and oracle contract. Mirrors `pause_all`.
     fn unpause_all(e: &Env, best_effort: bool) -> bool {
         let tokens: Vec<Address> = e
             .storage()
@@ -1147,20 +1232,45 @@ impl Governance {
             .get(&DataKey::RegisteredTokens)
             .unwrap_or_else(|| Vec::new(e));
 
+        let oracles: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::RegisteredOracles)
+            .unwrap_or_else(|| Vec::new(e));
+
         let gov_addr = e.current_contract_address();
         let mut all_ok = true;
+        let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
+
         for i in 0..tokens.len() {
             let token = tokens.get(i).unwrap();
-            let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
             let ok = if best_effort {
                 e.try_invoke_contract::<Val, InvokeError>(
                     &token,
                     &soroban_sdk::Symbol::new(e, "unpause"),
-                    args,
+                    args.clone(),
                 )
                 .is_ok()
             } else {
-                e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "unpause"), args);
+                e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "unpause"), args.clone());
+                true
+            };
+            if !ok {
+                all_ok = false;
+            }
+        }
+
+        for i in 0..oracles.len() {
+            let oracle = oracles.get(i).unwrap();
+            let ok = if best_effort {
+                e.try_invoke_contract::<Val, InvokeError>(
+                    &oracle,
+                    &soroban_sdk::Symbol::new(e, "unpause"),
+                    args.clone(),
+                )
+                .is_ok()
+            } else {
+                e.invoke_contract::<()>(&oracle, &soroban_sdk::Symbol::new(e, "unpause"), args.clone());
                 true
             };
             if !ok {

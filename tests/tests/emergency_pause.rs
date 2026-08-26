@@ -475,3 +475,45 @@ fn test_deregister_token_removes_from_list() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining.get(0).unwrap(), token_id_b);
 }
+
+// ── Test 11: Emergency pause affects registered oracles ──────────────────────
+
+use verification_oracle::{VerificationOracle, VerificationOracleClient};
+
+#[test]
+fn test_emergency_pause_affects_registered_oracles() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let member = Address::generate(&e);
+    
+    // Deploy Oracle
+    let oracle_id = e.register_contract(None, VerificationOracle);
+    let oracle_client = VerificationOracleClient::new(&e, &oracle_id);
+    oracle_client.initialize(&admin, &admin, &admin);
+
+    // Deploy Governance
+    let (gov_id, gov_client) = deploy_governance(&e, &admin, Vec::from_array(&e, [member.clone()]));
+
+    // Wire up governance as the oracle's pause guardian
+    oracle_client.set_pause_guardian(&admin, &gov_id);
+    
+    // Register the oracle with governance
+    gov_client.register_oracle(&admin, &oracle_id);
+
+    assert_eq!(gov_client.list_registered_oracles().len(), 1);
+    assert!(!oracle_client.paused(), "oracle should not be paused initially");
+
+    // Pause the protocol via governance
+    gov_client.emergency_pause(&admin);
+
+    assert!(oracle_client.paused(), "oracle must be paused after emergency_pause");
+    assert!(gov_client.is_protocol_paused());
+
+    // Unpause the protocol
+    gov_client.emergency_unpause(&admin);
+
+    assert!(!oracle_client.paused(), "oracle must be unpaused");
+    assert!(!gov_client.is_protocol_paused());
+}
