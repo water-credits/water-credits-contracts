@@ -16,6 +16,8 @@ const EVENT_EMERGENCY_PAUSE: Symbol = symbol_short!("emrg_pse");
 const EVENT_EMERGENCY_UNPAUSE: Symbol = symbol_short!("emrg_ups");
 const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfer");
+const EVENT_EXECUTE_FAILED: Symbol = symbol_short!("exe_fail");
+const EVENT_STALE_RESOLVED: Symbol = symbol_short!("stle_rslv");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +45,11 @@ pub struct GovernanceConfig {
     pub quorum_bps: u32,
     pub min_proposal_deposit: i128,
     pub max_active_proposals: u32,
+    /// Grace period (seconds) after a failed execute attempt before an Approved
+    /// proposal can be resolved as stale. During this window the proposer or
+    /// admin may still manually cancel. Once elapsed, anyone may call
+    /// `resolve_stale_proposal` to cancel and free the active slot.
+    pub stale_grace_period: u64,
 }
 
 #[contracttype]
@@ -85,6 +92,13 @@ pub struct Proposal {
     pub created_at: u64,
     pub voting_ends_at: u64,
     pub timelock_ends_at: u64,
+    /// Number of times `attempt_execute` has been called and the atomic dispatch
+    /// reverted (target contract upgraded/removed). Used by
+    /// `resolve_stale_proposal` to determine if the proposal is stuck.
+    pub failed_execute_attempts: u32,
+    /// Timestamp of the most recent failed `try_execute` attempt. The stale
+    /// grace period is measured from this timestamp.
+    pub last_execute_attempt_at: u64,
 }
 
 #[contracttype]
@@ -178,6 +192,13 @@ const MAX_QUORUM_BPS: u32 = 10_000;
 const MIN_ACTIVE_PROPOSALS: u32 = 1;
 /// Maximum active-proposal cap, to keep the active-proposals list bounded.
 const MAX_ACTIVE_PROPOSALS: u32 = 100;
+/// Minimum stale grace period (1 hour). Shorter windows give operators no
+/// realistic chance to react before a proposal becomes resolvable.
+const MIN_STALE_GRACE_PERIOD: u64 = 3_600;
+/// Maximum stale grace period (30 days).
+const MAX_STALE_GRACE_PERIOD: u64 = 2_592_000;
+/// Default stale grace period: 1 day.
+const DEFAULT_STALE_GRACE_PERIOD: u64 = 86_400;
 
 fn has_admin(e: &Env) -> bool {
     e.storage().instance().has(&DataKey::Admin)
@@ -217,6 +238,9 @@ fn validate_config(config: &GovernanceConfig) {
     }
     if !(MIN_ACTIVE_PROPOSALS..=MAX_ACTIVE_PROPOSALS).contains(&config.max_active_proposals) {
         panic!("max_active_proposals out of range");
+    }
+    if !(MIN_STALE_GRACE_PERIOD..=MAX_STALE_GRACE_PERIOD).contains(&config.stale_grace_period) {
+        panic!("stale_grace_period out of range");
     }
 }
 
@@ -320,6 +344,7 @@ impl Governance {
             quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
+            stale_grace_period: DEFAULT_STALE_GRACE_PERIOD,
         };
         e.storage().instance().set(&DataKey::Config, &config);
         e.storage().instance().set(&DataKey::ProposalCount, &0u64);
@@ -442,6 +467,8 @@ impl Governance {
             created_at: timestamp,
             voting_ends_at: timestamp + config.voting_period,
             timelock_ends_at: 0,
+            failed_execute_attempts: 0,
+            last_execute_attempt_at: 0,
         };
 
         e.storage()
@@ -722,11 +749,159 @@ impl Governance {
         }
     }
 
-    /// Cancel an approved or active proposal. Admin only.
+    /// Try to execute an approved proposal atomically, recording a failed
+    /// attempt if the dispatch would revert.
     ///
-    /// This is the on-chain recovery path for a proposal whose actions can no
-    /// longer succeed (for example a target contract was upgraded and its
-    /// function signature changed, leaving an `Approved` proposal permanently
+    /// This is the detection half of the stale-proposal recovery mechanism.
+    /// When a target contract has been upgraded (function signature changed) or
+    /// removed, a normal `execute()` call reverts and the proposal remains
+    /// stuck in `Approved` with no on-chain evidence of the failure.
+    ///
+    /// `attempt_execute` first performs a dry-run: it calls each action via
+    /// `try_invoke_contract` (no state changes, no auth required from the
+    /// target). If all actions would succeed, it proceeds with the real
+    /// atomic `execute`. If any action would fail, it records the failure
+    /// attempt, emits an `exe_fail` event, and leaves the proposal in
+    /// `Approved` so a member can retry or anyone can call
+    /// `resolve_stale_proposal` after the grace period.
+    ///
+    /// Authorization: any governance member.
+    pub fn attempt_execute(e: Env, caller: Address, proposal_id: u64) {
+        caller.require_auth();
+
+        if !is_member(&e, &caller) {
+            panic!("not a governance member");
+        }
+
+        let proposal_key = DataKey::Proposal(proposal_id);
+        let mut proposal: Proposal = e
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic!("proposal not found"));
+
+        if !matches!(proposal.status, ProposalStatus::Approved) {
+            panic!("proposal not approved");
+        }
+
+        let timestamp = e.ledger().timestamp();
+        if timestamp < proposal.timelock_ends_at {
+            panic!("timelock not elapsed");
+        }
+
+        // Dry-run: test each action via try_invoke_contract (no state changes).
+        // If any action would fail, record the attempt and bail out.
+        for i in 0..proposal.actions.len() {
+            let action = proposal.actions.get(i).unwrap();
+            let dry_ok = match action.protocol_action {
+                ProtocolAction::EmergencyPause | ProtocolAction::EmergencyUnpause => {
+                    // Built-in actions always succeed at the dispatch level;
+                    // real failures are caught per-token inside pause_all/unpause_all.
+                    true
+                }
+                ProtocolAction::None => e
+                    .try_invoke_contract::<Val, InvokeError>(
+                        &action.target,
+                        &action.function,
+                        action.args.clone(),
+                    )
+                    .is_ok(),
+            };
+            if !dry_ok {
+                proposal.failed_execute_attempts += 1;
+                proposal.last_execute_attempt_at = timestamp;
+                e.storage().persistent().set(&proposal_key, &proposal);
+                e.storage().persistent().extend_ttl(
+                    &proposal_key,
+                    PROPOSAL_TTL_THRESHOLD,
+                    PROPOSAL_TTL_BUMP,
+                );
+                e.events().publish(
+                    (EVENT_EXECUTE_FAILED,),
+                    (proposal_id, proposal.failed_execute_attempts),
+                );
+                return;
+            }
+        }
+
+        // All actions passed dry-run: proceed with real atomic execution.
+        Self::remove_from_active(&e, proposal_id);
+
+        for i in 0..proposal.actions.len() {
+            let action = proposal.actions.get(i).unwrap();
+            Self::dispatch_action(&e, &action, false);
+        }
+
+        proposal.status = ProposalStatus::Executed;
+        e.storage().persistent().set(&proposal_key, &proposal);
+        e.storage().persistent().extend_ttl(
+            &proposal_key,
+            PROPOSAL_TTL_THRESHOLD,
+            PROPOSAL_TTL_BUMP,
+        );
+        e.events()
+            .publish((EVENT_PROPOSAL_EXECUTED,), (proposal_id,));
+    }
+
+    /// Resolve a stale Approved proposal that can no longer be executed.
+    ///
+    /// When an Approved proposal's target contract is upgraded or removed, every
+    /// `execute()` call reverts and the proposal is stuck. After the
+    /// `stale_grace_period` has elapsed since the last failed `attempt_execute`
+    /// attempt, **anyone** may call this function to cancel the proposal and
+    /// free its active-proposals slot.
+    ///
+    /// Conditions:
+    ///   1. Proposal status must be `Approved`.
+    ///   2. `failed_execute_attempts >= 1` (at least one failed attempt recorded).
+    ///   3. `last_execute_attempt_at + stale_grace_period <= now`.
+    ///
+    /// Normal Approved proposals are unaffected: they have zero failed attempts
+    /// and can never satisfy condition (2).
+    ///
+    /// Emits a `stale_rslv` event carrying `(proposal_id, failed_attempts)`.
+    pub fn resolve_stale_proposal(e: Env, proposal_id: u64) {
+        let proposal_key = DataKey::Proposal(proposal_id);
+        let mut proposal: Proposal = e
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic!("proposal not found"));
+
+        if !matches!(proposal.status, ProposalStatus::Approved) {
+            panic!("proposal not approved");
+        }
+
+        if proposal.failed_execute_attempts == 0 {
+            panic!("proposal not stale");
+        }
+
+        let timestamp = e.ledger().timestamp();
+        let config: GovernanceConfig = read_config(&e);
+        let grace_deadline = proposal
+            .last_execute_attempt_at
+            .saturating_add(config.stale_grace_period);
+
+        if timestamp < grace_deadline {
+            panic!("grace period not elapsed");
+        }
+
+        proposal.status = ProposalStatus::Cancelled;
+        e.storage().persistent().set(&proposal_key, &proposal);
+        e.storage().persistent().extend_ttl(
+            &proposal_key,
+            PROPOSAL_TTL_THRESHOLD,
+            PROPOSAL_TTL_BUMP,
+        );
+
+        Self::remove_from_active(&e, proposal_id);
+
+        e.events().publish(
+            (EVENT_STALE_RESOLVED,),
+            (proposal_id, proposal.failed_execute_attempts),
+        );
+    }
+
     /// Cancel an approved, active, or pending proposal. Admin or proposer only.
     ///
     /// This is the recovery path for a proposal whose actions can no
@@ -1637,6 +1812,7 @@ mod tests {
             quorum_bps: 5000,
             min_proposal_deposit: 500,
             max_active_proposals: 20,
+            stale_grace_period: 86400,
         };
         client.update_config(&admin, &new_config);
 
@@ -1719,6 +1895,7 @@ mod tests {
             quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
+            stale_grace_period: 86400,
         };
         client.update_config(&new_admin, &config);
 
@@ -1730,6 +1907,7 @@ mod tests {
             quorum_bps: 5000,
             min_proposal_deposit: 1000,
             max_active_proposals: 10,
+            stale_grace_period: 86400,
         };
         let result = client.try_update_config(&admin, &config2);
         assert!(result.is_err());
@@ -2515,6 +2693,615 @@ mod tests {
             &String::from_str(&e, "Second Chance"),
             &String::from_str(&e, "succeeds after rejection"),
             &actions,
+            &false,
+        );
+        assert_eq!(id2, 2);
+    }
+
+    // ── Stale proposal detection & recovery tests ──
+
+    #[test]
+    fn test_attempt_execute_detects_failing_target() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        // Create a proposal targeting always_fail — will always revert.
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Doomed Proposal"),
+            &String::from_str(&e, "will always fail"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+        assert_eq!(proposal.failed_execute_attempts, 0);
+
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        // attempt_execute should detect the failure and record it.
+        client.attempt_execute(&member1, &id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+        assert_eq!(proposal.failed_execute_attempts, 1);
+        assert_eq!(proposal.last_execute_attempt_at, proposal.timelock_ends_at + 1);
+    }
+
+    #[test]
+    fn test_attempt_execute_succeeds_when_target_works() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "set_value"),
+            args: Vec::from_array(&e, [soroban_sdk::IntoVal::into_val(&42i128, &e)]),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Good Proposal"),
+            &String::from_str(&e, "will succeed"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        client.attempt_execute(&member1, &id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Executed));
+        assert_eq!(proposal.failed_execute_attempts, 0);
+    }
+
+    #[test]
+    fn test_attempt_execute_non_member_rejected() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Test"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        let rogue = Address::generate(&e);
+        let result = client.try_attempt_execute(&rogue, &id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_attempt_execute_multiple_failures_increment_counter() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Persistent Fail"),
+            &String::from_str(&e, "keeps failing"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        let mut ts = proposal.timelock_ends_at + 1;
+        let mut info = e.ledger().get();
+        info.timestamp = ts;
+        e.ledger().set(info);
+
+        // Three failed attempts at different timestamps.
+        client.attempt_execute(&member1, &id);
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.failed_execute_attempts, 1);
+
+        ts += 100;
+        let mut info = e.ledger().get();
+        info.timestamp = ts;
+        e.ledger().set(info);
+        client.attempt_execute(&member1, &id);
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.failed_execute_attempts, 2);
+        assert_eq!(proposal.last_execute_attempt_at, ts);
+
+        ts += 100;
+        let mut info = e.ledger().get();
+        info.timestamp = ts;
+        e.ledger().set(info);
+        client.attempt_execute(&member1, &id);
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.failed_execute_attempts, 3);
+        assert_eq!(proposal.last_execute_attempt_at, ts);
+
+        // Proposal is still Approved (not stuck).
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+    }
+
+    #[test]
+    fn test_resolve_stale_proposal_after_grace_period() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Stuck Proposal"),
+            &String::from_str(&e, "needs recovery"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        // Record a failed attempt.
+        client.attempt_execute(&member1, &id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.failed_execute_attempts, 1);
+
+        // Cannot resolve before grace period.
+        let result = client.try_resolve_stale_proposal(&id);
+        assert!(result.is_err());
+
+        // Advance past grace period (default: 86400 seconds).
+        let mut info2 = e.ledger().get();
+        info2.timestamp += 86401;
+        e.ledger().set(info2);
+
+        // Anyone (not just admin/proposer) can resolve.
+        client.resolve_stale_proposal(&id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Cancelled));
+        assert_eq!(proposal.failed_execute_attempts, 1);
+
+        // Active slot must be freed.
+        let active = client.active_proposals();
+        assert!(!active.contains(&id));
+
+        // Can no longer execute.
+        let mut info2 = e.ledger().get();
+        info2.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info2);
+        assert!(client.try_attempt_execute(&member1, &id).is_err());
+    }
+
+    #[test]
+    fn test_resolve_stale_proposal_not_stale_panics() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Healthy Proposal"),
+            &String::from_str(&e, "no failed attempts"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 86401;
+        e.ledger().set(info);
+
+        // No failed attempts → cannot resolve as stale.
+        let result = client.try_resolve_stale_proposal(&id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_stale_proposal_grace_period_not_elapsed_panics() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Too Early"),
+            &String::from_str(&e, "grace period not elapsed"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        client.attempt_execute(&member1, &id);
+
+        // Advance only 1 second past the failed attempt (grace = 86400).
+        let mut info2 = e.ledger().get();
+        info2.timestamp += 1;
+        e.ledger().set(info2);
+
+        let result = client.try_resolve_stale_proposal(&id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stale_proposal_frees_active_slot() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.max_active_proposals = 1;
+        client.update_config(&admin, &config);
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Blocker"),
+            &String::from_str(&e, "blocks slot"),
+            &actions,
+            &false,
+        );
+
+        // Slot is full.
+        let blocked = client.try_propose(
+            &member1,
+            &String::from_str(&e, "Blocked"),
+            &String::from_str(&e, "cannot propose"),
+            &Vec::new(&e),
+            &false,
+        );
+        assert!(blocked.is_err());
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        client.attempt_execute(&member1, &id);
+
+        let mut info2 = e.ledger().get();
+        info2.timestamp += 86401;
+        e.ledger().set(info2);
+
+        client.resolve_stale_proposal(&id);
+
+        // Slot freed — new proposal accepted.
+        let id2 = client.propose(
+            &member1,
+            &String::from_str(&e, "Unblocked"),
+            &String::from_str(&e, "slot freed"),
+            &Vec::new(&e),
+            &false,
+        );
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_attempt_execute_emits_exe_fail_event() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Event Test"),
+            &String::from_str(&e, "check event"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        let events_before = e.events().all().len();
+        client.attempt_execute(&member1, &id);
+        let events_after = e.events().all().len();
+
+        assert!(events_after > events_before);
+
+        let events = e.events().all();
+        let (_contract, topics, data) = &events.get(events.len() - 1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, Symbol::new(&e, "exe_fail"));
+
+        let (ev_id, ev_count) = <(u64, u32)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_id, id);
+        assert_eq!(ev_count, 1);
+    }
+
+    #[test]
+    fn test_resolve_stale_emits_stale_rslv_event() {
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Event Stale"),
+            &String::from_str(&e, "check stale event"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        client.attempt_execute(&member1, &id);
+
+        let mut info2 = e.ledger().get();
+        info2.timestamp += 86401;
+        e.ledger().set(info2);
+
+        client.resolve_stale_proposal(&id);
+
+        let events = e.events().all();
+        let (_contract, topics, data) = &events.get(events.len() - 1).unwrap();
+        let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, Symbol::new(&e, "stle_rslv"));
+
+        let (ev_id, ev_count) = <(u64, u32)>::try_from_val(&e, data).unwrap();
+        assert_eq!(ev_id, id);
+        assert_eq!(ev_count, 1);
+    }
+
+    #[test]
+    fn test_target_upgraded_then_stale_recovery_full_lifecycle() {
+        // Simulates the exact scenario from the issue:
+        // 1. Propose action targeting a contract
+        // 2. Contract is "upgraded" (target changes to always_fail mock)
+        // 3. execute() reverts (tested via try_execute detection)
+        // 4. After grace period, resolve_stale_proposal cancels it
+        // 5. Active slot is freed
+        let (e, admin, member1, client) = setup();
+        e.mock_all_auths();
+
+        let mut config = client.get_config();
+        config.max_active_proposals = 1;
+        config.stale_grace_period = 3600; // 1 hour for test
+        client.update_config(&admin, &config);
+
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        client.add_member(&admin, &member2);
+        client.add_member(&admin, &member3);
+
+        let mock_id = e.register_contract(None, mock_target::MockTarget);
+
+        // Step 1: Create proposal targeting a function that will "break".
+        let action = GovernanceAction {
+            target: mock_id.clone(),
+            function: soroban_sdk::Symbol::new(&e, "always_fail"),
+            args: Vec::new(&e),
+            protocol_action: ProtocolAction::None,
+        };
+        let actions = Vec::from_array(&e, [action]);
+
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Upgrade Victim"),
+            &String::from_str(&e, "target will be upgraded"),
+            &actions,
+            &false,
+        );
+
+        // Step 2: Vote and approve.
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 1;
+        e.ledger().set(info);
+
+        // Step 3: attempt_execute detects the "upgrade" (always_fail).
+        client.attempt_execute(&member1, &id);
+        let proposal = client.get_proposal(&id).unwrap();
+        assert_eq!(proposal.failed_execute_attempts, 1);
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        // Slot is still occupied — cannot propose new.
+        let blocked = client.try_propose(
+            &member1,
+            &String::from_str(&e, "New Thing"),
+            &String::from_str(&e, "blocked"),
+            &Vec::new(&e),
+            &false,
+        );
+        assert!(blocked.is_err());
+
+        // Step 4: Advance past grace period (3600s) and resolve.
+        let mut info2 = e.ledger().get();
+        info2.timestamp += 3601;
+        e.ledger().set(info2);
+
+        client.resolve_stale_proposal(&id);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Cancelled));
+
+        // Step 5: Active slot freed — new proposal accepted.
+        let id2 = client.propose(
+            &member1,
+            &String::from_str(&e, "Replacement"),
+            &String::from_str(&e, "fits in freed slot"),
+            &Vec::new(&e),
             &false,
         );
         assert_eq!(id2, 2);
