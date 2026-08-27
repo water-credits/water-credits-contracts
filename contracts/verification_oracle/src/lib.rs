@@ -6068,20 +6068,20 @@ mod tests {
         let (e, admin, client) = setup_with_client();
         let oracle = Address::generate(&e);
         e.mock_all_auths();
-        
+
         client.add_oracle(&admin, &oracle);
-        
+
         let guardian = Address::generate(&e);
         client.set_pause_guardian(&admin, &guardian);
-        
+
         // Guardian can pause
         client.pause(&guardian);
         assert_eq!(client.paused(), true);
-        
+
         // Guardian can unpause
         client.unpause(&guardian);
         assert_eq!(client.paused(), false);
-        
+
         // Unauthorized third-party cannot pause or unpause
         let third_party = Address::generate(&e);
         let res_pause = client.try_pause(&third_party);
@@ -6099,12 +6099,12 @@ mod tests {
         e.mock_all_auths();
         client.add_oracle(&admin, &oracle);
         client.open_window(&admin, &pid);
-        
+
         client.pause(&admin);
-        
+
         let salt = BytesN::from_array(&e, &[0x01u8; 32]);
         let commit_hash = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
-        
+
         client.commit_reading(&oracle, &pid, &1, &commit_hash);
     }
 
@@ -6117,13 +6117,13 @@ mod tests {
         e.mock_all_auths();
         client.add_oracle(&admin, &oracle);
         client.open_window(&admin, &pid);
-        
+
         let salt = BytesN::from_array(&e, &[0x01u8; 32]);
         let commit_hash = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
         client.commit_reading(&oracle, &pid, &1, &commit_hash);
-        
+
         client.pause(&admin);
-        
+
         let params = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
         client.reveal_reading(&oracle, &pid, &params);
     }

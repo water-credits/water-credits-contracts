@@ -983,7 +983,7 @@ impl Governance {
             .instance()
             .get(&DataKey::RegisteredOracles)
             .unwrap_or_else(|| Vec::new(&e));
-        
+
         for i in 0..oracles.len() {
             if oracles.get(i).unwrap() == oracle {
                 return;
@@ -1175,9 +1175,9 @@ impl Governance {
 
         let gov_addr = e.current_contract_address();
         let mut all_ok = true;
-        
+
         let args: Vec<Val> = vec![e, gov_addr.clone().to_val()];
-        
+
         for i in 0..tokens.len() {
             let token = tokens.get(i).unwrap();
             let ok = if best_effort {
@@ -1188,14 +1188,18 @@ impl Governance {
                 )
                 .is_ok()
             } else {
-                e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "pause"), args.clone());
+                e.invoke_contract::<()>(
+                    &token,
+                    &soroban_sdk::Symbol::new(e, "pause"),
+                    args.clone(),
+                );
                 true
             };
             if !ok {
                 all_ok = false;
             }
         }
-        
+
         for i in 0..oracles.len() {
             let oracle = oracles.get(i).unwrap();
             let ok = if best_effort {
@@ -1206,7 +1210,11 @@ impl Governance {
                 )
                 .is_ok()
             } else {
-                e.invoke_contract::<()>(&oracle, &soroban_sdk::Symbol::new(e, "pause"), args.clone());
+                e.invoke_contract::<()>(
+                    &oracle,
+                    &soroban_sdk::Symbol::new(e, "pause"),
+                    args.clone(),
+                );
                 true
             };
             if !ok {
@@ -1252,7 +1260,11 @@ impl Governance {
                 )
                 .is_ok()
             } else {
-                e.invoke_contract::<()>(&token, &soroban_sdk::Symbol::new(e, "unpause"), args.clone());
+                e.invoke_contract::<()>(
+                    &token,
+                    &soroban_sdk::Symbol::new(e, "unpause"),
+                    args.clone(),
+                );
                 true
             };
             if !ok {
@@ -1270,7 +1282,11 @@ impl Governance {
                 )
                 .is_ok()
             } else {
-                e.invoke_contract::<()>(&oracle, &soroban_sdk::Symbol::new(e, "unpause"), args.clone());
+                e.invoke_contract::<()>(
+                    &oracle,
+                    &soroban_sdk::Symbol::new(e, "unpause"),
+                    args.clone(),
+                );
                 true
             };
             if !ok {

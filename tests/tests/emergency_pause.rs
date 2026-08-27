@@ -487,7 +487,7 @@ fn test_emergency_pause_affects_registered_oracles() {
 
     let admin = Address::generate(&e);
     let member = Address::generate(&e);
-    
+
     // Deploy Oracle
     let oracle_id = e.register_contract(None, VerificationOracle);
     let oracle_client = VerificationOracleClient::new(&e, &oracle_id);
@@ -498,17 +498,23 @@ fn test_emergency_pause_affects_registered_oracles() {
 
     // Wire up governance as the oracle's pause guardian
     oracle_client.set_pause_guardian(&admin, &gov_id);
-    
+
     // Register the oracle with governance
     gov_client.register_oracle(&admin, &oracle_id);
 
     assert_eq!(gov_client.list_registered_oracles().len(), 1);
-    assert!(!oracle_client.paused(), "oracle should not be paused initially");
+    assert!(
+        !oracle_client.paused(),
+        "oracle should not be paused initially"
+    );
 
     // Pause the protocol via governance
     gov_client.emergency_pause(&admin);
 
-    assert!(oracle_client.paused(), "oracle must be paused after emergency_pause");
+    assert!(
+        oracle_client.paused(),
+        "oracle must be paused after emergency_pause"
+    );
     assert!(gov_client.is_protocol_paused());
 
     // Unpause the protocol
