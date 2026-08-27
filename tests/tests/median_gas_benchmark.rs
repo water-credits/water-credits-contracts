@@ -1,4 +1,3 @@
-//! Gas benchmark for `median_i64` with `max_oracles = 10` (issue #30).
 //!
 //! This test exercises the **full finalization path** with 10 oracles, which
 //! calls `median_i64` 7 times (once per sensor field) on 10-element `Vec`s.
@@ -10,9 +9,18 @@
 //! the fix (copy to local `[i64; 10]` array, sort on the stack, zero host
 //! allocations inside `median_i64`), the cost is dominated by the existing
 //! host calls for window state reads/writes, not by the median computation.
+//!
+//! All submissions go through the commit-reveal path (Issue #155: the plaintext
+//! `submit_reading` entry point was removed as a bypass of the anti-frontrunning
+//! scheme).
 
-use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, Vec};
-use verification_oracle::{OracleConfig, VerificationOracle, VerificationOracleClient};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, BytesN, Env, Vec,
+};
+use verification_oracle::{
+    sha256_commitment, OracleConfig, RevealParams, VerificationOracle, VerificationOracleClient,
+};
 
 fn setup_10_oracles(
     e: &Env,
@@ -73,52 +81,103 @@ fn setup_10_oracles(
     (admin, client, project_id, oracles)
 }
 
+/// Drive a full commit-reveal round on `project_id` for all `oracles`,
+/// all submitting the same `reading`. Returns the `VerificationResult`
+/// produced by the final reveal (when `oracles.len() >= min_oracles`).
+fn finalize_via_commit_reveal(
+    e: &Env,
+    admin: &Address,
+    client: &VerificationOracleClient<'static>,
+    project_id: &BytesN<32>,
+    oracles: &Vec<Address>,
+    reading: (i64, i64, i64, i64, i64, i64, i64),
+    salt: &BytesN<32>,
+    nonce: u64,
+) -> Option<verification_oracle::VerificationResult> {
+    let (ph, turb, do_, flow, temp, n, p) = reading;
+    let commitment = sha256_commitment(e, nonce, ph, turb, do_, flow, temp, n, p, salt);
+    let reveal_params = RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt: salt.clone(),
+    };
+
+    client.open_window(admin, project_id);
+    for i in 0..oracles.len() {
+        client.commit_reading(&oracles.get(i).unwrap(), project_id, &nonce, &commitment);
+    }
+
+    // Advance past the commit phase (default 300 s / 60 ledgers).
+    e.ledger().with_mut(|l| {
+        l.timestamp += 301;
+        l.sequence_number += 61;
+    });
+    client.begin_reveal_phase(project_id);
+
+    let mut last = None;
+    for i in 0..oracles.len() {
+        last = client.reveal_reading(&oracles.get(i).unwrap(), project_id, &reveal_params);
+    }
+    last
+}
+
 #[test]
 fn test_median_gas_with_ten_oracles_within_budget() {
     let e = Env::default();
     e.mock_all_auths();
 
     // Use the default test budget (not unlimited) so we can observe actual usage.
-    let (_admin, client, project_id, oracles) = setup_10_oracles(&e);
+    let (admin, client, project_id, oracles) = setup_10_oracles(&e);
 
     // All 10 oracles submit the same "healthy system" readings from
     // doc/MATH.md Example A so the credit formula path is exercised.
-    let (ph, turb, do_, flow, temp, n, p): (i64, i64, i64, i64, i64, i64, i64) =
-        (700, 10, 80, 500, 250, 8, 1);
+    let reading: (i64, i64, i64, i64, i64, i64, i64) = (700, 10, 80, 500, 250, 8, 1);
+    let salt = BytesN::from_array(&e, &[0xCCu8; 32]);
+    let nonce = 1u64;
+    let commitment = sha256_commitment(&e, nonce, 700, 10, 80, 500, 250, 8, 1, &salt);
+    let reveal_params = RevealParams {
+        nonce,
+        ph: reading.0,
+        turbidity: reading.1,
+        dissolved_oxygen: reading.2,
+        flow_rate: reading.3,
+        temperature: reading.4,
+        total_nitrogen: reading.5,
+        total_phosphorus: reading.6,
+        salt: salt.clone(),
+    };
 
-    // First 9 submissions — none finalize the window (min_oracles = 10).
+    client.open_window(&admin, &project_id);
+
+    // All 10 oracles commit.
+    for i in 0..10u32 {
+        client.commit_reading(&oracles.get(i).unwrap(), &project_id, &nonce, &commitment);
+    }
+
+    // Advance past commit phase.
+    e.ledger().with_mut(|l| {
+        l.timestamp += 301;
+        l.sequence_number += 61;
+    });
+    client.begin_reveal_phase(&project_id);
+
+    // First 9 reveals — none finalize the window (min_oracles = 10).
     for i in 0..9u32 {
-        let result = client.submit_reading(
-            &oracles.get(i).unwrap(),
-            &project_id,
-            &1,
-            &ph,
-            &turb,
-            &do_,
-            &flow,
-            &temp,
-            &n,
-            &p,
-        );
+        let result = client.reveal_reading(&oracles.get(i).unwrap(), &project_id, &reveal_params);
         assert!(result.is_none());
     }
 
-    // Record budget before the 10th (finalizing) submission.
+    // Record budget before the 10th (finalizing) reveal.
     let budget_before = e.budget().cpu_instruction_cost();
 
-    // 10th submission — triggers finalization, calls median_i64 7×.
-    let result = client.submit_reading(
-        &oracles.get(9).unwrap(),
-        &project_id,
-        &1,
-        &ph,
-        &turb,
-        &do_,
-        &flow,
-        &temp,
-        &n,
-        &p,
-    );
+    // 10th reveal — triggers finalization, calls median_i64 7×.
+    let result = client.reveal_reading(&oracles.get(9).unwrap(), &project_id, &reveal_params);
 
     let budget_after = e.budget().cpu_instruction_cost();
 
@@ -167,67 +226,97 @@ fn test_median_gas_scales_linearly_from_three_to_ten() {
     let (_admin10, client10, project_id10, oracles10) = setup_10_oracles(&e10);
 
     let reading: (i64, i64, i64, i64, i64, i64, i64) = (700, 10, 80, 500, 250, 8, 1);
+    let salt3 = BytesN::from_array(&e3, &[0xDDu8; 32]);
+    let salt10 = BytesN::from_array(&e10, &[0xDDu8; 32]);
+    let nonce = 1u64;
 
-    // 3-oracle finalization
+    // ── 3-oracle: commit phase ──
+    let commitment3 = sha256_commitment(
+        &e3,
+        nonce,
+        reading.0,
+        reading.1,
+        reading.2,
+        reading.3,
+        reading.4,
+        reading.5,
+        reading.6,
+        &salt3,
+    );
+    let reveal3 = RevealParams {
+        nonce,
+        ph: reading.0,
+        turbidity: reading.1,
+        dissolved_oxygen: reading.2,
+        flow_rate: reading.3,
+        temperature: reading.4,
+        total_nitrogen: reading.5,
+        total_phosphorus: reading.6,
+        salt: salt3.clone(),
+    };
+    client3.open_window(&admin3, &project_id3);
+    for i in 0..3u32 {
+        client3.commit_reading(&oracles3.get(i).unwrap(), &project_id3, &nonce, &commitment3);
+    }
+    e3.ledger().with_mut(|l| {
+        l.timestamp += 301;
+        l.sequence_number += 61;
+    });
+    client3.begin_reveal_phase(&project_id3);
+
+    // First 2 reveals — don't finalize yet.
     for i in 0..2u32 {
-        client3.submit_reading(
-            &oracles3.get(i).unwrap(),
-            &project_id3,
-            &1,
-            &reading.0,
-            &reading.1,
-            &reading.2,
-            &reading.3,
-            &reading.4,
-            &reading.5,
-            &reading.6,
-        );
+        client3.reveal_reading(&oracles3.get(i).unwrap(), &project_id3, &reveal3);
     }
     let before3 = e3.budget().cpu_instruction_cost();
-    let r3 = client3.submit_reading(
-        &oracles3.get(2).unwrap(),
-        &project_id3,
-        &1,
-        &reading.0,
-        &reading.1,
-        &reading.2,
-        &reading.3,
-        &reading.4,
-        &reading.5,
-        &reading.6,
-    );
+    let r3 = client3.reveal_reading(&oracles3.get(2).unwrap(), &project_id3, &reveal3);
     let after3 = e3.budget().cpu_instruction_cost();
     assert!(r3.is_some());
     let cost3 = after3 - before3;
 
-    // 10-oracle finalization
+    // ── 10-oracle: commit phase ──
+    let commitment10 = sha256_commitment(
+        &e10,
+        nonce,
+        reading.0,
+        reading.1,
+        reading.2,
+        reading.3,
+        reading.4,
+        reading.5,
+        reading.6,
+        &salt10,
+    );
+    let reveal10 = RevealParams {
+        nonce,
+        ph: reading.0,
+        turbidity: reading.1,
+        dissolved_oxygen: reading.2,
+        flow_rate: reading.3,
+        temperature: reading.4,
+        total_nitrogen: reading.5,
+        total_phosphorus: reading.6,
+        salt: salt10.clone(),
+    };
+    let admin10 = Address::generate(&e10);
+    // We don't have a direct handle to admin10 from setup_10_oracles, but
+    // e10 has mock_all_auths so any address can act as admin.
+    client10.open_window(&admin10, &project_id10);
+    for i in 0..10u32 {
+        client10.commit_reading(&oracles10.get(i).unwrap(), &project_id10, &nonce, &commitment10);
+    }
+    e10.ledger().with_mut(|l| {
+        l.timestamp += 301;
+        l.sequence_number += 61;
+    });
+    client10.begin_reveal_phase(&project_id10);
+
+    // First 9 reveals — don't finalize yet.
     for i in 0..9u32 {
-        client10.submit_reading(
-            &oracles10.get(i).unwrap(),
-            &project_id10,
-            &1,
-            &reading.0,
-            &reading.1,
-            &reading.2,
-            &reading.3,
-            &reading.4,
-            &reading.5,
-            &reading.6,
-        );
+        client10.reveal_reading(&oracles10.get(i).unwrap(), &project_id10, &reveal10);
     }
     let before10 = e10.budget().cpu_instruction_cost();
-    let r10 = client10.submit_reading(
-        &oracles10.get(9).unwrap(),
-        &project_id10,
-        &1,
-        &reading.0,
-        &reading.1,
-        &reading.2,
-        &reading.3,
-        &reading.4,
-        &reading.5,
-        &reading.6,
-    );
+    let r10 = client10.reveal_reading(&oracles10.get(9).unwrap(), &project_id10, &reveal10);
     let after10 = e10.budget().cpu_instruction_cost();
     assert!(r10.is_some());
     let cost10 = after10 - before10;

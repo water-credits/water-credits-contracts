@@ -745,9 +745,8 @@ pub struct FinalizationResult {
     pub total: i128,
 }
 
-/// Shared finalization arithmetic used by both `submit_reading_impl` and
-/// `finalize_reveals`. Every multiplication uses `checked_mul` so that
-/// near-`i64::MAX` intermediate values (e.g. `flow_rate` at the top of its
+/// Shared finalization arithmetic used by `finalize_reveals`. Every multiplication uses
+/// `checked_mul` so that near-`i64::MAX` intermediate values (e.g. `flow_rate` at the top of its
 /// valid range) panic and revert the transaction instead of silently
 /// wrapping in `i128`. `total` is floored at 0 so a maximal quality penalty
 /// can never be misread as a negative credit balance.
@@ -1050,22 +1049,30 @@ impl VerificationOracle {
             .unwrap_or_else(|| Vec::new(&e))
     }
 
-    /// Submit a sensor reading for a project. Uses nonce-based replay protection.
-    /// When min_oracles submissions are collected, computes median values, calculates
-    /// nutrient removal, quality penalty, and volumetric credits. If a ProjectConfig
-    /// is set, automatically mints credits to the configured beneficiary.
+    /// `submit_reading` has been removed (Issue #155).
+    ///
+    /// The plaintext single-call submission path bypassed the commit-reveal
+    /// scheme, allowing MEV/frontrunning of oracle readings and contradicting
+    /// the SPEC guarantee that "there is no plaintext single-call entry point".
+    ///
+    /// Use the commit-reveal path instead:
+    ///   1. `open_window(admin, project_id)`
+    ///   2. `commit_reading(oracle, project_id, nonce, sha256(reading || nonce || salt))`
+    ///   3. `begin_reveal_phase(project_id)` — after `commit_phase_secs` have elapsed
+    ///   4. `reveal_reading(oracle, project_id, RevealParams { nonce, reading fields, salt })`
+    #[allow(unused_variables)]
     pub fn submit_reading(
-        e: Env,
-        oracle: Address,
-        project_id: BytesN<32>,
-        nonce: u64,
-        ph: i64,
-        turbidity: i64,
-        dissolved_oxygen: i64,
-        flow_rate: i64,
-        temperature: i64,
-        total_nitrogen: i64,
-        total_phosphorus: i64,
+        _e: Env,
+        _oracle: Address,
+        _project_id: BytesN<32>,
+        _nonce: u64,
+        _ph: i64,
+        _turbidity: i64,
+        _dissolved_oxygen: i64,
+        _flow_rate: i64,
+        _temperature: i64,
+        _total_nitrogen: i64,
+        _total_phosphorus: i64,
     ) -> Option<VerificationResult> {
         Self::submit_reading_impl(
             e,
@@ -5594,6 +5601,11 @@ mod tests {
 
     #[test]
     fn test_window_finalizes_with_min_oracles_after_one_removed() {
+        // Verifies that after o4 is removed (it never participated in any window),
+        // the remaining three oracles can still finalize a new window — and that
+        // removal itself is allowed because o4 has no open submissions.
+        // Previously used the removed `submit_reading` path (Issue #155);
+        // rewritten to use the commit-reveal helpers.
         let (e, admin, client) = setup_with_client();
         e.mock_all_auths();
 
@@ -5607,25 +5619,43 @@ mod tests {
         client.add_oracle(&admin, &o4);
 
         let project_id = BytesN::from_array(&e, &[216u8; 32]);
+        let salt = BytesN::from_array(&e, &[0xE0u8; 32]);
 
-        // First window: 3 oracles submit, finalize
-        client.submit_reading(&o1, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
-        let result =
-            client.submit_reading(&o3, &project_id, &1, &700, &10, &80, &500, &250, &8, &1);
+        // Build a Vec of o1, o2, o3 (o4 never participates).
+        let mut three_oracles: Vec<Address> = Vec::new(&e);
+        three_oracles.push_back(o1.clone());
+        three_oracles.push_back(o2.clone());
+        three_oracles.push_back(o3.clone());
+
+        // Window 1: o1, o2, o3 commit-reveal → auto-finalizes on the 3rd reveal.
+        let result = commit_reveal_round_same(
+            &e,
+            &admin,
+            &client,
+            &project_id,
+            &three_oracles,
+            1,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
 
-        // Remove o4 (never submitted to this window)
+        // o4 never committed/revealed, so remove_oracle must succeed.
         client.remove_oracle(&admin, &o4);
         assert!(!client.is_oracle_active(&o4));
 
-        // Reset and resubmit — 3 remaining oracles finalize the window
+        // Window 2: reset, then o1, o2, o3 run a second commit-reveal round.
         client.reset_window(&admin, &project_id);
-        client.submit_reading(&o1, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        client.submit_reading(&o2, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
-        let result =
-            client.submit_reading(&o3, &project_id, &2, &700, &10, &80, &500, &250, &8, &1);
+        let result = commit_reveal_round_same_no_open(
+            &e,
+            &client,
+            &project_id,
+            &three_oracles,
+            2,
+            (700, 10, 80, 500, 250, 8, 1),
+            &salt,
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().oracle_count, 3);
     }
