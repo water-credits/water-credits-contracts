@@ -18,6 +18,8 @@ const EVENT_ORACLE_MISSED_REVEAL: Symbol = symbol_short!("orc_mr");
 const EVENT_WINDOW_OPENED: Symbol = symbol_short!("wnd_opn");
 const EVENT_INITIALIZED: Symbol = symbol_short!("init");
 const EVENT_ADMIN_TRANSFERRED: Symbol = symbol_short!("adm_xfer");
+const EVENT_PAUSED: Symbol = symbol_short!("paused");
+const EVENT_UNPAUSED: Symbol = symbol_short!("unpaused");
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -267,6 +269,8 @@ pub enum DataKey {
     OracleList, // bounded by max_oracles (≤10); safe in instance
     Config,
     TotalSubmissions,
+    Paused,
+    PauseGuardian,
     // ── Persistent (loaded on explicit access, survives with rent) ──
     OracleActive(Address),
     OracleNonce((BytesN<32>, Address)),
@@ -319,6 +323,19 @@ fn has_admin(e: &Env) -> bool {
 
 fn read_admin(e: &Env) -> Address {
     e.storage().instance().get(&DataKey::Admin).unwrap()
+}
+
+fn is_paused(e: &Env) -> bool {
+    e.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+fn require_not_paused(e: &Env) {
+    if is_paused(e) {
+        panic!("contract is paused");
+    }
 }
 
 fn read_config(e: &Env) -> OracleConfig {
@@ -926,6 +943,55 @@ impl VerificationOracle {
 
         e.events()
             .publish((EVENT_ADMIN_TRANSFERRED,), (stored, new_admin));
+    }
+
+    /// Pause all verification operations (commit_reading, reveal_reading, finalize_window). Admin or pause guardian only.
+    pub fn pause(e: Env, caller: Address) {
+        caller.require_auth();
+        let admin = read_admin(&e);
+        let guardian: Option<Address> = e.storage().instance().get(&DataKey::PauseGuardian);
+        if caller != admin && guardian.as_ref() != Some(&caller) {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::Paused, &true);
+        e.events().publish((EVENT_PAUSED,), ());
+    }
+
+    /// Resume verification operations after a pause. Admin or pause guardian only.
+    pub fn unpause(e: Env, caller: Address) {
+        caller.require_auth();
+        let admin = read_admin(&e);
+        let guardian: Option<Address> = e.storage().instance().get(&DataKey::PauseGuardian);
+        if caller != admin && guardian.as_ref() != Some(&caller) {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::Paused, &false);
+        e.events().publish((EVENT_UNPAUSED,), ());
+    }
+
+    /// Returns true if the contract is currently paused.
+    pub fn paused(e: Env) -> bool {
+        is_paused(&e)
+    }
+
+    /// Set the pause guardian: a secondary address that may call `pause` and `unpause`
+    /// in addition to the admin. Intended for use by the governance contract so that
+    /// it can trigger an emergency pause without being the full token admin.
+    /// Pass the zero address (or call without a guardian) to clear the guardian.
+    /// Admin only.
+    pub fn set_pause_guardian(e: Env, admin: Address, guardian: Address) {
+        admin.require_auth();
+        if admin != read_admin(&e) {
+            panic!("unauthorized");
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::PauseGuardian, &guardian);
+    }
+
+    /// Return the current pause guardian address, if any.
+    pub fn pause_guardian(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::PauseGuardian)
     }
 
     /// Add an oracle address to the whitelist. Only admin can call.
@@ -1924,6 +1990,7 @@ impl VerificationOracle {
         commitment: BytesN<32>,
     ) {
         oracle.require_auth();
+        require_not_paused(&e);
 
         if !e
             .storage()
@@ -2065,6 +2132,7 @@ impl VerificationOracle {
         params: RevealParams,
     ) -> Option<VerificationResult> {
         oracle.require_auth();
+        require_not_paused(&e);
 
         if !e
             .storage()
@@ -2206,6 +2274,7 @@ impl VerificationOracle {
     /// Penalizes oracles that committed but did not reveal.
     /// Can be called by anyone once the reveal phase duration has elapsed.
     pub fn finalize_window(e: Env, project_id: BytesN<32>) -> Option<VerificationResult> {
+        require_not_paused(&e);
         let window_key = DataKey::WindowState(project_id.clone());
         let window: WindowState = e
             .storage()
@@ -2506,17 +2575,26 @@ mod tests {
             pub fn balance(_e: Env, _addr: Address) -> i128 {
                 1_000_000
             }
-        }
 
-        pub fn total_supply(_e: Env) -> i128 {
-            0
-        }
+            pub fn total_supply(e: Env) -> i128 {
+                0
+            }
 
-        pub fn max_supply(_e: Env) -> i128 {
-            1_000_000_000
+            pub fn max_supply(e: Env) -> i128 {
+                1_000_000_000
+            }
         }
     }
     use mock_token::MockToken;
+
+    #[test]
+    fn test_mock_token_directly() {
+        let e = Env::default();
+        let token_contract = e.register_contract(None, MockToken);
+        let client = mock_token::MockTokenClient::new(&e, &token_contract);
+        assert_eq!(client.total_supply(), 0);
+        assert_eq!(client.max_supply(), 1_000_000_000);
+    }
 
     fn setup_with_client() -> (Env, Address, VerificationOracleClient<'static>) {
         let e = Env::default();
@@ -5983,5 +6061,81 @@ mod tests {
         let mut config = client.get_config();
         config.max_open_windows = 0;
         client.update_config(&admin, &config);
+    }
+
+    #[test]
+    fn test_pause_mechanisms() {
+        let (e, admin, client) = setup_with_client();
+        let oracle = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.add_oracle(&admin, &oracle);
+
+        let guardian = Address::generate(&e);
+        client.set_pause_guardian(&admin, &guardian);
+
+        // Guardian can pause
+        client.pause(&guardian);
+        assert_eq!(client.paused(), true);
+
+        // Guardian can unpause
+        client.unpause(&guardian);
+        assert_eq!(client.paused(), false);
+
+        // Unauthorized third-party cannot pause or unpause
+        let third_party = Address::generate(&e);
+        let res_pause = client.try_pause(&third_party);
+        assert!(res_pause.is_err());
+        let res_unpause = client.try_unpause(&third_party);
+        assert!(res_unpause.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is paused")]
+    fn test_paused_rejects_commit_reading() {
+        let (e, admin, client) = setup_with_client();
+        let oracle = Address::generate(&e);
+        let pid = BytesN::from_array(&e, &[100u8; 32]);
+        e.mock_all_auths();
+        client.add_oracle(&admin, &oracle);
+        client.open_window(&admin, &pid);
+
+        client.pause(&admin);
+
+        let salt = BytesN::from_array(&e, &[0x01u8; 32]);
+        let commit_hash = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+
+        client.commit_reading(&oracle, &pid, &1, &commit_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is paused")]
+    fn test_paused_rejects_reveal_reading() {
+        let (e, admin, client) = setup_with_client();
+        let oracle = Address::generate(&e);
+        let pid = BytesN::from_array(&e, &[101u8; 32]);
+        e.mock_all_auths();
+        client.add_oracle(&admin, &oracle);
+        client.open_window(&admin, &pid);
+
+        let salt = BytesN::from_array(&e, &[0x01u8; 32]);
+        let commit_hash = sha256_commitment(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.commit_reading(&oracle, &pid, &1, &commit_hash);
+
+        client.pause(&admin);
+
+        let params = make_reveal_params(&e, 1, 700, 10, 80, 500, 250, 8, 1, &salt);
+        client.reveal_reading(&oracle, &pid, &params);
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is paused")]
+    fn test_paused_rejects_finalize_window() {
+        let (e, admin, client) = setup_with_client();
+        let pid = BytesN::from_array(&e, &[102u8; 32]);
+        e.mock_all_auths();
+        client.open_window(&admin, &pid);
+        client.pause(&admin);
+        client.finalize_window(&pid);
     }
 }
