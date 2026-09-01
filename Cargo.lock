@@ -192,6 +192,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "credit_bridge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "shared",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "credit_factory"
 version = "0.1.0"
 dependencies = [
@@ -1336,9 +1345,11 @@ dependencies = [
 name = "tests"
 version = "0.1.0"
 dependencies = [
+ "credit_bridge",
  "credit_factory",
  "credit_marketplace",
  "credit_token",
+ "ed25519-dalek",
  "governance",
  "project_registry",
  "retirement_registry",

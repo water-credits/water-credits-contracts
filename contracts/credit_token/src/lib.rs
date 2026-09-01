@@ -89,6 +89,8 @@ pub enum DataKey {
     PauseGuardian,
     /// When true, `retire()` panics if no retirement registry is configured.
     RequireRegistry,
+    Bridge,
+    BridgedToEvm,
 }
 
 fn is_paused(e: &Env) -> bool {
@@ -126,6 +128,17 @@ fn require_minter(e: &Env, caller: &Address) {
     if *caller != minter && *caller != admin {
         panic!("unauthorized minter");
     }
+}
+
+fn read_bridged_to_evm(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&DataKey::BridgedToEvm)
+        .unwrap_or(0)
+}
+
+fn save_bridged_to_evm(e: &Env, amount: i128) {
+    e.storage().instance().set(&DataKey::BridgedToEvm, &amount);
 }
 
 fn read_balance(e: &Env, addr: &Address) -> i128 {
@@ -428,6 +441,25 @@ impl CreditToken {
         e.storage().instance().get(&DataKey::PauseGuardian)
     }
 
+    /// Set the bridge contract address. Admin only.
+    pub fn set_bridge(e: Env, admin: Address, bridge: Address) {
+        admin.require_auth();
+        if admin != read_admin(&e) {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::Bridge, &bridge);
+    }
+
+    /// Return the current bridge contract address, if any.
+    pub fn bridge(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::Bridge)
+    }
+
+    /// Return the current amount of tokens bridged to EVM.
+    pub fn bridged_to_evm(e: Env) -> i128 {
+        read_bridged_to_evm(&e)
+    }
+
     /// Mint new credits to a beneficiary. Callable by admin or designated minter.
     pub fn mint_to(e: Env, minter: Address, to: Address, amount: i128) {
         if amount <= 0 {
@@ -437,9 +469,28 @@ impl CreditToken {
         require_minter(&e, &minter);
 
         let total = read_total_supply(&e);
+        let bridged = read_bridged_to_evm(&e);
         let max: i128 = e.storage().instance().get(&DataKey::MaxSupply).unwrap_or(0);
-        if max > 0 && total.checked_add(amount).expect("overflow") > max {
+        if max > 0
+            && total
+                .checked_add(bridged)
+                .expect("overflow")
+                .checked_add(amount)
+                .expect("overflow")
+                > max
+        {
             panic!("max supply exceeded");
+        }
+
+        let bridge_opt: Option<Address> = e.storage().instance().get(&DataKey::Bridge);
+        if let Some(ref bridge) = bridge_opt {
+            if minter == *bridge {
+                let bridged = read_bridged_to_evm(&e);
+                if bridged < amount {
+                    panic!("insufficient bridged amount");
+                }
+                save_bridged_to_evm(&e, bridged - amount);
+            }
         }
 
         let balance = read_balance(&e, &to);
@@ -491,13 +542,25 @@ impl CreditToken {
 
     /// Burn credits from a holder. Admin only.
     /// Note: burn is explicitly allowed while the contract is paused (e.g. for emergency recalls).
-    pub fn burn(e: Env, admin: Address, from: Address, amount: i128) {
+    pub fn burn(e: Env, caller: Address, from: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
         }
-        admin.require_auth();
-        let stored: Address = read_admin(&e);
-        if admin != stored {
+        caller.require_auth();
+        let admin = read_admin(&e);
+        let bridge_opt: Option<Address> = e.storage().instance().get(&DataKey::Bridge);
+
+        let mut is_bridge = false;
+        if let Some(ref bridge) = bridge_opt {
+            if caller == *bridge {
+                is_bridge = true;
+                if from != *bridge {
+                    panic!("unauthorized: bridge can only burn from itself");
+                }
+            }
+        }
+
+        if !is_bridge && caller != admin {
             panic!("unauthorized");
         }
 
@@ -511,6 +574,11 @@ impl CreditToken {
 
         let new_total_burned = read_total_burned(&e).checked_add(amount).expect("overflow");
         save_total_burned(&e, new_total_burned);
+
+        if is_bridge {
+            let bridged = read_bridged_to_evm(&e);
+            save_bridged_to_evm(&e, bridged.checked_add(amount).expect("overflow"));
+        }
 
         e.events()
             .publish((EVENT_BURNED,), (from, amount, new_total_burned));

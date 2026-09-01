@@ -548,9 +548,9 @@ mod tests {
         );
 
         let events = e.events().all();
-        // initialize(1) + register_project(1) = 2
-        assert_eq!(events.len(), 2);
-        let (_contract, topics, _data) = &events.get(1).unwrap();
+        // initialize(1) + token_initialize(1) + register_project(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("proj_reg"));
     }
@@ -1011,9 +1011,9 @@ mod tests {
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
 
         let events = e.events().all();
-        // initialize(1) + register_project(1) + update_project_status(1) = 3
-        assert_eq!(events.len(), 3);
-        let (_contract, topics, data) = &events.get(2).unwrap();
+        // initialize(1) + token_initialize(1) + register_project(1) + update_project_status(1) = 4
+        assert_eq!(events.len(), 4);
+        let (_contract, topics, data) = &events.get(3).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("stat_chg"));
 
@@ -1045,9 +1045,9 @@ mod tests {
         client.update_project_owner(&admin, &pid, &new_owner);
 
         let events = e.events().all();
-        // initialize(1) + register_project(1) + update_project_owner(1) = 3
-        assert_eq!(events.len(), 3);
-        let (_contract, topics, data) = &events.get(2).unwrap();
+        // initialize(1) + token_initialize(1) + register_project(1) + update_project_owner(1) = 4
+        assert_eq!(events.len(), 4);
+        let (_contract, topics, data) = &events.get(3).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("ownr_chg"));
 

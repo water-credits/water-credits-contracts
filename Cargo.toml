@@ -8,6 +8,7 @@ members = [
     "contracts/project_registry",
     "contracts/governance",
     "contracts/credit_marketplace",
+    "contracts/credit_bridge",
     "tests",
 ]
 resolver = "2"

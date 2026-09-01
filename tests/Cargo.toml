@@ -13,6 +13,7 @@ testutils = [
     "project_registry/testutils",
     "governance/testutils",
     "credit_marketplace/testutils",
+    "credit_bridge/testutils",
 ]
 
 [dependencies]
@@ -23,8 +24,10 @@ retirement_registry = { path = "../contracts/retirement_registry", features = ["
 project_registry = { path = "../contracts/project_registry", features = ["testutils"] }
 governance = { path = "../contracts/governance", features = ["testutils"] }
 credit_marketplace = { path = "../contracts/credit_marketplace", features = ["testutils"] }
+credit_bridge = { path = "../contracts/credit_bridge", features = ["testutils"] }
 shared = { path = "../contracts/shared" }
 soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+ed25519-dalek = { version = "2.0.0", features = ["rand_core"] }
 
 [build-dependencies]
 # Used by build.rs to normalize the credit_token WASM encoding for the
