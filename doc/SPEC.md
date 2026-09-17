@@ -257,7 +257,7 @@ under-counted 6×.
 | Default | `3600` — set in `initialize`, so existing deployments are unaffected |
 | Valid range | `60 ≤ window_secs ≤ 86_400` (1 minute to 1 day), exported as `MIN_WINDOW_SECS` / `MAX_WINDOW_SECS` |
 | Validated in | `update_config` — out-of-range values panic with `window_secs out of valid range [60, 86400]` and leave the stored config untouched |
-| Applied in | `compute_finalization`, reached from both `submit_reading_impl` and `finalize_reveals`, each passing `config.window_secs` |
+| Applied in | `compute_finalization`, reached from `finalize_reveals`, passing `config.window_secs` |
 
 Only the nutrient-removal terms scale with the window; `volumetric_credit` is a
 flow-rate credit with no `Δt` factor and is unchanged by it. Admins must keep
@@ -524,7 +524,7 @@ admin's control.
 |---|---|---|
 | Admin | Contract deployer / multisig | Pause/unpause, set max supply, oracle whitelist, project status, config updates |
 | Minter | Designated address (typically oracle) | `mint_to`, `batch_mint_to` |
-| Oracle | Whitelisted oracle nodes | `submit_reading` |
+| Oracle | Whitelisted oracle nodes | `commit_reading`, `reveal_reading` |
 | Project owner | Registered developer wallet | `update_owner` / `update_project_owner` |
 | Credit holder | Any address with credits | `transfer`, `approve`, `retire` |
 | Anyone | Public | All read-only queries |

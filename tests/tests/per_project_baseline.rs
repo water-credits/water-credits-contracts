@@ -1,20 +1,23 @@
 //! Integration tests for Issue #26: per-project nutrient/temperature baselines.
 //!
-//! Before #26, `submit_reading_impl` hardcoded `baseline_n = 10` and
-//! `baseline_p = 2` (and compared temperature against the global
-//! `quality_threshold_temp` max) for every project. This made every project use
-//! the same thresholds regardless of its actual water quality, producing
-//! systematically wrong credit totals.
+//! Before #26, the oracle hardcoded `baseline_n = 10` and `baseline_p = 2` (and
+//! compared temperature against the global `quality_threshold_temp` max) for
+//! every project. This made every project use the same thresholds regardless of
+//! its actual water quality, producing systematically wrong credit totals.
 //!
 //! These tests prove the fix: two projects with identical sensor readings but
 //! different `ProjectConfig` baselines produce different credit totals, and the
 //! per-project temperature baseline drives the temperature quality penalty.
+//! All contract-level tests use the commit-reveal path; the legacy `submit_reading`
+//! plaintext entry point has been removed (Issue #155).
 
 use credit_token::{CreditToken, CreditTokenClient};
 use soroban_sdk::{
     testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, String, Vec,
 };
-use verification_oracle::{sha256_commitment, VerificationOracle, VerificationOracleClient};
+use verification_oracle::{
+    sha256_commitment, RevealParams, VerificationOracle, VerificationOracleClient,
+};
 
 /// Identical sensor readings for both projects. Encodings per doc/MATH.md §1:
 /// ph=700 (7.00), turb=10, do=80, flow=500 L/s, temp=250 (25.0°C),
@@ -101,19 +104,38 @@ fn configure_project(
 
 fn submit_three(f: &Fixture, project_id: &BytesN<32>) {
     let (ph, turb, do_, flow, temp, n, p) = READING;
+    let salt = BytesN::from_array(&f._e, &[0xABu8; 32]);
+    let nonce: u64 = 1;
+    let commitment = sha256_commitment(&f._e, nonce, ph, turb, do_, flow, temp, n, p, &salt);
+
+    f.oracle_client.open_window(&f.admin, project_id);
     for i in 0..3u32 {
-        f.oracle_client.submit_reading(
-            &f.oracles.get(i).unwrap(),
-            project_id,
-            &1,
-            &ph,
-            &turb,
-            &do_,
-            &flow,
-            &temp,
-            &n,
-            &p,
-        );
+        f.oracle_client
+            .commit_reading(&f.oracles.get(i).unwrap(), project_id, &nonce, &commitment);
+    }
+
+    // Advance past the default commit phase (300 s).
+    let mut info = f._e.ledger().get();
+    info.timestamp += 301;
+    info.sequence_number += 61;
+    f._e.ledger().set(info);
+
+    f.oracle_client.begin_reveal_phase(project_id);
+
+    let params = RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt,
+    };
+    for i in 0..3u32 {
+        f.oracle_client
+            .reveal_reading(&f.oracles.get(i).unwrap(), project_id, &params);
     }
 }
 
@@ -229,19 +251,36 @@ fn test_reading_equals_baseline_zero_removal() {
     let proj = configure_project(&f, 10, 2, 300);
 
     let (ph, turb, do_, flow, temp, _, _) = READING;
+    let salt = BytesN::from_array(&f._e, &[0xBCu8; 32]);
+    let nonce: u64 = 1;
+    let n: i64 = 10; // == baseline_n
+    let p: i64 = 2; // == baseline_p
+    let commitment = sha256_commitment(&f._e, nonce, ph, turb, do_, flow, temp, n, p, &salt);
+
+    f.oracle_client.open_window(&f.admin, &proj);
     for i in 0..3u32 {
-        f.oracle_client.submit_reading(
-            &f.oracles.get(i).unwrap(),
-            &proj,
-            &1,
-            &ph,
-            &turb,
-            &do_,
-            &flow,
-            &temp,
-            &10, // n = baseline_n exactly
-            &2,  // p = baseline_p exactly
-        );
+        f.oracle_client
+            .commit_reading(&f.oracles.get(i).unwrap(), &proj, &nonce, &commitment);
+    }
+    let mut info = f._e.ledger().get();
+    info.timestamp += 301;
+    info.sequence_number += 61;
+    f._e.ledger().set(info);
+    f.oracle_client.begin_reveal_phase(&proj);
+    let params = RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt,
+    };
+    for i in 0..3u32 {
+        f.oracle_client
+            .reveal_reading(&f.oracles.get(i).unwrap(), &proj, &params);
     }
 
     let res = f.oracle_client.get_last_result(&proj).unwrap();
@@ -265,19 +304,36 @@ fn test_reading_above_baseline_zero_removal() {
     let proj = configure_project(&f, 5, 1, 300);
 
     let (ph, turb, do_, flow, temp, _, _) = READING;
+    let salt = BytesN::from_array(&f._e, &[0xCDu8; 32]);
+    let nonce: u64 = 1;
+    let n: i64 = 8; // n > baseline_n
+    let p: i64 = 1; // p == baseline_p
+    let commitment = sha256_commitment(&f._e, nonce, ph, turb, do_, flow, temp, n, p, &salt);
+
+    f.oracle_client.open_window(&f.admin, &proj);
     for i in 0..3u32 {
-        f.oracle_client.submit_reading(
-            &f.oracles.get(i).unwrap(),
-            &proj,
-            &1,
-            &ph,
-            &turb,
-            &do_,
-            &flow,
-            &temp,
-            &8, // n > baseline_n
-            &1, // p == baseline_p
-        );
+        f.oracle_client
+            .commit_reading(&f.oracles.get(i).unwrap(), &proj, &nonce, &commitment);
+    }
+    let mut info = f._e.ledger().get();
+    info.timestamp += 301;
+    info.sequence_number += 61;
+    f._e.ledger().set(info);
+    f.oracle_client.begin_reveal_phase(&proj);
+    let params = RevealParams {
+        nonce,
+        ph,
+        turbidity: turb,
+        dissolved_oxygen: do_,
+        flow_rate: flow,
+        temperature: temp,
+        total_nitrogen: n,
+        total_phosphorus: p,
+        salt,
+    };
+    for i in 0..3u32 {
+        f.oracle_client
+            .reveal_reading(&f.oracles.get(i).unwrap(), &proj, &params);
     }
 
     let res = f.oracle_client.get_last_result(&proj).unwrap();

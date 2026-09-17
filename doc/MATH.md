@@ -52,7 +52,7 @@ responsible for encoding physical values before submission.
 
 ### 1.1 Entry Validation
 
-Every call to `submit_reading` and `reveal_reading` validates the raw sensor fields
+Every call to `reveal_reading` validates the raw sensor fields
 before they can enter median aggregation. A reading that fails validation panics
 (reverting the transaction) rather than being accepted:
 
@@ -114,9 +114,8 @@ concentrations below hardcoded baselines, integrated over the monitoring window.
 The window length is the configurable **`window_secs`** field of `OracleConfig`
 (seconds). It defaults to **3 600** (one hour), the value the formula previously
 hardcoded, so an untouched deployment behaves exactly as before. `update_config`
-constrains it to `60 ≤ window_secs ≤ 86 400` (1 minute to 1 day), and both
-finalization paths — `submit_reading_impl` and `finalize_reveals` — pass
-`config.window_secs` into `compute_finalization`.
+constrains it to `60 ≤ window_secs ≤ 86 400` (1 minute to 1 day), and
+`finalize_reveals` passes `config.window_secs` into `compute_finalization`.
 
 `window_secs` must match the interval at which the deployment's oracles actually
 submit. A deployment reporting every 30 minutes while `window_secs` is left at
