@@ -1128,7 +1128,7 @@ An oracle node is an off-chain service that:
 1. Receives sensor readings from edge gateways (via REST or MQTT).
 2. Validates the cryptographic signature of each reading.
 3. Aggregates readings from multiple gateways (optional).
-4. Calls `verification_oracle.submit_reading()` with the validated data.
+4. Calls `verification_oracle.commit_reading()` followed by `reveal_reading()` with the validated data.
 5. Manages nonces and retry logic.
 
 ### Oracle Staking
