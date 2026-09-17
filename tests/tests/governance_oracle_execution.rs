@@ -11,7 +11,7 @@
 //! address equals the invoking contract's own address — no extra signature
 //! is needed.
 
-use governance::{Governance, GovernanceAction, GovernanceClient};
+use governance::{Governance, GovernanceAction, GovernanceClient, ProtocolAction};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     Address, Env, IntoVal, String, Symbol, Vec,
@@ -64,6 +64,7 @@ fn test_proposal_updates_oracle_config_via_cross_contract_execution() {
             &e,
             [gov_id.clone().to_val(), new_config.clone().into_val(&e)],
         ),
+        protocol_action: ProtocolAction::None,
     };
     let actions = Vec::from_array(&e, [action]);
 

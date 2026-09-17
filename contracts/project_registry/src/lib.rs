@@ -193,7 +193,9 @@ impl ProjectRegistry {
     pub fn update_status(e: Env, caller: Address, project_id: BytesN<32>, status: String) {
         caller.require_auth();
         let stored: Address = read_admin(&e);
-        if caller != stored {
+        let auth_key = DataKey::AuthorizedCaller(caller.clone());
+        let authorized: bool = e.storage().persistent().get(&auth_key).unwrap_or(false);
+        if caller != stored && !authorized {
             panic!("unauthorized");
         }
 
@@ -300,6 +302,8 @@ impl ProjectRegistry {
     pub fn update_owner(e: Env, caller: Address, project_id: BytesN<32>, new_owner: Address) {
         caller.require_auth();
         let admin = read_admin(&e);
+        let auth_key = DataKey::AuthorizedCaller(caller.clone());
+        let authorized: bool = e.storage().persistent().get(&auth_key).unwrap_or(false);
         let key = DataKey::Project(project_id.clone());
         let mut project: ProjectEntry = e
             .storage()
@@ -307,7 +311,7 @@ impl ProjectRegistry {
             .get(&key)
             .unwrap_or_else(|| panic!("project not found"));
 
-        if caller != admin && caller != project.owner {
+        if caller != admin && caller != project.owner && !authorized {
             panic!("unauthorized");
         }
 

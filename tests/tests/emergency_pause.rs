@@ -2,11 +2,11 @@
 //!
 //! Covers:
 //!   1. Governance admin can directly call `emergency_pause` / `emergency_unpause`.
-//!   2. A supermajority proposal with action `"emergency_pause"` executes and pauses.
+//!   2. A supermajority proposal with `ProtocolAction::EmergencyPause` executes and pauses.
 //!   3. A paused token blocks `mint_to`, `transfer`, and `retire`.
 
 use credit_token::{CreditToken, CreditTokenClient};
-use governance::{Governance, GovernanceAction, GovernanceClient};
+use governance::{Governance, GovernanceAction, GovernanceClient, ProtocolAction};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     Address, BytesN, Env, String, Symbol, Vec,
@@ -130,11 +130,13 @@ fn test_supermajority_proposal_emergency_pause() {
     assert!(!token_client.paused());
     assert!(!gov_client.is_protocol_paused());
 
-    // Build a proposal whose single action is the built-in emergency_pause.
+    // Build a proposal whose single action is the built-in EmergencyPause.
+    // `target`/`function`/`args` are ignored for built-in actions.
     let pause_action = GovernanceAction {
-        target: gov_id.clone(), // target is ignored for built-in actions
-        function: Symbol::new(&e, "emergency_pause"),
+        target: gov_id.clone(),
+        function: Symbol::new(&e, "unused"),
         args: Vec::new(&e),
+        protocol_action: ProtocolAction::EmergencyPause,
     };
     let actions = Vec::from_array(&e, [pause_action]);
 
@@ -195,11 +197,12 @@ fn test_supermajority_proposal_emergency_unpause() {
     gov_client.emergency_pause(&admin);
     assert!(token_client.paused());
 
-    // Propose to unpause.
+    // Propose to unpause via the built-in EmergencyUnpause action.
     let unpause_action = GovernanceAction {
         target: gov_id.clone(),
-        function: Symbol::new(&e, "emergency_unpause"),
+        function: Symbol::new(&e, "unused"),
         args: Vec::new(&e),
+        protocol_action: ProtocolAction::EmergencyUnpause,
     };
     let actions = Vec::from_array(&e, [unpause_action]);
 
@@ -471,4 +474,52 @@ fn test_deregister_token_removes_from_list() {
     let remaining = gov_client.list_registered_tokens();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining.get(0).unwrap(), token_id_b);
+}
+
+// ── Test 11: Emergency pause affects registered oracles ──────────────────────
+
+use verification_oracle::{VerificationOracle, VerificationOracleClient};
+
+#[test]
+fn test_emergency_pause_affects_registered_oracles() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let member = Address::generate(&e);
+
+    // Deploy Oracle
+    let oracle_id = e.register_contract(None, VerificationOracle);
+    let oracle_client = VerificationOracleClient::new(&e, &oracle_id);
+    oracle_client.initialize(&admin, &admin, &admin);
+
+    // Deploy Governance
+    let (gov_id, gov_client) = deploy_governance(&e, &admin, Vec::from_array(&e, [member.clone()]));
+
+    // Wire up governance as the oracle's pause guardian
+    oracle_client.set_pause_guardian(&admin, &gov_id);
+
+    // Register the oracle with governance
+    gov_client.register_oracle(&admin, &oracle_id);
+
+    assert_eq!(gov_client.list_registered_oracles().len(), 1);
+    assert!(
+        !oracle_client.paused(),
+        "oracle should not be paused initially"
+    );
+
+    // Pause the protocol via governance
+    gov_client.emergency_pause(&admin);
+
+    assert!(
+        oracle_client.paused(),
+        "oracle must be paused after emergency_pause"
+    );
+    assert!(gov_client.is_protocol_paused());
+
+    // Unpause the protocol
+    gov_client.emergency_unpause(&admin);
+
+    assert!(!oracle_client.paused(), "oracle must be unpaused");
+    assert!(!gov_client.is_protocol_paused());
 }

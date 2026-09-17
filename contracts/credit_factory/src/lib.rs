@@ -279,6 +279,24 @@ impl CreditFactory {
             panic!("unauthorized");
         }
 
+        if let Some(registry_address) = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ProjectRegistry)
+        {
+            let update_args: Vec<Val> = vec![
+                &e,
+                e.current_contract_address().to_val(),
+                project_id.clone().to_val(),
+                status.clone().to_val(),
+            ];
+            e.invoke_contract::<()>(
+                &registry_address,
+                &Symbol::new(&e, "update_status"),
+                update_args,
+            );
+        }
+
         if !is_valid_status(&e, &status) {
             panic!("invalid status");
         }
@@ -334,6 +352,24 @@ impl CreditFactory {
 
         if caller != admin && caller != project.owner {
             panic!("unauthorized");
+        }
+
+        if let Some(registry_address) = e
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::ProjectRegistry)
+        {
+            let update_args: Vec<Val> = vec![
+                &e,
+                e.current_contract_address().to_val(),
+                project_id.clone().to_val(),
+                new_owner.clone().to_val(),
+            ];
+            e.invoke_contract::<()>(
+                &registry_address,
+                &Symbol::new(&e, "update_owner"),
+                update_args,
+            );
         }
 
         let old_owner = project.owner.clone();
@@ -512,9 +548,9 @@ mod tests {
         );
 
         let events = e.events().all();
-        // initialize(1) + register_project(1) = 2
-        assert_eq!(events.len(), 2);
-        let (_contract, topics, _data) = &events.get(1).unwrap();
+        // initialize(1) + token_initialize(1) + register_project(1) = 3
+        assert_eq!(events.len(), 3);
+        let (_contract, topics, _data) = &events.get(2).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("proj_reg"));
     }
@@ -975,9 +1011,9 @@ mod tests {
         client.update_project_status(&admin, &pid, &String::from_str(&e, "active"));
 
         let events = e.events().all();
-        // initialize(1) + register_project(1) + update_project_status(1) = 3
-        assert_eq!(events.len(), 3);
-        let (_contract, topics, data) = &events.get(2).unwrap();
+        // initialize(1) + token_initialize(1) + register_project(1) + update_project_status(1) = 4
+        assert_eq!(events.len(), 4);
+        let (_contract, topics, data) = &events.get(3).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("stat_chg"));
 
@@ -1009,9 +1045,9 @@ mod tests {
         client.update_project_owner(&admin, &pid, &new_owner);
 
         let events = e.events().all();
-        // initialize(1) + register_project(1) + update_project_owner(1) = 3
-        assert_eq!(events.len(), 3);
-        let (_contract, topics, data) = &events.get(2).unwrap();
+        // initialize(1) + token_initialize(1) + register_project(1) + update_project_owner(1) = 4
+        assert_eq!(events.len(), 4);
+        let (_contract, topics, data) = &events.get(3).unwrap();
         let topic: Symbol = Symbol::try_from_val(&e, &topics.get(0).unwrap()).unwrap();
         assert_eq!(topic, symbol_short!("ownr_chg"));
 

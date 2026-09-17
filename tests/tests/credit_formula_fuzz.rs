@@ -96,6 +96,7 @@ fn default_config(e: &Env) -> OracleConfig {
         max_slash_amount: i128::MAX,
         window_secs: 3600,
         max_open_windows: 20,
+        fee_bps: 0,
     }
 }
 

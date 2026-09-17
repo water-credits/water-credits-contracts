@@ -2,4 +2,4 @@ target/
 *.wasm
 test_snapshots/
 .DS_Store
-issues.md
+issues.mdtest_output.log

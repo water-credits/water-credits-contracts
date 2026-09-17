@@ -453,3 +453,86 @@ fn test_full_credit_lifecycle() {
     assert_eq!(client.total_retired(), 500);
     assert_eq!(client.total_supply(), 4500);
 }
+
+/// Invariant test: when `fee_bps` is enabled, the protocol fee is minted
+/// to the treasury and `total_supply == credits_minted + protocol_fee_minted`.
+/// This confirms supply conservation with the fee mechanism active.
+#[test]
+fn test_protocol_fee_supply_conservation() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let admin = Address::generate(&e);
+    let beneficiary = Address::generate(&e);
+    let treasury = Address::generate(&e);
+    let project_id = BytesN::from_array(&e, &[0xAA; 32]);
+
+    let (token_id, token_client) = deploy_token(&e, &admin, &project_id);
+    let (oracle_id, oracle_client) = deploy_oracle_with_treasury(&e, &admin, &treasury);
+
+    // Set minter to oracle and configure project
+    token_client.set_minter(&admin, &oracle_id);
+    oracle_client.set_project_config(&admin, &project_id, &token_id, &beneficiary, &10, &2, &300);
+
+    // Add 3 oracles
+    let o1 = Address::generate(&e);
+    let o2 = Address::generate(&e);
+    let o3 = Address::generate(&e);
+    oracle_client.add_oracle(&admin, &o1);
+    oracle_client.add_oracle(&admin, &o2);
+    oracle_client.add_oracle(&admin, &o3);
+
+    // Enable 10% protocol fee (1000 bps)
+    let mut config = oracle_client.get_config();
+    config.fee_bps = 1000;
+    oracle_client.update_config(&admin, &config);
+
+    // Submit a direct reading (all 3 oracles same values → median = value)
+    let reading = (700i64, 10i64, 80i64, 500i64, 250i64, 8i64, 1i64);
+    let (ph, turb, do_, flow, temp, n, p) = reading;
+    oracle_client.submit_reading(&o1, &project_id, &1, &ph, &turb, &do_, &flow, &temp, &n, &p);
+    oracle_client.submit_reading(&o2, &project_id, &1, &ph, &turb, &do_, &flow, &temp, &n, &p);
+    oracle_client.submit_reading(&o3, &project_id, &1, &ph, &turb, &do_, &flow, &temp, &n, &p);
+
+    // Verify: beneficiary got credits, treasury got fee
+    let beneficiary_balance = token_client.balance(&beneficiary);
+    let treasury_balance = token_client.balance(&treasury);
+
+    assert!(
+        beneficiary_balance > 0,
+        "beneficiary should receive net credits"
+    );
+    assert!(treasury_balance > 0, "treasury should receive protocol fee");
+
+    // Core invariant: total_supply == net + fee (no credits lost or created)
+    let result = oracle_client.get_last_result(&project_id).unwrap();
+    assert_eq!(
+        token_client.total_supply(),
+        result.credits_minted + result.protocol_fee_minted,
+        "supply conservation: total_supply == credits_minted + protocol_fee_minted"
+    );
+
+    // Fee accounting: credits_minted + protocol_fee_minted == total_credits
+    assert_eq!(
+        result.credits_minted + result.protocol_fee_minted,
+        result.total_credits,
+        "full amount accounted for: net + fee == total_credits"
+    );
+
+    // Verify the beneficiary and treasury balances match the result
+    assert_eq!(beneficiary_balance, result.credits_minted);
+    assert_eq!(treasury_balance, result.protocol_fee_minted);
+}
+
+/// Helper to deploy oracle with a known treasury address.
+fn deploy_oracle_with_treasury(
+    e: &Env,
+    admin: &Address,
+    treasury: &Address,
+) -> (Address, VerificationOracleClient<'static>) {
+    let contract_id = e.register_contract(None, VerificationOracle);
+    let client = VerificationOracleClient::new(e, &contract_id);
+    let staking_token = Address::generate(e);
+    client.initialize(admin, &staking_token, treasury);
+    (contract_id, client)
+}

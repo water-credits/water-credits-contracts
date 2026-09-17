@@ -69,8 +69,13 @@ pub enum DataKey {
     TotalRetired,
     /// Running total of credits destroyed via `burn()` (admin-only, no retirement record).
     /// Maintained separately from `TotalRetired` so that supply conservation can be
-    /// verified on-chain: `total_supply + total_retired + total_burned == ever_minted`.
+    /// verified on-chain: `total_supply + total_retired + total_burned == ever_minted()`.
     TotalBurned,
+    /// Cumulative sum of every credit ever minted via `mint_to` / `batch_mint_to`.
+    /// Never decreases (burns/retirements only reduce `TotalSupply`). Serves as the
+    /// canonical "ever minted" reference for the supply-conservation invariant
+    /// `total_supply + total_retired + total_burned == ever_minted()`.
+    EverMinted,
     Name,
     Symbol,
     Decimals,
@@ -84,6 +89,8 @@ pub enum DataKey {
     PauseGuardian,
     /// When true, `retire()` panics if no retirement registry is configured.
     RequireRegistry,
+    Bridge,
+    BridgedToEvm,
 }
 
 fn is_paused(e: &Env) -> bool {
@@ -121,6 +128,17 @@ fn require_minter(e: &Env, caller: &Address) {
     if *caller != minter && *caller != admin {
         panic!("unauthorized minter");
     }
+}
+
+fn read_bridged_to_evm(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&DataKey::BridgedToEvm)
+        .unwrap_or(0)
+}
+
+fn save_bridged_to_evm(e: &Env, amount: i128) {
+    e.storage().instance().set(&DataKey::BridgedToEvm, &amount);
 }
 
 fn read_balance(e: &Env, addr: &Address) -> i128 {
@@ -167,6 +185,17 @@ fn read_total_burned(e: &Env) -> i128 {
 
 fn save_total_burned(e: &Env, amount: i128) {
     e.storage().instance().set(&DataKey::TotalBurned, &amount);
+}
+
+fn read_ever_minted(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&DataKey::EverMinted)
+        .unwrap_or(0)
+}
+
+fn save_ever_minted(e: &Env, amount: i128) {
+    e.storage().instance().set(&DataKey::EverMinted, &amount);
 }
 
 fn read_allowance(e: &Env, from: &Address, spender: &Address) -> i128 {
@@ -219,6 +248,7 @@ impl CreditToken {
         e.storage().instance().set(&DataKey::TotalSupply, &0i128);
         e.storage().instance().set(&DataKey::TotalRetired, &0i128);
         e.storage().instance().set(&DataKey::TotalBurned, &0i128);
+        e.storage().instance().set(&DataKey::EverMinted, &0i128);
         e.storage().instance().set(&DataKey::Metadata, &metadata);
         e.storage().instance().set(&DataKey::CertCount, &0u64);
 
@@ -411,6 +441,25 @@ impl CreditToken {
         e.storage().instance().get(&DataKey::PauseGuardian)
     }
 
+    /// Set the bridge contract address. Admin only.
+    pub fn set_bridge(e: Env, admin: Address, bridge: Address) {
+        admin.require_auth();
+        if admin != read_admin(&e) {
+            panic!("unauthorized");
+        }
+        e.storage().instance().set(&DataKey::Bridge, &bridge);
+    }
+
+    /// Return the current bridge contract address, if any.
+    pub fn bridge(e: Env) -> Option<Address> {
+        e.storage().instance().get(&DataKey::Bridge)
+    }
+
+    /// Return the current amount of tokens bridged to EVM.
+    pub fn bridged_to_evm(e: Env) -> i128 {
+        read_bridged_to_evm(&e)
+    }
+
     /// Mint new credits to a beneficiary. Callable by admin or designated minter.
     pub fn mint_to(e: Env, minter: Address, to: Address, amount: i128) {
         if amount <= 0 {
@@ -420,14 +469,37 @@ impl CreditToken {
         require_minter(&e, &minter);
 
         let total = read_total_supply(&e);
+        let bridged = read_bridged_to_evm(&e);
         let max: i128 = e.storage().instance().get(&DataKey::MaxSupply).unwrap_or(0);
-        if max > 0 && total.checked_add(amount).expect("overflow") > max {
+        if max > 0
+            && total
+                .checked_add(bridged)
+                .expect("overflow")
+                .checked_add(amount)
+                .expect("overflow")
+                > max
+        {
             panic!("max supply exceeded");
+        }
+
+        let bridge_opt: Option<Address> = e.storage().instance().get(&DataKey::Bridge);
+        if let Some(ref bridge) = bridge_opt {
+            if minter == *bridge {
+                let bridged = read_bridged_to_evm(&e);
+                if bridged < amount {
+                    panic!("insufficient bridged amount");
+                }
+                save_bridged_to_evm(&e, bridged - amount);
+            }
         }
 
         let balance = read_balance(&e, &to);
         save_balance(&e, &to, balance.checked_add(amount).expect("overflow"));
         save_total_supply(&e, total.checked_add(amount).expect("overflow"));
+        save_ever_minted(
+            &e,
+            read_ever_minted(&e).checked_add(amount).expect("overflow"),
+        );
 
         e.events().publish((EVENT_MINTED,), (to, amount));
     }
@@ -446,6 +518,7 @@ impl CreditToken {
         require_minter(&e, &minter);
 
         let mut total = read_total_supply(&e);
+        let mut ever_minted = read_ever_minted(&e);
         let max: i128 = e.storage().instance().get(&DataKey::MaxSupply).unwrap_or(0);
 
         for i in 0..recipients.len() {
@@ -461,19 +534,33 @@ impl CreditToken {
             save_balance(&e, &to, balance.checked_add(amount).expect("overflow"));
             total = total.checked_add(amount).expect("overflow");
             save_total_supply(&e, total);
+            ever_minted = ever_minted.checked_add(amount).expect("overflow");
             e.events().publish((EVENT_MINTED,), (to, amount));
         }
+        save_ever_minted(&e, ever_minted);
     }
 
     /// Burn credits from a holder. Admin only.
     /// Note: burn is explicitly allowed while the contract is paused (e.g. for emergency recalls).
-    pub fn burn(e: Env, admin: Address, from: Address, amount: i128) {
+    pub fn burn(e: Env, caller: Address, from: Address, amount: i128) {
         if amount <= 0 {
             panic!("amount must be positive");
         }
-        admin.require_auth();
-        let stored: Address = read_admin(&e);
-        if admin != stored {
+        caller.require_auth();
+        let admin = read_admin(&e);
+        let bridge_opt: Option<Address> = e.storage().instance().get(&DataKey::Bridge);
+
+        let mut is_bridge = false;
+        if let Some(ref bridge) = bridge_opt {
+            if caller == *bridge {
+                is_bridge = true;
+                if from != *bridge {
+                    panic!("unauthorized: bridge can only burn from itself");
+                }
+            }
+        }
+
+        if !is_bridge && caller != admin {
             panic!("unauthorized");
         }
 
@@ -487,6 +574,11 @@ impl CreditToken {
 
         let new_total_burned = read_total_burned(&e).checked_add(amount).expect("overflow");
         save_total_burned(&e, new_total_burned);
+
+        if is_bridge {
+            let bridged = read_bridged_to_evm(&e);
+            save_bridged_to_evm(&e, bridged.checked_add(amount).expect("overflow"));
+        }
 
         e.events()
             .publish((EVENT_BURNED,), (from, amount, new_total_burned));
@@ -662,6 +754,19 @@ impl CreditToken {
             .get(&DataKey::RequireRegistry)
             .unwrap_or(false);
 
+        if registry_addr.is_none() && require_registry {
+            soroban_sdk::panic_with_error!(&e, soroban_sdk::Error::from_contract_error(1));
+        }
+
+        let total = read_total_supply(&e);
+        let total_retired = read_total_retired(&e);
+
+        // Commit the token accounting before handing control to the registry.
+        // If the registry call fails, Soroban rolls these writes back atomically.
+        save_balance(&e, &holder, balance - amount);
+        save_total_supply(&e, total - amount);
+        save_total_retired(&e, total_retired + amount);
+
         let registry_record_id = if let Some(registry) = registry_addr {
             let record_args: Vec<Val> = vec![
                 &e,
@@ -678,19 +783,9 @@ impl CreditToken {
                 record_args,
             );
             Some(record_id)
-        } else if require_registry {
-            soroban_sdk::panic_with_error!(&e, soroban_sdk::Error::from_contract_error(1));
         } else {
             None
         };
-
-        save_balance(&e, &holder, balance - amount);
-
-        let total = read_total_supply(&e);
-        save_total_supply(&e, total - amount);
-
-        let total_retired = read_total_retired(&e);
-        save_total_retired(&e, total_retired + amount);
 
         let cert_count: u64 = e.storage().instance().get(&DataKey::CertCount).unwrap();
         let timestamp = e.ledger().timestamp();
@@ -735,10 +830,23 @@ impl CreditToken {
 
     /// Total credits destroyed via admin `burn()` (no retirement record issued).
     ///
-    /// Invariant: `total_supply() + total_retired() + total_burned() == ever_minted`
-    /// where `ever_minted` is the cumulative sum of all `mint_to` / `batch_mint_to` calls.
+    /// Invariant: `total_supply() + total_retired() + total_burned() == ever_minted()`
     pub fn total_burned(e: Env) -> i128 {
         read_total_burned(&e)
+    }
+
+    /// Cumulative total of credits ever minted, across all `mint_to` and
+    /// `batch_mint_to` calls. This is the canonical "ever minted" reference for
+    /// the supply-conservation invariant (SPEC §5, Invariant 1):
+    ///
+    /// ```text
+    /// total_supply() + total_retired() + total_burned() == ever_minted()
+    /// ```
+    ///
+    /// The value never decreases: transfers move balances, `retire()` and `burn()`
+    /// only shift credits from `total_supply` into `total_retired`/`total_burned`.
+    pub fn ever_minted(e: Env) -> i128 {
+        read_ever_minted(&e)
     }
 
     pub fn allowance(e: Env, from: Address, spender: Address) -> i128 {
@@ -1406,6 +1514,95 @@ mod tests {
         assert_eq!(client.balance(&user1), 0);
         assert_eq!(client.balance(&user2), 0);
         assert_eq!(client.total_supply(), 0);
+        assert_eq!(client.ever_minted(), 0);
+    }
+
+    #[test]
+    fn test_ever_minted_accumulates_across_mint_to_and_batch() {
+        let (e, admin, user1, user2, _, client) = setup();
+        let user3 = Address::generate(&e);
+        e.mock_all_auths();
+
+        assert_eq!(client.ever_minted(), 0);
+
+        // Single mint
+        client.mint_to(&admin, &user1, &1000);
+        assert_eq!(client.ever_minted(), 1000);
+
+        // Batch mint accumulates every recipient's amount
+        let recipients = Vec::from_array(&e, [user1.clone(), user2.clone(), user3.clone()]);
+        let amounts: Vec<i128> = Vec::from_array(&e, [100i128, 200i128, 300i128]);
+        client.batch_mint_to(&admin, &recipients, &amounts);
+        assert_eq!(client.ever_minted(), 1600);
+
+        // Transfers, retirements, and burns never reduce ever_minted.
+        client.transfer(&user1, &user2, &400);
+        let purpose = String::from_str(&e, "voluntary");
+        let uri = String::from_str(&e, "ipfs://QmCert");
+        client.retire(&user3, &300, &purpose, &uri);
+        client.burn(&admin, &user1, &200);
+        assert_eq!(client.ever_minted(), 1600);
+
+        // The conservation invariant still holds after all operations.
+        assert_eq!(
+            client.total_supply() + client.total_retired() + client.total_burned(),
+            client.ever_minted()
+        );
+    }
+
+    #[test]
+    fn test_batch_mint_to_third_recipient_breaches_cap_atomic_failure() {
+        let (e, admin, user1, user2, _, client) = setup();
+        let user3 = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.set_max_supply(&admin, &1000);
+
+        // Pre-existing balances so the "unchanged" assertions are meaningful.
+        client.mint_to(&admin, &user1, &100);
+        client.mint_to(&admin, &user2, &200);
+
+        // Running total 300 → +200 (500) → +200 (700) → +400 (1100) breaches cap.
+        let recipients = Vec::from_array(&e, [user1.clone(), user2.clone(), user3.clone()]);
+        let amounts: Vec<i128> = Vec::from_array(&e, [200i128, 200i128, 400i128]);
+
+        let result = client.try_batch_mint_to(&admin, &recipients, &amounts);
+        assert!(
+            result.is_err(),
+            "batch_mint_to must panic when the third recipient breaches max_supply"
+        );
+
+        // The whole batch failed atomically: recipients 1 and 2 keep their
+        // pre-existing balances and no supply or ever_minted was recorded.
+        assert_eq!(
+            client.balance(&user1),
+            100,
+            "user1 balance must be unchanged"
+        );
+        assert_eq!(
+            client.balance(&user2),
+            200,
+            "user2 balance must be unchanged"
+        );
+        assert_eq!(client.balance(&user3), 0);
+        assert_eq!(client.total_supply(), 300);
+        assert_eq!(client.ever_minted(), 300);
+    }
+
+    #[test]
+    #[should_panic(expected = "max supply exceeded")]
+    fn test_batch_mint_to_third_recipient_breaches_cap_panic_message() {
+        let (e, admin, user1, user2, _, client) = setup();
+        let user3 = Address::generate(&e);
+        e.mock_all_auths();
+
+        client.set_max_supply(&admin, &1000);
+
+        // Running total 0 → +400 (400) → +400 (800) → +300 (1100) breaches cap.
+        let recipients = Vec::from_array(&e, [user1.clone(), user2.clone(), user3.clone()]);
+        let amounts: Vec<i128> = Vec::from_array(&e, [400i128, 400i128, 300i128]);
+
+        client.batch_mint_to(&admin, &recipients, &amounts);
     }
 
     #[test]

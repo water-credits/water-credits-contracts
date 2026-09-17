@@ -5,7 +5,7 @@
 //! proposals, and verifies token behavior on both sides of the pause.
 
 use credit_token::CreditTokenClient;
-use governance::{GovernanceAction, GovernanceClient};
+use governance::{GovernanceAction, GovernanceClient, ProtocolAction};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     Address, BytesN, Env, String, Symbol, Vec,
@@ -21,16 +21,19 @@ fn execute_protocol_action(
     governance: &GovernanceClient,
     governance_id: &Address,
     member: &Address,
-    function: &str,
+    protocol_action: ProtocolAction,
 ) {
+    // `target`/`function`/`args` are ignored for built-in protocol actions;
+    // the enum variant alone selects the dispatch path.
     let action = GovernanceAction {
         target: governance_id.clone(),
-        function: Symbol::new(e, function),
+        function: Symbol::new(e, "unused"),
         args: Vec::new(e),
+        protocol_action,
     };
     let proposal_id = governance.propose(
         member,
-        &String::from_str(e, function),
+        &String::from_str(e, "emergency control"),
         &String::from_str(e, "Exercise the governance emergency control"),
         &Vec::from_array(e, [action]),
         &false,
@@ -77,7 +80,13 @@ fn governance_pause_and_unpause_control_real_token_wasm() {
         Vec::from_array(&e, [token_id])
     );
 
-    execute_protocol_action(&e, &governance, &governance_id, &member, "emergency_pause");
+    execute_protocol_action(
+        &e,
+        &governance,
+        &governance_id,
+        &member,
+        ProtocolAction::EmergencyPause,
+    );
 
     assert!(governance.is_protocol_paused());
     assert!(token.paused());
@@ -89,7 +98,7 @@ fn governance_pause_and_unpause_control_real_token_wasm() {
         &governance,
         &governance_id,
         &member,
-        "emergency_unpause",
+        ProtocolAction::EmergencyUnpause,
     );
 
     assert!(!governance.is_protocol_paused());
