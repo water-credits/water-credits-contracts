@@ -67,7 +67,7 @@ This repository contains the **on-chain component** of the Water Quality & Reple
 | `credit_factory` | **Factory** — deploys new credit tokens for registered projects | `register_project`, `get_project`, `update_status` |
 | `verification_oracle` | **Verifier** — ingests sensor data, validates, computes credits | `commit_reading`, `reveal_reading`, `add_oracle`, `get_config` |
 | `retirement_registry` | **Registry** — immutable record of all credit retirements | `record_retirement`, `get_record`, `total_retired` |
-| `project_registry` | **Directory** — on-chain metadata store for all projects | `register`, `get`, `update_status`, `list_all` |
+| `project_registry` | **Directory** — on-chain metadata store for all projects | `register`, `get`, `update_status`, `list_paginated` |
 | `governance` | **DAO** — protocol parameters, oracle whitelist, multisig | `propose`, `vote`, `execute` |
 
 ### Design Principles
@@ -496,8 +496,12 @@ pub fn update_status(env: Env, admin: Address, id: BytesN<32>, status: String);
 /// Get the total number of projects registered.
 pub fn count(env: Env) -> u64;
 
-/// List all registered projects (paginate in production).
+/// List registered projects. Returns up to 100 entries.
+/// Use `list_paginated` for full/production iteration.
 pub fn list_all(env: Env) -> Vec<ProjectMeta>;
+
+/// List registered projects from `offset`, returning at most `limit` entries.
+pub fn list_paginated(env: Env, offset: u64, limit: u32) -> Vec<ProjectMeta>;
 ```
 
 ---

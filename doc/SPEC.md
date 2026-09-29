@@ -390,6 +390,19 @@ Both indexes are updated atomically with the record write in
 On-chain metadata directory. Projects are registered by the admin and can be
 queried or listed by any caller.
 
+#### Listing projects
+
+`list_all` is a convenience view bounded to **100** entries. When more projects
+exist, the additional entries are silently omitted (no panic) so the per-call
+storage-read cost stays predictable as the directory grows. Off-chain callers
+(e.g. the project-directory backend) must use `list_paginated` for full
+iteration.
+
+| Function | Auth | Description |
+|---|---|---|
+| `list_all()` | none | Convenience list, capped at 100 entries |
+| `list_paginated(offset, limit)` | none | Paginated list; use in production |
+
 #### Public interface additions (this version)
 
 | Function | Auth | Description |

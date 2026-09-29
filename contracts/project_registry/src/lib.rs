@@ -26,6 +26,14 @@ const INDEX_TTL_BUMP: u32 = 63_072_000;
 const AUTH_TTL_THRESHOLD: u32 = 6_307_200;
 const AUTH_TTL_BUMP: u32 = 6_307_200;
 
+/// Hard cap on the number of entries returned by `list_all`.
+///
+/// `list_all` is a convenience view for small directories; every returned
+/// entry costs a persistent-storage read, so it is bounded to keep the
+/// per-call cost predictable as the directory grows. Callers that need the
+/// full directory must use `list_paginated`.
+const MAX_LIST_ALL: u32 = 100;
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectEntry {
@@ -252,12 +260,21 @@ impl ProjectRegistry {
             .publish((EVENT_AUTH_CALLER_SET,), (caller, authorized));
     }
 
-    /// List registered projects with pagination.
-    /// `offset` is the zero-based start position; `limit` is the max entries to return.
+    /// List registered projects (capped).
+    ///
+    /// Returns up to 100 entries. Use `list_paginated` for full iteration.
+    ///
+    /// This is a convenience view for small directories. It reads every entry
+    /// it returns from persistent storage, so it is intentionally bounded to
+    /// [`MAX_LIST_ALL`] to keep the per-call storage-read cost predictable as
+    /// the directory grows. When more than [`MAX_LIST_ALL`] projects exist the
+    /// extra entries are silently omitted (no panic), matching the
+    /// `.min(total)` truncation used by `list_paginated`.
     pub fn list_all(e: Env) -> Vec<ProjectEntry> {
         let total: u64 = e.storage().instance().get(&DataKey::ProjectCount).unwrap();
+        let end = total.min(MAX_LIST_ALL as u64);
         let mut projects: Vec<ProjectEntry> = Vec::new(&e);
-        for pos in 0..total {
+        for pos in 0..end {
             let idx_key = DataKey::ProjectIdAt(pos);
             if let Some(id) = e.storage().persistent().get::<_, BytesN<32>>(&idx_key) {
                 let proj_key = DataKey::Project(id);
@@ -408,6 +425,34 @@ mod tests {
 
         let all = client.list_all();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_list_all_caps_at_100() {
+        let (e, admin, client) = setup();
+        e.mock_all_auths();
+        let owner = Address::generate(&e);
+
+        // Register 101 projects: one more than the list_all cap.
+        for i in 0..101u64 {
+            client.register(
+                &admin,
+                &String::from_str(&e, "Project"),
+                &38_897_700,
+                &(-77_036_500),
+                &String::from_str(&e, "v1"),
+                &owner,
+                &(500 + i),
+            );
+        }
+        assert_eq!(client.count(), 101);
+
+        // list_all silently truncates to the first 100 entries (no panic).
+        assert_eq!(client.list_all().len(), 100);
+
+        // list_paginated is unchanged and can still reach every entry.
+        assert_eq!(client.list_paginated(&0_u64, &200_u32).len(), 101);
+        assert_eq!(client.list_paginated(&100_u64, &10_u32).len(), 1);
     }
 
     #[test]
