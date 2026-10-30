@@ -3,3 +3,5 @@ target/
 test_snapshots/
 .DS_Store
 issues.mdtest_output.log
+config.bat
+node_modules
