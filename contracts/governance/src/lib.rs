@@ -662,6 +662,15 @@ impl Governance {
             panic!("timelock not elapsed");
         }
 
+        // Stale execution risk mitigation (#183): Enforce 7-day execution deadline
+        let execution_window: u64 = 604_800;
+        if timestamp > proposal.timelock_ends_at + execution_window {
+            proposal.status = ProposalStatus::Expired;
+            e.storage().persistent().set(&proposal_key, &proposal);
+            Self::remove_from_active(&e, proposal_id);
+            panic!("execution deadline elapsed; proposal expired");
+        }
+
         // Remove from the active list before dispatch. In atomic mode a
         // failing action reverts the whole transaction, which rolls this
         // removal back; in best-effort mode the removal persists so a
@@ -795,15 +804,20 @@ impl Governance {
             .get(&proposal_key)
             .unwrap_or_else(|| panic!("proposal not found"));
 
-        if !matches!(proposal.status, ProposalStatus::Active)
-            && !matches!(proposal.status, ProposalStatus::Pending)
-        {
-            panic!("proposal not active or pending");
-        }
-
         let timestamp = e.ledger().timestamp();
-        if timestamp <= proposal.voting_ends_at {
-            panic!("voting period has not ended");
+        if matches!(proposal.status, ProposalStatus::Approved) {
+            let execution_window: u64 = 604_800;
+            if timestamp <= proposal.timelock_ends_at + execution_window {
+                panic!("execution deadline has not ended");
+            }
+        } else if matches!(proposal.status, ProposalStatus::Active)
+            || matches!(proposal.status, ProposalStatus::Pending)
+        {
+            if timestamp <= proposal.voting_ends_at {
+                panic!("voting period has not ended");
+            }
+        } else {
+            panic!("proposal not active, pending, or approved");
         }
 
         proposal.status = ProposalStatus::Expired;
@@ -1687,6 +1701,45 @@ mod tests {
 
         let proposal = client.get_proposal(&id).unwrap();
         assert!(matches!(proposal.status, ProposalStatus::Executed));
+    }
+
+    #[test]
+    #[should_panic(expected = "execution deadline elapsed; proposal expired")]
+    fn test_execute_after_deadline_fails_and_expires() {
+        let e = Env::default();
+        e.mock_all_auths();
+        let admin = Address::generate(&e);
+        let member1 = Address::generate(&e);
+        let member2 = Address::generate(&e);
+        let member3 = Address::generate(&e);
+        let contract_id = e.register_contract(None, Governance);
+        let client = GovernanceClient::new(&e, &contract_id);
+
+        let members: Vec<Address> =
+            Vec::from_array(&e, [member1.clone(), member2.clone(), member3.clone()]);
+        client.initialize(&admin, &members);
+
+        let actions: Vec<GovernanceAction> = Vec::new(&e);
+        let id = client.propose(
+            &member1,
+            &String::from_str(&e, "Exec Deadline Test"),
+            &String::from_str(&e, "desc"),
+            &actions,
+            &false,
+        );
+
+        client.vote(&member1, &id, &true);
+        client.vote(&member2, &id, &true);
+
+        let proposal = client.get_proposal(&id).unwrap();
+        assert!(matches!(proposal.status, ProposalStatus::Approved));
+
+        // Jump past execution deadline (timelock + 7 days + 10s)
+        let mut info = e.ledger().get();
+        info.timestamp = proposal.timelock_ends_at + 604_800 + 10;
+        e.ledger().set(info);
+
+        client.execute(&member1, &id);
     }
 
     #[test]
